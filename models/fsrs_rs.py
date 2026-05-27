@@ -25,7 +25,7 @@ def convert_to_items(df: pd.DataFrame, config: Config):
         from fsrs_rs_python import FSRSItem, FSRSReview
     except ImportError:
         raise ImportError(
-            "fsrs-rs-python is not installed. Please install it to use FSRS-rs models."
+            "fsrs-rs-python is not installed. Please install it to use the FSRS-rs backend."
         )
 
     def accumulate(group):
@@ -71,7 +71,7 @@ class FSRSRsBackend:
             from fsrs_rs_python import DEFAULT_PARAMETERS
         except ImportError:
             raise ImportError(
-                "fsrs-rs-python is not installed. Please install it to use FSRS-rs models."
+                "fsrs-rs-python is not installed. Please install it to use the FSRS-rs backend."
             )
 
         return list(DEFAULT_PARAMETERS)
@@ -87,7 +87,7 @@ class FSRSRsBackend:
             from fsrs_rs_python import FSRS
         except ImportError:
             raise ImportError(
-                "fsrs-rs-python is not installed. Please install it to use FSRS-rs models."
+                "fsrs-rs-python is not installed. Please install it to use the FSRS-rs backend."
             )
 
         self.config = config
