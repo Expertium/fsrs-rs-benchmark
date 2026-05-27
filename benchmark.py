@@ -2,6 +2,13 @@ import json
 import importlib.util
 import sys
 import types
+from pathlib import Path as _Path
+
+# Ensure the repo root is first on sys.path so the local fsrs_rs_python package
+# is always imported before any version that may be installed in site-packages.
+_REPO_ROOT = str(_Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 def _bootstrap_models_package() -> None:

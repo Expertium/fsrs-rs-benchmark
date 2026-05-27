@@ -42,12 +42,16 @@ def _prepare_windows_extension_aliases() -> None:
             for basename in _EXTENSION_BASENAMES:
                 for candidate in sorted(profile_dir.glob(f"{basename}.dll")):
                     alias = candidate.with_name(f"{basename}{pyd_suffix}")
-                    if (
-                        alias.exists()
-                        and alias.stat().st_mtime_ns > candidate.stat().st_mtime_ns
-                    ):
+                    if alias.exists():
+                        # Already copied; skip to avoid PermissionError when the
+                        # .pyd is held open by another process (e.g. a sibling
+                        # worker spawned via multiprocessing on Windows).
                         continue
-                    shutil.copy2(candidate, alias)
+                    try:
+                        shutil.copy2(candidate, alias)
+                    except PermissionError:
+                        # Another process may have created the alias concurrently.
+                        pass
 
 
 def _extension_candidates() -> list[Path]:
