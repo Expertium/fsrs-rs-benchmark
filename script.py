@@ -18,10 +18,10 @@ def _bootstrap_models_package() -> None:
     module_name = f"{package_name}.fsrs_rs"
     module_path = _Path(__file__).resolve().parent / package_name / "fsrs_rs.py"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
-    assert spec is not None
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load {module_name} from {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    assert spec.loader is not None
     spec.loader.exec_module(module)
 
 
