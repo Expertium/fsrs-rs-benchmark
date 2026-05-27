@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,11 +13,41 @@ _ROOT = Path(__file__).resolve().parent.parent
 _CRATE_DIR = _ROOT / "fsrs-rs-python"
 _MANIFEST_PATH = _CRATE_DIR / "Cargo.toml"
 _MODULE_NAME = f"{__name__}.fsrs_rs_python"
-_VALID_EXTENSION_SUFFIXES = {".so", ".pyd", ".dylib"}
+_VALID_EXTENSION_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES)
 _EXTENSION_BASENAMES = ("libfsrs_rs_python", "fsrs_rs_python")
 
 
+def _matches_extension_suffix(candidate: Path) -> bool:
+    return any(candidate.name.endswith(suffix) for suffix in _VALID_EXTENSION_SUFFIXES)
+
+
+def _prepare_windows_extension_aliases() -> None:
+    if sys.platform != "win32":
+        return
+
+    pyd_suffix = next(
+        (suffix for suffix in _VALID_EXTENSION_SUFFIXES if suffix.endswith(".pyd")),
+        ".pyd",
+    )
+
+    for profile in ("release", "debug"):
+        profile_dir = _CRATE_DIR / "target" / profile
+        if not profile_dir.exists():
+            continue
+        for basename in _EXTENSION_BASENAMES:
+            for candidate in sorted(profile_dir.glob(f"{basename}.dll")):
+                alias = candidate.with_name(f"{basename}{pyd_suffix}")
+                if (
+                    alias.exists()
+                    and alias.stat().st_size == candidate.stat().st_size
+                    and alias.stat().st_mtime_ns >= candidate.stat().st_mtime_ns
+                ):
+                    continue
+                shutil.copy2(candidate, alias)
+
+
 def _extension_candidates() -> list[Path]:
+    _prepare_windows_extension_aliases()
     candidates: list[Path] = []
     for profile in ("release", "debug"):
         profile_dir = _CRATE_DIR / "target" / profile
@@ -26,7 +58,7 @@ def _extension_candidates() -> list[Path]:
                 sorted(
                     candidate
                     for candidate in profile_dir.glob(f"{basename}.*")
-                    if candidate.suffix in _VALID_EXTENSION_SUFFIXES
+                    if _matches_extension_suffix(candidate)
                 )
             )
     return candidates
