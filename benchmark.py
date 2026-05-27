@@ -7,7 +7,7 @@ from pathlib import Path as _Path
 # Ensure the repo root is first on sys.path so the local fsrs_rs_python package
 # is always imported before any version that may be installed in site-packages.
 _REPO_ROOT = str(_Path(__file__).resolve().parent)
-if _REPO_ROOT not in sys.path:
+if not sys.path or sys.path[0] != _REPO_ROOT:
     sys.path.insert(0, _REPO_ROOT)
 
 
