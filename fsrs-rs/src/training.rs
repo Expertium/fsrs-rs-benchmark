@@ -36,6 +36,8 @@ type B = NdArray<f32>;
 
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
+const MIN_RETRIEVABILITY: f32 = 0.0001;
+const MAX_RETRIEVABILITY: f32 = 0.9999;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
@@ -92,7 +94,7 @@ impl<B: Backend> Model<B> {
         let state = self.forward(t_historys, r_historys, None);
         let retrievability = self
             .power_forgetting_curve(delta_ts, state.stability)
-            .clamp(0.0001_f32, 0.9999_f32);
+            .clamp(MIN_RETRIEVABILITY, MAX_RETRIEVABILITY);
         BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
     }
 }
