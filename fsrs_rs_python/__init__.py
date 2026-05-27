@@ -26,8 +26,12 @@ def _prepare_windows_extension_aliases() -> None:
         return
 
     pyd_suffix = next(
-        (suffix for suffix in _VALID_EXTENSION_SUFFIXES if suffix.endswith(".pyd")),
-        ".pyd",
+        (
+            suffix
+            for suffix in _VALID_EXTENSION_SUFFIXES
+            if suffix.endswith(".pyd")
+        ),
+        _VALID_EXTENSION_SUFFIXES[0],
     )
 
     for profile in ("release", "debug"):
@@ -39,7 +43,6 @@ def _prepare_windows_extension_aliases() -> None:
                 alias = candidate.with_name(f"{basename}{pyd_suffix}")
                 if (
                     alias.exists()
-                    and alias.stat().st_size == candidate.stat().st_size
                     and alias.stat().st_mtime_ns >= candidate.stat().st_mtime_ns
                 ):
                     continue
