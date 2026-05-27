@@ -29,6 +29,12 @@ def convert_to_items(df: pd.DataFrame, config: Config):
         )
 
     def parse_int(value: object, *, clamp_nonnegative: bool = False) -> int:
+        if pd.isna(value):
+            raise ValueError("Expected a numeric review history value, got missing data")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Expected a numeric review history value, got empty text")
         parsed = int(float(value))
         return max(0, parsed) if clamp_nonnegative else parsed
 
