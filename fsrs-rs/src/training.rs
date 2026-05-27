@@ -90,7 +90,9 @@ impl<B: Backend> Model<B> {
         // info!("t_historys: {}", &t_historys);
         // info!("r_historys: {}", &r_historys);
         let state = self.forward(t_historys, r_historys, None);
-        let retrievability = self.power_forgetting_curve(delta_ts, state.stability);
+        let retrievability = self
+            .power_forgetting_curve(delta_ts, state.stability)
+            .clamp(0.0001_f32, 0.9999_f32);
         BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
     }
 }
