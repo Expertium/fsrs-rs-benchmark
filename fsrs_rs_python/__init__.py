@@ -21,6 +21,11 @@ def _matches_extension_suffix(candidate: Path) -> bool:
     return any(candidate.name.endswith(suffix) for suffix in _VALID_EXTENSION_SUFFIXES)
 
 
+def _profile_dirs(profile: str) -> list[Path]:
+    profile_dir = _CRATE_DIR / "target" / profile
+    return [candidate for candidate in (profile_dir, profile_dir / "deps") if candidate.exists()]
+
+
 def _prepare_windows_extension_aliases() -> None:
     if sys.platform != "win32":
         return
@@ -33,35 +38,31 @@ def _prepare_windows_extension_aliases() -> None:
         raise ImportError("Python did not report a Windows .pyd extension suffix")
 
     for profile in ("release", "debug"):
-        profile_dir = _CRATE_DIR / "target" / profile
-        if not profile_dir.exists():
-            continue
-        for basename in _EXTENSION_BASENAMES:
-            for candidate in sorted(profile_dir.glob(f"{basename}.dll")):
-                alias = candidate.with_name(f"{basename}{pyd_suffix}")
-                if (
-                    alias.exists()
-                    and alias.stat().st_mtime_ns > candidate.stat().st_mtime_ns
-                ):
-                    continue
-                shutil.copy2(candidate, alias)
+        for profile_dir in _profile_dirs(profile):
+            for basename in _EXTENSION_BASENAMES:
+                for candidate in sorted(profile_dir.glob(f"{basename}.dll")):
+                    alias = candidate.with_name(f"{basename}{pyd_suffix}")
+                    if (
+                        alias.exists()
+                        and alias.stat().st_mtime_ns > candidate.stat().st_mtime_ns
+                    ):
+                        continue
+                    shutil.copy2(candidate, alias)
 
 
 def _extension_candidates() -> list[Path]:
     _prepare_windows_extension_aliases()
     candidates: list[Path] = []
     for profile in ("release", "debug"):
-        profile_dir = _CRATE_DIR / "target" / profile
-        if not profile_dir.exists():
-            continue
-        for basename in _EXTENSION_BASENAMES:
-            candidates.extend(
-                sorted(
-                    candidate
-                    for candidate in profile_dir.glob(f"{basename}.*")
-                    if _matches_extension_suffix(candidate)
+        for profile_dir in _profile_dirs(profile):
+            for basename in _EXTENSION_BASENAMES:
+                candidates.extend(
+                    sorted(
+                        candidate
+                        for candidate in profile_dir.glob(f"{basename}.*")
+                        if _matches_extension_suffix(candidate)
+                    )
                 )
-            )
     return candidates
 
 
