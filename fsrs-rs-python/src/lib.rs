@@ -76,6 +76,27 @@ impl FSRS {
                 .unwrap(),
         )
     }
+    #[pyo3(signature = (items, starting_states=None))]
+    pub fn memory_state_batch(
+        &self,
+        items: Vec<FSRSItem>,
+        starting_states: Option<Vec<Option<MemoryState>>>,
+    ) -> Vec<MemoryState> {
+        let items: Vec<fsrs::FSRSItem> = items.iter().map(|x| x.0.clone()).collect();
+        let starting_states = starting_states
+            .unwrap_or_else(|| (0..items.len()).map(|_| None).collect())
+            .into_iter()
+            .map(|state| state.map(|x| x.0))
+            .collect();
+        self.0
+            .lock()
+            .unwrap()
+            .memory_state_batch(items, starting_states)
+            .unwrap()
+            .into_iter()
+            .map(MemoryState)
+            .collect()
+    }
 }
 #[pyclass(module = "fsrs_rs_python")]
 #[derive(Debug, Clone)]
