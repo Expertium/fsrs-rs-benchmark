@@ -4,12 +4,15 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CRATE_DIR = _ROOT / "fsrs-rs-python"
 _MANIFEST_PATH = _CRATE_DIR / "Cargo.toml"
 _MODULE_NAME = f"{__name__}.fsrs_rs_python"
+_VALID_EXTENSION_SUFFIXES = {".so", ".pyd", ".dylib"}
+_EXTENSION_BASENAMES = ("libfsrs_rs_python", "fsrs_rs_python")
 
 
 def _extension_candidates() -> list[Path]:
@@ -18,35 +21,75 @@ def _extension_candidates() -> list[Path]:
         profile_dir = _CRATE_DIR / "target" / profile
         if not profile_dir.exists():
             continue
-        candidates.extend(sorted(profile_dir.glob("libfsrs_rs_python.*"), reverse=True))
+        for basename in _EXTENSION_BASENAMES:
+            candidates.extend(
+                sorted(
+                    candidate
+                    for candidate in profile_dir.glob(f"{basename}.*")
+                    if candidate.suffix in _VALID_EXTENSION_SUFFIXES
+                )
+            )
     return candidates
 
 
-def _load_extension() -> object:
+def _load_extension() -> ModuleType:
+    errors: list[str] = []
     for candidate in _extension_candidates():
         spec = importlib.util.spec_from_file_location(_MODULE_NAME, candidate)
         if spec is None or spec.loader is None:
+            errors.append(f"{candidate}: missing import spec or loader")
             continue
         module = importlib.util.module_from_spec(spec)
         sys.modules[_MODULE_NAME] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            sys.modules.pop(_MODULE_NAME, None)
+            errors.append(f"{candidate}: {exc}")
+            continue
         return module
-    raise ImportError("Unable to load fsrs-rs-python extension from local build artifacts")
+    details = "\n".join(errors)
+    raise ImportError(
+        "Unable to load fsrs-rs-python extension from local build artifacts"
+        + (f"\n{details}" if details else "")
+    )
 
 
 def _build_extension() -> None:
-    subprocess.run(
-        ["cargo", "build", "--manifest-path", str(_MANIFEST_PATH)],
-        cwd=_ROOT,
-        check=True,
-    )
+    try:
+        subprocess.run(
+            ["cargo", "build", "--release", "--manifest-path", str(_MANIFEST_PATH)],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise ImportError(
+            "Failed to build the vendored fsrs-rs-python extension because `cargo` "
+            "was not found on PATH. Please install Rust/Cargo first."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        details = "\n".join(
+            part.strip() for part in (exc.stdout, exc.stderr) if part and part.strip()
+        )
+        raise ImportError(
+            "Failed to build the vendored fsrs-rs-python extension. "
+            "Please make sure Rust/Cargo is installed and available on PATH."
+            + (f"\n{details}" if details else "")
+        ) from exc
 
 
 try:
     fsrs_rs_python = _load_extension()
 except ImportError:
     _build_extension()
-    fsrs_rs_python = _load_extension()
+    try:
+        fsrs_rs_python = _load_extension()
+    except ImportError as exc:
+        raise ImportError(
+            "Built the vendored fsrs-rs-python extension, but importing it still failed."
+        ) from exc
 
 __doc__ = fsrs_rs_python.__doc__
 if hasattr(fsrs_rs_python, "__all__"):
