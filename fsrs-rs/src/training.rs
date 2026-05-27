@@ -505,14 +505,15 @@ fn train<B: AutodiffBackend>(
                 &w_vec,
                 &init_w_vec,
                 real_batch_size,
-                1,
+                total_size,
                 l2_weight,
                 &training_v7::PARAMS_STDDEV,
             );
             let (_schedule_value, schedule_grad) =
                 schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+            let inv_total = 1.0 / total_size as f64;
             for i in 0..manual_grad.len().min(schedule_grad.len()) {
-                manual_grad[i] += schedule_grad[i] as f32;
+                manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
             }
             let loss = model.forward_classification(
                 item.t_historys,
@@ -564,12 +565,13 @@ fn train<B: AutodiffBackend>(
                 &w_vec,
                 &init_w_vec,
                 real_batch_size,
-                1,
+                total_size,
                 l2_weight,
                 &training_v7::PARAMS_STDDEV,
             );
-            let (schedule_penalty, _) =
+            let (schedule_value, _) =
                 schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+            let schedule_penalty = schedule_value / total_size as f64;
             let loss = model_valid.forward_classification(
                 batch.t_historys,
                 batch.r_historys,
