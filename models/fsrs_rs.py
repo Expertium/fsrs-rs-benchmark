@@ -6,6 +6,7 @@ within the benchmark framework.
 """
 
 from typing import List, Optional
+import numpy as np
 import pandas as pd
 from config import Config
 
@@ -141,7 +142,30 @@ class FSRSRsBackend:
         Returns:
             tuple: (predictions, labels, testset_with_predictions)
         """
-        from fsrs_optimizer import Collection, power_forgetting_curve  # type: ignore
+        from fsrs_optimizer import Collection  # type: ignore
+
+        def fsrs7_forgetting_curve(delta_t: pd.Series, stability: pd.Series) -> pd.Series:
+            stability_array = stability.clip(lower=0.0001).to_numpy(dtype=float, copy=False)
+            delta_t_array = delta_t.clip(lower=0).to_numpy(dtype=float, copy=False)
+            t_over_s = delta_t_array / stability_array
+
+            decay1 = -weights[27]
+            decay2 = -weights[28]
+            base1 = weights[29]
+            base2 = weights[30]
+
+            factor1 = base1 ** (1 / decay1) - 1
+            factor2 = base2 ** (1 / decay2) - 1
+            r1 = (1 + factor1 * t_over_s) ** decay1
+            r2 = (1 + factor2 * t_over_s) ** decay2
+
+            weight1 = weights[31] * stability_array ** (-weights[33])
+            weight2 = weights[32] * stability_array ** weights[34]
+
+            return pd.Series(
+                np.clip((weight1 * r1 + weight2 * r2) / (weight1 + weight2), 0.0001, 0.9999),
+                index=stability.index,
+            )
 
         my_collection = Collection(weights)
         testset_copy = testset.copy()
@@ -149,10 +173,8 @@ class FSRSRsBackend:
         testset_copy["stability"], testset_copy["difficulty"] = (
             my_collection.batch_predict(testset_copy)
         )
-        testset_copy["p"] = power_forgetting_curve(
-            testset_copy["delta_t"],
-            testset_copy["stability"],
-            -weights[20],
+        testset_copy["p"] = fsrs7_forgetting_curve(
+            testset_copy["delta_t"], testset_copy["stability"]
         )
 
         p = testset_copy["p"].tolist()
