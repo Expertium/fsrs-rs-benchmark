@@ -1,21 +1,16 @@
 #![allow(clippy::single_range_in_vec_init)]
 
-mod batch_shuffle;
 #[cfg(test)]
 mod convertor_tests;
-mod cosine_annealing;
-mod dataset;
 mod error;
 mod inference;
 mod model;
-mod parameter_clipper;
-mod parameter_initialization_fsrs7;
 mod simulation;
 #[cfg(test)]
 mod test_helpers;
 mod training;
 
-pub use dataset::{FSRSItem, FSRSReview, filter_outlier};
+pub use training::{FSRSItem, FSRSReview, filter_outlier};
 pub use error::{FSRSError, Result};
 pub use inference::{
     DEFAULT_PARAMETERS, ItemProgress, ItemState, MemoryState, ModelEvaluation, NextStates,

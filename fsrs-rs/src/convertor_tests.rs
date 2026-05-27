@@ -1,6 +1,5 @@
 use crate::convertor_tests::RevlogReviewKind::*;
-use crate::dataset::{FSRSBatcher, constant_weighted_fsrs_items};
-use crate::dataset::{FSRSItem, FSRSReview};
+use crate::training::{FSRSBatcher, FSRSItem, FSRSReview, constant_weighted_fsrs_items};
 use crate::simulation::{RevlogEntry, RevlogReviewKind};
 use crate::test_helpers::NdArrayAutodiff;
 use burn::backend::ndarray::NdArrayDevice;

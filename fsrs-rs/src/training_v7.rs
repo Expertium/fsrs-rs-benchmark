@@ -832,8 +832,9 @@ impl<B: Backend> Model<B> {
 mod tests {
     use super::*;
     use crate::DEFAULT_PARAMETERS;
-    use crate::dataset::FSRSBatch;
-    use crate::model::{Get, Model, ModelConfig};
+    use super::FSRSBatch;
+    use crate::model::{Get, Model};
+    use super::ModelConfig;
     use burn::backend::Autodiff;
     use burn::backend::NdArray;
     use burn::backend::ndarray::NdArrayDevice;

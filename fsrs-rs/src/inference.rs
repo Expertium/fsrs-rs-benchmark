@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
-use crate::dataset::{
+use crate::training::{
     FSRSBatch, FSRSBatcher, constant_weighted_fsrs_items, recency_weighted_fsrs_items,
 };
 use crate::error::Result;
