@@ -91,7 +91,15 @@ def _load_extension() -> ModuleType:
 def _build_extension() -> None:
     try:
         subprocess.run(
-            ["cargo", "build", "--release", "--manifest-path", str(_MANIFEST_PATH)],
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--manifest-path",
+                str(_MANIFEST_PATH),
+                "--features",
+                "pyo3/extension-module",
+            ],
             cwd=_ROOT,
             check=True,
             capture_output=True,
