@@ -225,7 +225,7 @@ impl MetricsRenderer for ProgressCollector {
 pub(crate) struct TrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = true)]
+    #[config(default = false)]
     pub enable_sched_penalties: bool,
     #[config(default = 8)]
     pub num_epochs: usize,
@@ -274,7 +274,7 @@ impl Default for ComputeParametersInput {
             train_set: Vec::new(),
             progress: None,
             enable_short_term: true,
-            enable_sched_penalties: true,
+            enable_sched_penalties: false,
             num_relearning_steps: None,
         }
     }
@@ -671,6 +671,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(parameters, DEFAULT_PARAMETERS.to_vec());
+    }
+
+    #[test]
+    fn test_sched_penalties_default_to_disabled() {
+        assert!(!ComputeParametersInput::default().enable_sched_penalties);
+        let config =
+            TrainingConfig::new(ModelConfig::default(), AdamConfig::new().with_epsilon(1e-8));
+        assert!(!config.enable_sched_penalties);
     }
 
     #[test]

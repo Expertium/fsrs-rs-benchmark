@@ -38,7 +38,7 @@ impl FSRS {
             train_set: train_set.iter().map(|x| x.0.clone()).collect(),
             progress: None,
             enable_short_term: true,
-            enable_sched_penalties: true,
+            enable_sched_penalties: false,
             num_relearning_steps: None,
         })
         .unwrap_or_default()
@@ -48,7 +48,7 @@ impl FSRS {
             train_set: train_set.iter().map(|x| x.0.clone()).collect(),
             progress: None,
             enable_short_term: true,
-            enable_sched_penalties: true,
+            enable_sched_penalties: false,
             num_relearning_steps: None,
         })
     }
