@@ -52,11 +52,12 @@ def parse_history(
     parser: Callable[..., ParsedValue],
     *,
     clamp_nonnegative: bool = False,
+    supports_clamp: bool = False,
 ) -> List[ParsedValue]:
     if pd.isna(history):
         return []
     values = [value.strip() for value in str(history).split(",") if value.strip()]
-    if parser is parse_interval:
+    if supports_clamp:
         return [parser(value, clamp_nonnegative=clamp_nonnegative) for value in values]
     return [parser(value) for value in values]
 
@@ -70,7 +71,7 @@ def build_reviews(row: pd.Series, *, include_current: bool = False):
         )
 
     t_history = parse_history(
-        row["t_history"], parse_interval, clamp_nonnegative=True
+        row["t_history"], parse_interval, clamp_nonnegative=True, supports_clamp=True
     )
     r_history = parse_history(row["r_history"], parse_rating)
     if include_current:
@@ -202,6 +203,9 @@ class FSRSRsBackend:
             decay2 = -weights[FSRS7_DECAY2_INDEX]
             base1 = weights[FSRS7_BASE1_INDEX]
             base2 = weights[FSRS7_BASE2_INDEX]
+
+            if decay1 == 0 or decay2 == 0:
+                raise ValueError("FSRS-7 decay parameters must be non-zero")
 
             factor1 = base1 ** (1 / decay1) - 1
             factor2 = base2 ** (1 / decay2) - 1
