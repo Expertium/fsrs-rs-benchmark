@@ -6,11 +6,10 @@ use crate::dataset::{
 use crate::error::Result;
 use crate::model::{Model, ModelConfig, ModelVersion, parameters_to_model};
 use crate::parameter_clipper::parameter_clipper;
-use crate::parameter_initialization::{initialize_stability_parameters, smooth_and_fill};
 use crate::parameter_initialization_fsrs7::{
     initialize_parameters_fsrs7, smooth_initial_stabilities_fsrs7,
 };
-use crate::{DEFAULT_PARAMETERS, FSRS6_DEFAULT_PARAMETERS, FSRSError};
+use crate::{DEFAULT_PARAMETERS, FSRSError};
 use burn::backend::Autodiff;
 use burn::backend::ndarray::NdArray;
 use burn::lr_scheduler::LrScheduler;
@@ -28,11 +27,8 @@ use burn::{config::Config, tensor::backend::AutodiffBackend};
 use core::marker::PhantomData;
 use log::info;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[path = "training_v6.rs"]
-mod training_v6;
 #[path = "training_v7.rs"]
 mod training_v7;
 
@@ -45,17 +41,13 @@ type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
 
 fn schedule_penalty_fn(version: ModelVersion) -> SchedulePenaltyFn {
-    match version {
-        ModelVersion::Fsrs6 => training_v6::maybe_schedule_penalty_value_and_grad,
-        ModelVersion::Fsrs7 => training_v7::maybe_schedule_penalty_value_and_grad,
-    }
+    let _ = version;
+    training_v7::maybe_schedule_penalty_value_and_grad
 }
 
 fn l2_penalty_fn(version: ModelVersion) -> L2PenaltyFn {
-    match version {
-        ModelVersion::Fsrs6 => training_v6::l2_penalty_value_and_grad,
-        ModelVersion::Fsrs7 => training_v7::l2_penalty_value_and_grad,
-    }
+    let _ = version;
+    training_v7::l2_penalty_value_and_grad
 }
 
 pub struct BCELoss<B: Backend> {
@@ -265,7 +257,6 @@ pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ComputeParametersVersion {
-    Fsrs6,
     #[default]
     Fsrs7,
 }
@@ -304,26 +295,16 @@ fn normalize_for_model_version(
     train_set: Vec<FSRSItem>,
     model_version: ComputeParametersVersion,
 ) -> Vec<FSRSItem> {
-    match model_version {
-        ComputeParametersVersion::Fsrs6 => train_set
-            .into_iter()
-            .map(|mut item| {
-                for review in &mut item.reviews {
-                    review.delta_t = review.delta_t.max(0.0).round();
-                }
-                item
-            })
-            .collect(),
-        ComputeParametersVersion::Fsrs7 => train_set
-            .into_iter()
-            .map(|mut item| {
-                for review in &mut item.reviews {
-                    review.delta_t = review.delta_t.max(0.0);
-                }
-                item
-            })
-            .collect(),
-    }
+    let _ = model_version;
+    train_set
+        .into_iter()
+        .map(|mut item| {
+            for review in &mut item.reviews {
+                review.delta_t = review.delta_t.max(0.0);
+            }
+            item
+        })
+        .collect()
 }
 /// Computes optimized parameters for the FSRS model based on training data.
 ///
@@ -360,37 +341,18 @@ pub fn compute_parameters(
     let average_recall = calculate_average_recall(&train_set);
     if train_set.len() < 8 {
         finish_progress();
-        return Ok(match model_version {
-            ComputeParametersVersion::Fsrs6 => FSRS6_DEFAULT_PARAMETERS.to_vec(),
-            ComputeParametersVersion::Fsrs7 => DEFAULT_PARAMETERS.to_vec(),
-        });
+        return Ok(DEFAULT_PARAMETERS.to_vec());
     }
 
-    let (initialized_parameters, fsrs6_initial_rating_count) = match model_version {
-        ComputeParametersVersion::Fsrs6 => {
-            let (initial_stability, initial_rating_count) =
-                initialize_stability_parameters(dataset_for_initialization.clone(), average_recall)
-                    .inspect_err(|_e| {
-                        finish_progress();
-                    })?;
-            let initialized_parameters = initial_stability
-                .into_iter()
-                .chain(FSRS6_DEFAULT_PARAMETERS[4..].iter().copied())
-                .collect();
-            (initialized_parameters, Some(initial_rating_count))
-        }
-        ComputeParametersVersion::Fsrs7 => {
-            let (initial_stability, initial_forgetting_curve, _initial_rating_count) =
-                initialize_parameters_fsrs7(dataset_for_initialization.clone(), average_recall)
-                    .inspect_err(|_e| {
-                        finish_progress();
-                    })?;
-            let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
-            initialized_parameters[0..4].copy_from_slice(&initial_stability);
-            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
-            (initialized_parameters, None)
-        }
-    };
+    let _ = model_version;
+    let (initial_stability, initial_forgetting_curve, _initial_rating_count) =
+        initialize_parameters_fsrs7(dataset_for_initialization.clone(), average_recall)
+            .inspect_err(|_e| {
+                finish_progress();
+            })?;
+    let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+    initialized_parameters[0..4].copy_from_slice(&initial_stability);
+    initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
     if train_set.len() == dataset_for_initialization.len() || train_set.len() < 64 {
         finish_progress();
         return Ok(initialized_parameters);
@@ -448,20 +410,8 @@ pub fn compute_parameters(
         return Err(FSRSError::InvalidInput);
     }
 
-    let clamped_stability = match model_version {
-        ComputeParametersVersion::Fsrs6 => {
-            let initial_rating_count = fsrs6_initial_rating_count.expect("FSRS-6 rating count");
-            let mut optimized_initial_stability = optimized_parameters[0..4]
-                .iter()
-                .enumerate()
-                .map(|(i, &val)| (i as u32 + 1, val))
-                .collect::<HashMap<_, _>>();
-            smooth_and_fill(&mut optimized_initial_stability, &initial_rating_count)?
-        }
-        ComputeParametersVersion::Fsrs7 => {
-            smooth_initial_stabilities_fsrs7(optimized_parameters[0..4].try_into().unwrap())?
-        }
-    };
+    let clamped_stability =
+        smooth_initial_stabilities_fsrs7(optimized_parameters[0..4].try_into().unwrap())?;
     Ok(clamped_stability
         .into_iter()
         .chain(optimized_parameters[4..].iter().copied())
@@ -484,25 +434,12 @@ pub fn benchmark(
         .clone()
         .into_iter()
         .partition(|item| item.long_term_review_cnt() == 1);
-    let initialized_parameters = match model_version {
-        ComputeParametersVersion::Fsrs6 => {
-            let (initial_stability, _rating_count) =
-                initialize_stability_parameters(dataset_for_initialization, average_recall)
-                    .unwrap();
-            initial_stability
-                .into_iter()
-                .chain(FSRS6_DEFAULT_PARAMETERS[4..].iter().copied())
-                .collect()
-        }
-        ComputeParametersVersion::Fsrs7 => {
-            let (initial_stability, initial_forgetting_curve, _rating_count) =
-                initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
-            let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
-            initialized_parameters[0..4].copy_from_slice(&initial_stability);
-            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
-            initialized_parameters
-        }
-    };
+    let _ = model_version;
+    let (initial_stability, initial_forgetting_curve, _rating_count) =
+        initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
+    let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+    initialized_parameters[0..4].copy_from_slice(&initial_stability);
+    initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
     let mut config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
@@ -708,11 +645,8 @@ mod tests {
     use super::*;
     use crate::convertor_tests::anki21_sample_file_converted_to_fsrs;
     use crate::convertor_tests::data_from_csv;
-    use crate::dataset::FSRSBatch;
-    use crate::model::{FSRS, parameters_to_model};
-    use crate::test_helpers::TestHelper;
-    use crate::{DEFAULT_PARAMETERS, FSRS6_DEFAULT_PARAMETERS};
-    use burn::backend::NdArray;
+    use crate::model::FSRS;
+    use crate::DEFAULT_PARAMETERS;
     use log::LevelFilter;
 
     #[test]
@@ -723,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_for_model_version_rounds_fsrs6_only() {
+    fn test_normalize_for_model_version_clamps_negative_intervals() {
         let train_set = vec![FSRSItem {
             reviews: vec![
                 crate::FSRSReview {
@@ -740,26 +674,9 @@ mod tests {
                 },
             ],
         }];
-        let fsrs6 = normalize_for_model_version(train_set.clone(), ComputeParametersVersion::Fsrs6);
-        let fsrs7 = normalize_for_model_version(train_set, ComputeParametersVersion::Fsrs7);
-        let fsrs6_days: Vec<f32> = fsrs6[0].reviews.iter().map(|r| r.delta_t).collect();
-        let fsrs7_days: Vec<f32> = fsrs7[0].reviews.iter().map(|r| r.delta_t).collect();
-        assert_eq!(fsrs6_days, vec![0.0, 0.0, 1.0]);
-        assert_eq!(fsrs7_days, vec![0.0, 0.49, 0.51]);
-    }
-
-    #[test]
-    fn test_compute_parameters_small_dataset_fsrs6_defaults() {
-        let parameters = compute_parameters(ComputeParametersInput {
-            train_set: vec![],
-            progress: None,
-            enable_short_term: true,
-            enable_sched_penalties: true,
-            model_version: ComputeParametersVersion::Fsrs6,
-            num_relearning_steps: None,
-        })
-        .unwrap();
-        assert_eq!(parameters, FSRS6_DEFAULT_PARAMETERS.to_vec());
+        let normalized = normalize_for_model_version(train_set, ComputeParametersVersion::Fsrs7);
+        let days: Vec<f32> = normalized[0].reviews.iter().map(|r| r.delta_t).collect();
+        assert_eq!(days, vec![0.0, 0.49, 0.51]);
     }
 
     #[test]
@@ -819,244 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn test_loss_and_grad() {
-        use burn::backend::ndarray::NdArrayDevice;
-        use burn::tensor::TensorData;
-
-        let device = NdArrayDevice::Cpu;
-        type B = Autodiff<NdArray<f32>>;
-        let mut model: Model<B> = parameters_to_model::<B>(&FSRS6_DEFAULT_PARAMETERS, &device);
-        let init_w = model.w.val();
-
-        let item = FSRSBatch {
-            t_historys: Tensor::from_floats(
-                TensorData::from([
-                    [0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                    [0.0, 1.0, 1.0, 3.0],
-                    [1.0, 3.0, 3.0, 5.0],
-                    [3.0, 6.0, 6.0, 12.0],
-                ]),
-                &device,
-            ),
-            r_historys: Tensor::from_floats(
-                TensorData::from([
-                    [1.0, 2.0, 3.0, 4.0],
-                    [3.0, 4.0, 2.0, 4.0],
-                    [1.0, 4.0, 4.0, 3.0],
-                    [4.0, 3.0, 3.0, 3.0],
-                    [3.0, 1.0, 3.0, 3.0],
-                    [2.0, 3.0, 3.0, 4.0],
-                ]),
-                &device,
-            ),
-            delta_ts: Tensor::from_floats([4.0, 11.0, 12.0, 23.0], &device),
-            labels: Tensor::from_ints([1, 1, 1, 0], &device),
-            weights: Tensor::from_floats([1.0, 1.0, 1.0, 1.0], &device),
-        };
-
-        let loss = model.forward_classification(
-            item.t_historys,
-            item.r_historys,
-            item.delta_ts,
-            item.labels,
-            item.weights,
-            Reduction::Sum,
-        );
-
-        assert_eq!(loss.clone().into_scalar().to_f32(), 4.0466027);
-        let gradients = loss.backward();
-
-        let w_grad = model.w.grad(&gradients).unwrap();
-        w_grad.to_data().to_vec::<f32>().unwrap().assert_approx_eq([
-            -0.095688485,
-            -0.0051607806,
-            -0.0012249565,
-            0.007462064,
-            0.03650761,
-            -0.082112335,
-            0.0593964,
-            -2.1474836,
-            0.57626534,
-            -2.8751316,
-            0.7154875,
-            -0.028993709,
-            0.0099172965,
-            -0.2189217,
-            -0.0017800558,
-            -0.089381434,
-            0.299141,
-            0.068104014,
-            -0.011605468,
-            -0.25398168,
-            0.27700496,
-        ]);
-
-        let config =
-            TrainingConfig::new(ModelConfig::default(), AdamConfig::new().with_epsilon(1e-8));
-        let mut optim = config.optimizer.init::<B, Model<B>>();
-        let lr = 0.04;
-        let grads = GradientsParams::from_grads(gradients, &model);
-        model = optim.step(lr, model, grads);
-        model.w = parameter_clipper(
-            model.w,
-            config.model.num_relearning_steps,
-            !config.model.freeze_short_term_stability,
-        );
-        model
-            .w
-            .val()
-            .to_data()
-            .to_vec::<f32>()
-            .unwrap()
-            .assert_approx_eq([
-                0.252,
-                1.3331,
-                2.3464994,
-                8.2556,
-                6.3733,
-                0.87340003,
-                2.9794,
-                0.040999997,
-                1.8322,
-                0.20660001,
-                0.756,
-                1.5235,
-                0.021400042,
-                0.3029,
-                1.6882998,
-                0.64140004,
-                1.8329,
-                0.5025,
-                0.13119997,
-                0.1058,
-                0.1142,
-            ]);
-
-        let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
-        let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
-        let (penalty_value, grad_vec) = training_v6::l2_penalty_value_and_grad(
-            &w_vec,
-            &init_w_vec,
-            512,
-            1000,
-            L2_PENALTY_WEIGHT,
-            &training_v7::PARAMS_STDDEV,
-        );
-        assert!((penalty_value - 0.16927784).abs() < 1e-6);
-        grad_vec.assert_approx_eq([
-            0.0004953454,
-            0.00021947007,
-            0.00006626537,
-            -0.000026404574,
-            -0.06303472,
-            0.26122463,
-            -0.056888837,
-            1.4222223,
-            -0.13464814,
-            0.63209885,
-            -0.18806253,
-            0.22755535,
-            -2.5283923,
-            0.79999983,
-            0.06303435,
-            0.3276802,
-            -0.019304348,
-            -0.21311146,
-            0.19999984,
-            1.0448979,
-            -0.28093278,
-        ]);
-
-        let item = FSRSBatch {
-            t_historys: Tensor::from_floats(
-                TensorData::from([
-                    [0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                    [0.0, 1.0, 1.0, 3.0],
-                    [1.0, 3.0, 3.0, 5.0],
-                    [3.0, 6.0, 6.0, 12.0],
-                ]),
-                &device,
-            ),
-            r_historys: Tensor::from_floats(
-                TensorData::from([
-                    [1.0, 2.0, 3.0, 4.0],
-                    [3.0, 4.0, 2.0, 4.0],
-                    [1.0, 4.0, 4.0, 3.0],
-                    [4.0, 3.0, 3.0, 3.0],
-                    [3.0, 1.0, 3.0, 3.0],
-                    [2.0, 3.0, 3.0, 4.0],
-                ]),
-                &device,
-            ),
-            delta_ts: Tensor::from_floats([4.0, 11.0, 12.0, 23.0], &device),
-            labels: Tensor::from_ints([1, 1, 1, 0], &device),
-            weights: Tensor::from_floats([1.0, 1.0, 1.0, 1.0], &device),
-        };
-
-        let loss = model.forward_classification(
-            item.t_historys,
-            item.r_historys,
-            item.delta_ts,
-            item.labels,
-            item.weights,
-            Reduction::Sum,
-        );
-        assert_eq!(loss.clone().into_scalar().to_f32(), 3.767796);
-        let gradients = loss.backward();
-        let w_grad = model.w.grad(&gradients).unwrap();
-        w_grad
-            .clone()
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap()
-            .assert_approx_eq([
-                -0.040530164,
-                -0.0041278866,
-                -0.0010157757,
-                0.007239434,
-                0.009321215,
-                -0.120117955,
-                0.039143264,
-                -0.8628009,
-                0.5794302,
-                -2.5713828,
-                0.7669307,
-                -0.024242667,
-                0.0,
-                -0.16912507,
-                -0.0017008218,
-                -0.061857328,
-                0.28093633,
-                0.064058185,
-                0.0063592787,
-                -0.1903223,
-                0.6257775,
-            ]);
-        let grads = GradientsParams::from_grads(gradients, &model);
-        model = optim.step(lr, model, grads);
-        model.w = parameter_clipper(
-            model.w,
-            config.model.num_relearning_steps,
-            !config.model.freeze_short_term_stability,
-        );
-        model
-            .w
-            .val()
-            .to_data()
-            .to_vec::<f32>()
-            .unwrap()
-            .assert_approx_eq([
-                0.2882918, 1.3726242, 2.3861322, 8.215636, 6.339965, 0.9130969, 2.940639,
-                0.07696985, 1.7921946, 0.2464217, 0.71595186, 1.5631561, 0.001, 0.34230903,
-                1.7282416, 0.68038, 1.7929853, 0.46258268, 0.14039303, 0.14509967, 0.1,
-            ]);
-    }
-
-    #[test]
     fn test_training() {
         if std::env::var("SKIP_TRAINING").is_ok() {
             println!("Skipping test in CI");
@@ -1083,43 +762,35 @@ mod tests {
                 .unwrap();
         }
         for items in [anki21_sample_file_converted_to_fsrs(), data_from_csv()] {
-            for model_version in [
-                ComputeParametersVersion::Fsrs6,
-                ComputeParametersVersion::Fsrs7,
-            ] {
-                for enable_short_term in [true, false] {
-                    let progress = CombinedProgressState::new_shared();
-                    let progress2 = Some(progress.clone());
-                    thread::spawn(move || {
-                        let mut finished = false;
-                        while !finished {
-                            thread::sleep(Duration::from_millis(500));
-                            let guard = progress.lock().unwrap();
-                            finished = guard.finished();
-                            println!("progress: {}/{}", guard.current(), guard.total());
-                        }
-                    });
-
-                    let parameters = compute_parameters(ComputeParametersInput {
-                        train_set: items.clone(),
-                        progress: progress2,
-                        enable_short_term,
-                        enable_sched_penalties: true,
-                        model_version,
-                        num_relearning_steps: None,
-                    })
-                    .unwrap();
-                    dbg!(&parameters);
-                    match model_version {
-                        ComputeParametersVersion::Fsrs6 => assert_eq!(parameters.len(), 21),
-                        ComputeParametersVersion::Fsrs7 => assert_eq!(parameters.len(), 35),
+            for enable_short_term in [true, false] {
+                let progress = CombinedProgressState::new_shared();
+                let progress2 = Some(progress.clone());
+                thread::spawn(move || {
+                    let mut finished = false;
+                    while !finished {
+                        thread::sleep(Duration::from_millis(500));
+                        let guard = progress.lock().unwrap();
+                        finished = guard.finished();
+                        println!("progress: {}/{}", guard.current(), guard.total());
                     }
+                });
 
-                    // evaluate
-                    let model = FSRS::new(&parameters).unwrap();
-                    let metrics = model.evaluate(items.clone(), |_| true).unwrap();
-                    dbg!(&metrics);
-                }
+                let parameters = compute_parameters(ComputeParametersInput {
+                    train_set: items.clone(),
+                    progress: progress2,
+                    enable_short_term,
+                    enable_sched_penalties: true,
+                    model_version: ComputeParametersVersion::Fsrs7,
+                    num_relearning_steps: None,
+                })
+                .unwrap();
+                dbg!(&parameters);
+                assert_eq!(parameters.len(), 35);
+
+                // evaluate
+                let model = FSRS::new(&parameters).unwrap();
+                let metrics = model.evaluate(items.clone(), |_| true).unwrap();
+                dbg!(&metrics);
             }
         }
     }

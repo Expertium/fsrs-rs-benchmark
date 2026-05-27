@@ -1,4 +1,4 @@
-use crate::{parameter_initialization::INIT_S_MAX, simulation::S_MIN};
+use crate::{parameter_initialization_fsrs7::INIT_S_MAX, simulation::S_MIN};
 
 const FSRS7_PARAM_LEN: usize = 35;
 

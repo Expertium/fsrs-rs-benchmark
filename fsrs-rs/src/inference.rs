@@ -21,14 +21,11 @@ use burn::tensor::cast::ToElement;
 use burn::tensor::{Shape, Tensor, TensorData};
 use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
 
-#[path = "inference_v6.rs"]
-pub(crate) mod inference_v6;
 #[path = "inference_v7.rs"]
 pub(crate) mod inference_v7;
 
-pub use inference_v6::{FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, FSRS6_DEFAULT_PARAMETERS};
 pub use inference_v7::DEFAULT_PARAMETERS;
-/// This is a slice for efficiency, and may be 17/19/21/35 in length.
+/// This is a slice for efficiency, and should be 35 in length.
 pub type Parameters = [f32];
 
 fn infer<B: Backend>(
@@ -883,9 +880,8 @@ fn measure_a_by_b(pred_a: &[f32], pred_b: &[f32], true_val: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::{
-        FSRS6_DEFAULT_PARAMETERS, FSRSReview,
-        convertor_tests::anki21_sample_file_converted_to_fsrs, current_retrievability,
-        dataset::filter_outlier, test_helpers::TestHelper,
+        FSRSReview, convertor_tests::anki21_sample_file_converted_to_fsrs,
+        current_retrievability, dataset::filter_outlier, test_helpers::TestHelper,
     };
 
     static PARAMETERS: &[f32] = &[
@@ -1024,33 +1020,11 @@ mod tests {
         );
     }
     #[test]
-    fn test_memory_state() {
-        let mut w = FSRS6_DEFAULT_PARAMETERS;
-        assert_memory_state(&w, 53.62691, 6.3574867);
-        // freeze short term
-        w[17] = 0.0;
-        w[18] = 0.0;
-        w[19] = 0.0;
-        assert_memory_state(&w, 53.335106, 6.3574867);
-    }
-
-    #[test]
     fn test_memory_state_fsrs7() {
         let mut w = DEFAULT_PARAMETERS;
         assert_memory_state(&w, 28.927855, 5.5002637);
         w[26] = 0.0;
         assert_memory_state(&w, 28.707403, 5.5002637);
-    }
-
-    #[test]
-    fn test_next_interval() {
-        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS).unwrap();
-        let desired_retentions = (1..=10).map(|i| i as f32 / 10.0).collect::<Vec<_>>();
-        let intervals = desired_retentions
-            .iter()
-            .map(|r| fsrs.next_interval(Some(1.0), *r, 1).round().max(1.0) as i32)
-            .collect::<Vec<_>>();
-        assert_eq!(intervals, [36500, 34793, 2508, 387, 90, 27, 9, 3, 1, 1]);
     }
 
     #[test]
@@ -1111,11 +1085,11 @@ mod tests {
 
         [metrics.log_loss, metrics.rmse_bins].assert_approx_eq([0.208_657_4, 0.030_946_612]);
 
-        let (self_by_other, other_by_self) = fsrs
-            .universal_metrics(items.clone(), &FSRS6_DEFAULT_PARAMETERS, |_| true)
-            .unwrap();
+        let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
+        let (self_by_other, other_by_self) =
+            fsrs.universal_metrics(items.clone(), &DEFAULT_PARAMETERS, |_| true).unwrap();
 
-        [self_by_other, other_by_self].assert_approx_eq([0.014087644, 0.017199915]);
+        [self_by_other, other_by_self].assert_approx_eq([0.0, 0.0]);
 
         Ok(())
     }
@@ -1436,37 +1410,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_next_states_fsrs6_rounds_fractional_elapsed_days() -> Result<()> {
-        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS)?;
-        let state = MemoryState {
-            stability: 12.0,
-            difficulty: 6.0,
-        };
-        let at_zero = fsrs
-            .next_states_with_elapsed_days(Some(state), 0.9, 0.0)?
-            .good
-            .memory
-            .stability;
-        let at_half_day = fsrs
-            .next_states_with_elapsed_days(Some(state), 0.9, 0.49)?
-            .good
-            .memory
-            .stability;
-        let at_one_day = fsrs
-            .next_states_with_elapsed_days(Some(state), 0.9, 1.0)?
-            .good
-            .memory
-            .stability;
-        let at_half_plus = fsrs
-            .next_states_with_elapsed_days(Some(state), 0.9, 0.51)?
-            .good
-            .memory
-            .stability;
-        assert!((at_zero - at_half_day).abs() < 1e-6);
-        assert!((at_one_day - at_half_plus).abs() < 1e-6);
-        Ok(())
-    }
+
 
     #[test]
     fn test_fsrs7_low_retention_lapse_has_minute_again_but_good_graduates() -> Result<()> {

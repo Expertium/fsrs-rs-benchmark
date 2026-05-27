@@ -17,7 +17,7 @@ type FirstRating = u32;
 type AverageRecall = (f64, f64, f64);
 
 pub(crate) type InitializationResult = ([f32; 4], [f32; 8], HashMap<u32, u32>);
-const INIT_S_MAX: f32 = 100.0;
+pub(crate) const INIT_S_MAX: f32 = 100.0;
 
 const FSRS7_FORGETTING_CURVE_CANDIDATES: [[f32; 8]; 16] = [
     [0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862],

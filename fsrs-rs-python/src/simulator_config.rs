@@ -39,6 +39,7 @@ impl SimulatorConfig {
             suspend_after_lapses,
             post_scheduling_fn: None,
             review_priority_fn: None,
+            review_rating_cost_fn: None,
             learning_step_transitions,
             relearning_step_transitions,
             state_rating_costs,

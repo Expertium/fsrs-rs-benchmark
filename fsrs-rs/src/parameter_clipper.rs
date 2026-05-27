@@ -1,11 +1,9 @@
-use crate::{inference::Parameters, model::ModelVersion};
+use crate::inference::Parameters;
 use burn::{
     module::Param,
     tensor::{Tensor, TensorData, backend::Backend},
 };
 
-#[path = "parameter_clipper_v6.rs"]
-mod parameter_clipper_v6;
 #[path = "parameter_clipper_v7.rs"]
 mod parameter_clipper_v7;
 
@@ -20,12 +18,7 @@ pub(crate) fn parameter_clipper<B: Backend>(
         num_relearning_steps,
         enable_short_term,
     );
-    if !enable_short_term
-        && matches!(
-            ModelVersion::from_param_count(clipped.len()),
-            ModelVersion::Fsrs7
-        )
-    {
+    if !enable_short_term {
         // FSRS-7: w[26] controls short-term mixing.
         // Forcing it to 0 disables the short-term path (long-term only).
         clipped[26] = 0.0;
@@ -42,18 +35,9 @@ pub(crate) fn clip_parameters(
     enable_short_term: bool,
 ) -> Vec<f32> {
     let mut parameters = parameters.to_vec();
-    match ModelVersion::from_param_count(parameters.len()) {
-        ModelVersion::Fsrs7 => {
-            parameter_clipper_v7::clip_fsrs7_parameters(&mut parameters);
-        }
-        ModelVersion::Fsrs6 => {
-            parameter_clipper_v6::clip_fsrs6_parameters(
-                &mut parameters,
-                num_relearning_steps,
-                enable_short_term,
-            );
-        }
-    }
+    let _ = num_relearning_steps;
+    let _ = enable_short_term;
+    parameter_clipper_v7::clip_fsrs7_parameters(&mut parameters);
     parameters
 }
 

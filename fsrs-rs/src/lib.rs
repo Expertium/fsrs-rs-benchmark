@@ -9,7 +9,6 @@ mod error;
 mod inference;
 mod model;
 mod parameter_clipper;
-mod parameter_initialization;
 mod parameter_initialization_fsrs7;
 mod simulation;
 #[cfg(test)]
@@ -19,9 +18,8 @@ mod training;
 pub use dataset::{FSRSItem, FSRSReview, filter_outlier};
 pub use error::{FSRSError, Result};
 pub use inference::{
-    DEFAULT_PARAMETERS, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, FSRS6_DEFAULT_PARAMETERS,
-    ItemProgress, ItemState, MemoryState, ModelEvaluation, NextStates, current_retrievability,
-    evaluate_with_time_series_splits,
+    DEFAULT_PARAMETERS, ItemProgress, ItemState, MemoryState, ModelEvaluation, NextStates,
+    current_retrievability, evaluate_with_time_series_splits,
 };
 pub use model::FSRS;
 pub use simulation::{

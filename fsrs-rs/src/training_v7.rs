@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::model::{Get, Model, ModelVersion};
+use crate::model::{Get, Model};
 use crate::simulation::{S_MAX, S_MIN};
 #[cfg(test)]
 use burn::tensor::Tensor;
@@ -798,10 +798,7 @@ impl<B: Backend> Model<B> {
 
     pub(crate) fn fsrs7_schedule_penalty(&self, batch_size: usize) -> Tensor<B, 1> {
         let device = self.w.val().device();
-        if !matches!(
-            ModelVersion::from_param_count(self.w.val().dims()[0]),
-            ModelVersion::Fsrs7
-        ) {
+        if self.w.val().dims()[0] != PARAM_LEN {
             return Tensor::zeros([1], &device);
         }
         let w_vec = self.w.val().to_data().to_vec::<f32>().unwrap();

@@ -1,7 +1,7 @@
 use crate::DEFAULT_PARAMETERS;
 use crate::error::{FSRSError, Result};
 use crate::inference::{ItemProgress, Parameters};
-use crate::model::{ModelVersion, check_and_fill_parameters, model_v6, model_v7};
+use crate::model::{check_and_fill_parameters, model_v7};
 use itertools::{Itertools, izip};
 use ndarray::{Array1, Array2, Array3};
 use priority_queue::PriorityQueue;
@@ -261,7 +261,6 @@ trait SimulatedFsrs {
 }
 
 struct SimulatedFsrs7;
-struct LegacySimulatedFsrs;
 
 impl SimulatedFsrs for SimulatedFsrs7 {
     fn stability_after_success(
@@ -321,52 +320,9 @@ impl SimulatedFsrs for SimulatedFsrs7 {
     }
 }
 
-impl SimulatedFsrs for LegacySimulatedFsrs {
-    fn stability_after_success(
-        &self,
-        w: &[f32],
-        s: f32,
-        r: f32,
-        d: f32,
-        rating: usize,
-        _delta_t: f32,
-    ) -> f32 {
-        model_v6::stability_after_success_scalar(w, s, r, d, rating)
-    }
-
-    fn stability_after_failure(&self, w: &[f32], s: f32, r: f32, d: f32, _delta_t: f32) -> f32 {
-        model_v6::stability_after_failure_scalar(w, s, r, d)
-    }
-
-    fn stability_short_term(&self, w: &[f32], s: f32, _d: f32, rating: usize) -> f32 {
-        model_v6::stability_short_term_scalar(w, s, rating)
-    }
-
-    fn init_d(&self, w: &[f32], rating: usize) -> f32 {
-        model_v6::init_difficulty_scalar(w, rating)
-    }
-
-    fn next_d(&self, w: &[f32], d: f32, rating: usize) -> f32 {
-        model_v6::next_difficulty_scalar(w, d, rating)
-    }
-
-    fn power_forgetting_curve(&self, w: &[f32], t: f32, s: f32) -> f32 {
-        model_v6::power_forgetting_curve_scalar(w, t, s)
-    }
-
-    fn next_interval(&self, w: &[f32], stability: f32, desired_retention: f32) -> f32 {
-        model_v6::next_interval_scalar(w, stability, desired_retention)
-    }
-}
-
 static SIMULATED_FSRS7: SimulatedFsrs7 = SimulatedFsrs7;
-static LEGACY_SIMULATED_FSRS: LegacySimulatedFsrs = LegacySimulatedFsrs;
-
-fn simulated_fsrs(w: &[f32]) -> &'static dyn SimulatedFsrs {
-    match ModelVersion::from_param_count(w.len()) {
-        ModelVersion::Fsrs7 => &SIMULATED_FSRS7,
-        ModelVersion::Fsrs6 => &LEGACY_SIMULATED_FSRS,
-    }
+fn simulated_fsrs(_w: &[f32]) -> &'static dyn SimulatedFsrs {
+    &SIMULATED_FSRS7
 }
 
 fn stability_after_success_with_fsrs(
@@ -1799,12 +1755,9 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::{
-        FSRS6_DEFAULT_PARAMETERS, convertor_tests::read_collection, test_helpers::TestHelper,
-    };
+    use crate::{DEFAULT_PARAMETERS, convertor_tests::read_collection, test_helpers::TestHelper};
     const LEARN_COST: f32 = 42.;
     const REVIEW_COST: f32 = 43.;
-    const DEFAULT_PARAMETERS: [f32; 21] = FSRS6_DEFAULT_PARAMETERS;
 
     #[test]
     fn test_memory_state_short_term() {

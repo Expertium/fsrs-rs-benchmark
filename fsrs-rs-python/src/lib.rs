@@ -12,7 +12,7 @@ pub struct FSRS(Mutex<fsrs::FSRS>);
 impl FSRS {
     #[new]
     pub fn new(parameters: Vec<f32>) -> Self {
-        Self(fsrs::FSRS::new(Some(&parameters)).unwrap().into())
+        Self(fsrs::FSRS::new(&parameters).unwrap().into())
     }
     #[pyo3(signature=(current_memory_state,desired_retention,days_elapsed))]
     pub fn next_states(
@@ -34,22 +34,23 @@ impl FSRS {
         )
     }
     pub fn compute_parameters(&self, train_set: Vec<FSRSItem>) -> Vec<f32> {
-        self.0
-            .lock()
-            .unwrap()
-            .compute_parameters(ComputeParametersInput {
-                train_set: train_set.iter().map(|x| x.0.clone()).collect(),
-                progress: None,
-                enable_short_term: true,
-                num_relearning_steps: None,
-            })
-            .unwrap_or_default()
-    }
-    pub fn benchmark(&self, train_set: Vec<FSRSItem>) -> Vec<f32> {
-        self.0.lock().unwrap().benchmark(ComputeParametersInput {
+        fsrs::compute_parameters(ComputeParametersInput {
             train_set: train_set.iter().map(|x| x.0.clone()).collect(),
             progress: None,
             enable_short_term: true,
+            enable_sched_penalties: true,
+            model_version: fsrs::ComputeParametersVersion::Fsrs7,
+            num_relearning_steps: None,
+        })
+        .unwrap_or_default()
+    }
+    pub fn benchmark(&self, train_set: Vec<FSRSItem>) -> Vec<f32> {
+        fsrs::benchmark(ComputeParametersInput {
+            train_set: train_set.iter().map(|x| x.0.clone()).collect(),
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: true,
+            model_version: fsrs::ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         })
     }
@@ -171,7 +172,7 @@ impl FSRSItem {
         self.0
             .reviews
             .iter()
-            .filter(|review| review.delta_t > 0)
+            .filter(|review| review.delta_t > 0.0)
             .count()
     }
     pub fn __repr__(&self) -> String {
@@ -186,7 +187,7 @@ pub struct FSRSReview(fsrs::FSRSReview);
 #[pymethods]
 impl FSRSReview {
     #[new]
-    pub fn new(rating: u32, delta_t: u32) -> Self {
+    pub fn new(rating: u32, delta_t: f32) -> Self {
         Self(fsrs::FSRSReview { rating, delta_t })
     }
     pub fn __repr__(&self) -> String {
@@ -251,10 +252,7 @@ fn fsrs_rs_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_simulator_config, m)?)?;
     m.add(
         "DEFAULT_PARAMETERS",
-        [
-            0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192,
-            1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621,
-        ],
+        fsrs::DEFAULT_PARAMETERS.to_vec(),
     )?;
     Ok(())
 }

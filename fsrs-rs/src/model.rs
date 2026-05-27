@@ -12,31 +12,25 @@ use burn::{
     tensor::{Shape, Tensor, TensorData, backend::Backend},
 };
 
-#[path = "model_v6.rs"]
-pub(crate) mod model_v6;
 #[path = "model_v7.rs"]
 pub(crate) mod model_v7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelVersion {
-    Fsrs6,
     Fsrs7,
 }
 
 impl ModelVersion {
     pub(crate) fn from_param_count(param_count: usize) -> Self {
-        if param_count == model_v7::PARAM_LEN {
-            Self::Fsrs7
-        } else {
-            Self::Fsrs6
-        }
+        debug_assert_eq!(param_count, model_v7::PARAM_LEN);
+        let _ = param_count;
+        Self::Fsrs7
     }
 }
 
 impl core::fmt::Display for ModelVersion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Fsrs6 => write!(f, "FSRS6"),
             Self::Fsrs7 => write!(f, "FSRS7"),
         }
     }
@@ -96,7 +90,6 @@ pub(super) trait VersionOps<B: Backend> {
     ) -> f32;
 }
 
-pub(super) struct Fsrs6Ops;
 pub(super) struct Fsrs7Ops;
 
 type ApplyFreezeShortTermFn = fn(&mut [f32]);
@@ -120,14 +113,6 @@ struct VersionFns<B: Backend> {
 impl<B: Backend> VersionFns<B> {
     fn from_version(version: ModelVersion) -> Self {
         match version {
-            ModelVersion::Fsrs6 => Self {
-                apply_freeze_short_term: <Fsrs6Ops as VersionOps<B>>::apply_freeze_short_term,
-                power_forgetting_curve: <Fsrs6Ops as VersionOps<B>>::power_forgetting_curve,
-                next_interval: <Fsrs6Ops as VersionOps<B>>::next_interval,
-                update_state: <Fsrs6Ops as VersionOps<B>>::update_state,
-                memory_state_from_sm2: <Fsrs6Ops as VersionOps<B>>::memory_state_from_sm2_fsrs,
-                interval_at_retrievability: <Fsrs6Ops as VersionOps<B>>::interval_at_retrievability,
-            },
             ModelVersion::Fsrs7 => Self {
                 apply_freeze_short_term: <Fsrs7Ops as VersionOps<B>>::apply_freeze_short_term,
                 power_forgetting_curve: <Fsrs7Ops as VersionOps<B>>::power_forgetting_curve,
@@ -221,11 +206,6 @@ impl<B: Backend> Model<B> {
 
     fn linear_damping(&self, delta_d: Tensor<B, 1>, old_d: Tensor<B, 1>) -> Tensor<B, 1> {
         old_d.neg().add_scalar(10.0) * delta_d.div_scalar(9.0)
-    }
-
-    fn next_difficulty(&self, difficulty: Tensor<B, 1>, rating: Tensor<B, 1>) -> Tensor<B, 1> {
-        let delta_d = -self.w.get(6) * (rating - 3);
-        difficulty.clone() + self.linear_damping(delta_d, difficulty)
     }
 
     pub(crate) fn step(
@@ -408,10 +388,10 @@ pub(crate) fn parameters_to_model<B: Backend>(
 }
 
 pub(crate) fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f32>, FSRSError> {
-    let parameters = if parameters.len() == model_v7::PARAM_LEN {
+    let parameters = if parameters.is_empty() {
+        DEFAULT_PARAMETERS.to_vec()
+    } else if parameters.len() == model_v7::PARAM_LEN {
         parameters.to_vec()
-    } else if let Some(parameters) = model_v6::check_and_fill_parameters_fsrs6(parameters) {
-        parameters
     } else {
         return Err(FSRSError::InvalidParameters);
     };
@@ -424,12 +404,8 @@ pub(crate) fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::FSRS6_DEFAULT_PARAMETERS;
-    use crate::test_helpers::{Model as TestModel, NdArrayAutodiff, TestHelper};
-    use burn::backend::ndarray::NdArrayDevice;
+    use crate::test_helpers::{Model as TestModel, TestHelper};
     use burn::tensor::TensorData;
-
-    static DEVICE: NdArrayDevice = NdArrayDevice::Cpu;
 
     #[test]
     fn test_w() {
@@ -441,22 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_parameters() {
-        let fsrs4dot5_param = vec![
-            0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26,
-            0.29, 2.61,
-        ];
-        let fsrs5_param = check_and_fill_parameters(&fsrs4dot5_param).unwrap();
-        assert_eq!(
-            fsrs5_param,
-            vec![
-                0.4, 0.6, 2.4, 5.8, 6.81, 0.44675013, 1.36, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05,
-                0.34, 1.26, 0.29, 2.61, 0.0, 0.0, 0.0, 0.5
-            ]
-        )
-    }
-
-    #[test]
     fn test_fsrs() {
         FSRS::default()
             .model()
@@ -464,20 +424,15 @@ mod tests {
             .to_data()
             .to_vec::<f32>()
             .unwrap()
-            .assert_approx_eq(FSRS6_DEFAULT_PARAMETERS);
+            .assert_approx_eq(DEFAULT_PARAMETERS);
         assert!(FSRS::new(&[]).is_ok());
         assert!(FSRS::new(&[1.]).is_err());
         assert!(FSRS::new(DEFAULT_PARAMETERS.as_slice()).is_ok());
-        assert!(FSRS::new(&FSRS6_DEFAULT_PARAMETERS[..17]).is_ok());
-        assert!(FSRS::new(&FSRS6_DEFAULT_PARAMETERS).is_ok());
     }
 
     #[test]
     fn test_model_version_selection() {
         let model_v7: TestModel = Model::new(ModelConfig::default());
         assert_eq!(model_v7.version(), ModelVersion::Fsrs7);
-
-        let model_v6 = parameters_to_model::<NdArrayAutodiff>(&FSRS6_DEFAULT_PARAMETERS, &DEVICE);
-        assert_eq!(model_v6.version(), ModelVersion::Fsrs6);
     }
 }

@@ -7,10 +7,10 @@ use std::iter::repeat;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use criterion::{Criterion, Throughput};
+use fsrs::DEFAULT_PARAMETERS;
 use fsrs::FSRS;
 use fsrs::FSRSReview;
 use fsrs::NextStates;
-use fsrs::{FSRS6_DEFAULT_DECAY, current_retrievability};
 use fsrs::{FSRSItem, MemoryState};
 use itertools::Itertools;
 
@@ -61,26 +61,7 @@ pub(crate) fn next_states(inf: &FSRS) -> NextStates {
 }
 
 pub fn criterion_benchmark(c: &mut Criterion) {
-    let fsrs = FSRS::new(&[
-        0.81497127,
-        1.5411042,
-        4.007436,
-        9.045982,
-        4.9264183,
-        1.039322,
-        0.93803364,
-        0.0,
-        1.5530516,
-        0.10299722,
-        0.9981442,
-        2.210701,
-        0.018248068,
-        0.3422524,
-        1.3384504,
-        0.22278537,
-        2.6646678,
-    ])
-    .unwrap();
+    let fsrs = FSRS::new(&DEFAULT_PARAMETERS).unwrap();
 
     c.bench_function("next_states", |b| b.iter(|| black_box(next_states(&fsrs))));
 
@@ -89,13 +70,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             stability: 51.344814,
             difficulty: 7.005062,
         };
-        b.iter(|| {
-            black_box(current_retrievability(
-                black_box(state),
-                black_box(21.0),
-                black_box(FSRS6_DEFAULT_DECAY),
-            ))
-        })
+        b.iter(|| black_box(fsrs.current_retrievability(black_box(state), black_box(21.0))))
     });
 
     {
