@@ -4,7 +4,7 @@ use crate::dataset::{
     FSRSDataset, FSRSItem, WeightedFSRSItem, prepare_training_data, recency_weighted_fsrs_items,
 };
 use crate::error::Result;
-use crate::model::{Model, ModelConfig, ModelVersion, parameters_to_model};
+use crate::model::{Model, ModelConfig, parameters_to_model};
 use crate::parameter_clipper::parameter_clipper;
 use crate::parameter_initialization_fsrs7::{
     initialize_parameters_fsrs7, smooth_initial_stabilities_fsrs7,
@@ -40,13 +40,11 @@ const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
 
-fn schedule_penalty_fn(version: ModelVersion) -> SchedulePenaltyFn {
-    let _ = version;
+fn schedule_penalty_fn() -> SchedulePenaltyFn {
     training_v7::maybe_schedule_penalty_value_and_grad
 }
 
-fn l2_penalty_fn(version: ModelVersion) -> L2PenaltyFn {
-    let _ = version;
+fn l2_penalty_fn() -> L2PenaltyFn {
     training_v7::l2_penalty_value_and_grad
 }
 
@@ -255,12 +253,6 @@ pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
     total_recall as f32 / total_reviews as f32
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ComputeParametersVersion {
-    #[default]
-    Fsrs7,
-}
-
 /// Input parameters for computing FSRS parameters
 #[derive(Clone, Debug)]
 pub struct ComputeParametersInput {
@@ -272,8 +264,6 @@ pub struct ComputeParametersInput {
     pub enable_short_term: bool,
     /// Whether to enable FSRS-7 schedule penalties (penalty 1 & 2)
     pub enable_sched_penalties: bool,
-    /// Target parameter version to optimize.
-    pub model_version: ComputeParametersVersion,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
 }
@@ -285,17 +275,12 @@ impl Default for ComputeParametersInput {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: ComputeParametersVersion::default(),
             num_relearning_steps: None,
         }
     }
 }
 
-fn normalize_for_model_version(
-    train_set: Vec<FSRSItem>,
-    model_version: ComputeParametersVersion,
-) -> Vec<FSRSItem> {
-    let _ = model_version;
+fn normalize_training_set(train_set: Vec<FSRSItem>) -> Vec<FSRSItem> {
     train_set
         .into_iter()
         .map(|mut item| {
@@ -321,7 +306,6 @@ pub fn compute_parameters(
         progress,
         enable_short_term,
         enable_sched_penalties,
-        model_version,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
@@ -336,7 +320,7 @@ pub fn compute_parameters(
         }
     };
 
-    let train_set = normalize_for_model_version(train_set, model_version);
+    let train_set = normalize_training_set(train_set);
     let (dataset_for_initialization, train_set) = prepare_training_data(train_set);
     let average_recall = calculate_average_recall(&train_set);
     if train_set.len() < 8 {
@@ -344,7 +328,6 @@ pub fn compute_parameters(
         return Ok(DEFAULT_PARAMETERS.to_vec());
     }
 
-    let _ = model_version;
     let (initial_stability, initial_forgetting_curve, _initial_rating_count) =
         initialize_parameters_fsrs7(dataset_for_initialization.clone(), average_recall)
             .inspect_err(|_e| {
@@ -423,18 +406,16 @@ pub fn benchmark(
         train_set,
         enable_short_term,
         enable_sched_penalties,
-        model_version,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
 ) -> Vec<f32> {
-    let train_set = normalize_for_model_version(train_set, model_version);
+    let train_set = normalize_training_set(train_set);
     let average_recall = calculate_average_recall(&train_set);
     let (dataset_for_initialization, _next_train_set) = train_set
         .clone()
         .into_iter()
         .partition(|item| item.long_term_review_cnt() == 1);
-    let _ = model_version;
     let (initial_stability, initial_forgetting_curve, _rating_count) =
         initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
     let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
@@ -502,8 +483,8 @@ fn train<B: AutodiffBackend>(
     };
 
     let mut model: Model<B> = parameters_to_model::<B>(initial_parameters, &B::Device::default());
-    let schedule_penalty = schedule_penalty_fn(model.version());
-    let l2_penalty = l2_penalty_fn(model.version());
+    let schedule_penalty = schedule_penalty_fn();
+    let l2_penalty = l2_penalty_fn();
     let init_w = model.w.val();
     let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
     let mut optim = config.optimizer.init::<B, Model<B>>();
@@ -657,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_for_model_version_clamps_negative_intervals() {
+    fn test_normalize_training_set_clamps_negative_intervals() {
         let train_set = vec![FSRSItem {
             reviews: vec![
                 crate::FSRSReview {
@@ -674,7 +655,7 @@ mod tests {
                 },
             ],
         }];
-        let normalized = normalize_for_model_version(train_set, ComputeParametersVersion::Fsrs7);
+        let normalized = normalize_training_set(train_set);
         let days: Vec<f32> = normalized[0].reviews.iter().map(|r| r.delta_t).collect();
         assert_eq!(days, vec![0.0, 0.49, 0.51]);
     }
@@ -686,7 +667,6 @@ mod tests {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         })
         .unwrap();
@@ -727,7 +707,6 @@ mod tests {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         });
 
@@ -780,7 +759,6 @@ mod tests {
                     progress: progress2,
                     enable_short_term,
                     enable_sched_penalties: true,
-                    model_version: ComputeParametersVersion::Fsrs7,
                     num_relearning_steps: None,
                 })
                 .unwrap();

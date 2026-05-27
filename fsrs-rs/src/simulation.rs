@@ -321,7 +321,7 @@ impl SimulatedFsrs for SimulatedFsrs7 {
 }
 
 static SIMULATED_FSRS7: SimulatedFsrs7 = SimulatedFsrs7;
-fn simulated_fsrs(_w: &[f32]) -> &'static dyn SimulatedFsrs {
+fn simulated_fsrs() -> &'static dyn SimulatedFsrs {
     &SIMULATED_FSRS7
 }
 
@@ -340,7 +340,7 @@ fn stability_after_success_with_fsrs(
 #[cfg(test)]
 #[allow(dead_code)]
 fn stability_after_success(w: &[f32], s: f32, r: f32, d: f32, rating: usize, delta_t: f32) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     stability_after_success_with_fsrs(fsrs, w, s, r, d, rating, delta_t)
 }
 
@@ -358,7 +358,7 @@ fn stability_after_failure_with_fsrs(
 #[cfg(test)]
 #[allow(dead_code)]
 fn stability_after_failure(w: &[f32], s: f32, r: f32, d: f32, delta_t: f32) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     stability_after_failure_with_fsrs(fsrs, w, s, r, d, delta_t)
 }
 
@@ -375,7 +375,7 @@ fn stability_short_term_with_fsrs(
 #[cfg(test)]
 #[allow(dead_code)]
 fn stability_short_term(w: &[f32], s: f32, d: f32, rating: usize) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     stability_short_term_with_fsrs(fsrs, w, s, d, rating)
 }
 
@@ -436,7 +436,7 @@ fn memory_state_short_term(
     step_count: usize,
     rng: &mut StdRng,
 ) -> (f32, f32, f32) {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     memory_state_short_term_with_fsrs(
         fsrs,
         w,
@@ -457,7 +457,7 @@ fn init_d_with_fsrs(fsrs: &dyn SimulatedFsrs, w: &[f32], rating: usize) -> f32 {
 #[cfg(test)]
 #[allow(dead_code)]
 fn init_d(w: &[f32], rating: usize) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     init_d_with_fsrs(fsrs, w, rating)
 }
 
@@ -468,7 +468,7 @@ fn next_d_with_fsrs(fsrs: &dyn SimulatedFsrs, w: &[f32], d: f32, rating: usize) 
 #[cfg(test)]
 #[allow(dead_code)]
 fn next_d(w: &[f32], d: f32, rating: usize) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     next_d_with_fsrs(fsrs, w, d, rating)
 }
 
@@ -480,7 +480,7 @@ fn power_forgetting_curve_with_fsrs(fsrs: &dyn SimulatedFsrs, w: &[f32], t: f32,
 #[allow(dead_code)]
 fn power_forgetting_curve(w: &[f32], t: f32, s: f32) -> f32 {
     debug_assert!(t >= 0.);
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     power_forgetting_curve_with_fsrs(fsrs, w, t, s)
 }
 
@@ -496,7 +496,7 @@ fn next_interval_with_fsrs(
 #[cfg(test)]
 #[allow(dead_code)]
 fn next_interval(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
-    let fsrs = simulated_fsrs(w);
+    let fsrs = simulated_fsrs();
     next_interval_with_fsrs(fsrs, w, stability, desired_retention)
 }
 
@@ -591,7 +591,7 @@ impl WorkloadEstimator {
 
     fn precompute_cost_matrix(&mut self, desired_retention: f32, w: &Parameters) {
         self.desired_retention = desired_retention;
-        let fsrs = simulated_fsrs(w);
+        let fsrs = simulated_fsrs();
         // Cache precomputed values using ndarray
         let mut transition_probs = Array2::zeros((4, self.s_size));
         let mut next_s_indices = Array3::zeros((4, self.s_size, self.d_size));
@@ -673,7 +673,7 @@ impl WorkloadEstimator {
         if due > self.t_size {
             return 0.0;
         }
-        let fsrs = simulated_fsrs(w);
+        let fsrs = simulated_fsrs();
         let mut total_cost = 0.0;
         for rating in 1..=4 {
             let s = init_s(w, rating);
@@ -704,7 +704,7 @@ impl WorkloadEstimator {
         if card.due > self.t_size as f32 {
             return 0.0;
         }
-        let fsrs = simulated_fsrs(w);
+        let fsrs = simulated_fsrs();
 
         let real_due = card.due.max(0.0);
 
@@ -862,7 +862,7 @@ pub struct Card {
 
 impl Card {
     pub fn power_forgetting_curve(&self, w: &[f32], t: f32) -> f32 {
-        let fsrs = simulated_fsrs(w);
+        let fsrs = simulated_fsrs();
         power_forgetting_curve_with_fsrs(fsrs, w, t, self.stability)
     }
 
@@ -1004,7 +1004,7 @@ pub fn simulate(
     // Main simulation loop
     while let Some((&card_index, _)) = card_priorities.peek() {
         let card = &mut cards[card_index];
-        let fsrs = simulated_fsrs(&card.parameters);
+        let fsrs = simulated_fsrs();
 
         let day_index = card.due.max(0.0) as usize;
 

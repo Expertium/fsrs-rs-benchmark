@@ -806,7 +806,6 @@ pub fn evaluate_with_time_series_splits<F>(
         train_set,
         enable_short_term,
         enable_sched_penalties,
-        model_version,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
@@ -832,7 +831,6 @@ where
             train_set: split.train_items.clone(),
             enable_short_term,
             enable_sched_penalties,
-            model_version,
             num_relearning_steps,
             progress: None,
         };
@@ -1305,7 +1303,6 @@ mod tests {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: crate::training::ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         };
 
@@ -1319,7 +1316,6 @@ mod tests {
                 progress: None,
                 enable_short_term: true,
                 enable_sched_penalties: true,
-                model_version: crate::training::ComputeParametersVersion::Fsrs7,
                 num_relearning_steps: None,
             },
             |_| true,

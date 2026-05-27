@@ -39,7 +39,6 @@ impl FSRS {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: fsrs::ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         })
         .unwrap_or_default()
@@ -50,7 +49,6 @@ impl FSRS {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
-            model_version: fsrs::ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
         })
     }

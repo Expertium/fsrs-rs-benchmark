@@ -28,6 +28,5 @@ pub use simulation::{
     expected_workload_with_existing_cards, extract_simulator_config, optimal_retention, simulate,
 };
 pub use training::{
-    CombinedProgressState, ComputeParametersInput, ComputeParametersVersion, benchmark,
-    compute_parameters,
+    CombinedProgressState, ComputeParametersInput, benchmark, compute_parameters,
 };
