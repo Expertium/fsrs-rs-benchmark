@@ -20,14 +20,6 @@ pub(crate) enum ModelVersion {
     Fsrs7,
 }
 
-impl ModelVersion {
-    pub(crate) fn from_param_count(param_count: usize) -> Self {
-        debug_assert_eq!(param_count, model_v7::PARAM_LEN);
-        let _ = param_count;
-        Self::Fsrs7
-    }
-}
-
 impl core::fmt::Display for ModelVersion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -133,7 +125,7 @@ impl<B: Backend> Model<B> {
 
     pub fn new_with_device(config: ModelConfig, device: &B::Device) -> Self {
         let mut initial_params = DEFAULT_PARAMETERS.to_vec();
-        let version = ModelVersion::from_param_count(initial_params.len());
+        let version = ModelVersion::Fsrs7;
         if let Some(initial_stability) = config.initial_stability {
             initial_params[0..4].copy_from_slice(&initial_stability);
         }
@@ -373,7 +365,7 @@ pub(crate) fn parameters_to_model<B: Backend>(
 ) -> Model<B> {
     let config = ModelConfig::default();
     let mut model = Model::new_with_device(config.clone(), device);
-    let clipped = clip_parameters(parameters, config.num_relearning_steps, Default::default());
+    let clipped = clip_parameters(parameters);
     model.w = Param::from_tensor(Tensor::from_floats(
         TensorData::new(
             clipped.clone(),
@@ -383,7 +375,7 @@ pub(crate) fn parameters_to_model<B: Backend>(
         ),
         device,
     ));
-    model.version = ModelVersion::from_param_count(clipped.len());
+    model.version = ModelVersion::Fsrs7;
     model
 }
 

@@ -13,11 +13,8 @@ pub(crate) fn parameter_clipper<B: Backend>(
     enable_short_term: bool,
 ) -> Param<Tensor<B, 1>> {
     let (id, val) = parameters.consume();
-    let mut clipped = clip_parameters(
-        &val.to_data().to_vec().unwrap(),
-        num_relearning_steps,
-        enable_short_term,
-    );
+    let _ = num_relearning_steps;
+    let mut clipped = clip_parameters(&val.to_data().to_vec().unwrap());
     if !enable_short_term {
         // FSRS-7: w[26] controls short-term mixing.
         // Forcing it to 0 disables the short-term path (long-term only).
@@ -29,14 +26,8 @@ pub(crate) fn parameter_clipper<B: Backend>(
     )
 }
 
-pub(crate) fn clip_parameters(
-    parameters: &Parameters,
-    num_relearning_steps: usize,
-    enable_short_term: bool,
-) -> Vec<f32> {
+pub(crate) fn clip_parameters(parameters: &Parameters) -> Vec<f32> {
     let mut parameters = parameters.to_vec();
-    let _ = num_relearning_steps;
-    let _ = enable_short_term;
     parameter_clipper_v7::clip_fsrs7_parameters(&mut parameters);
     parameters
 }
@@ -82,7 +73,7 @@ mod tests {
         params[28] = 10.0;
         params[29] = 0.1;
         params[30] = 2.0;
-        let clipped = clip_parameters(&params, 1, true);
+        let clipped = clip_parameters(&params);
         assert_eq!(clipped.len(), 35);
         assert!(clipped[1] >= clipped[0]);
         assert!(clipped[2] >= clipped[1]);
@@ -113,7 +104,7 @@ mod tests {
         for idx in [0, 1, 2, 3, 27, 28, 29, 30] {
             params[idx] = f32::NAN;
         }
-        let clipped = clip_parameters(&params, 1, true);
+        let clipped = clip_parameters(&params);
         assert_eq!(clipped.len(), 35);
         assert!(clipped.iter().all(|v| v.is_finite()));
         assert!(clipped[1] >= clipped[0]);
