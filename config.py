@@ -226,7 +226,6 @@ class Config:
 
         # Training/data parameters from parser (with defaults)
         self.n_splits: int = args.n_splits
-        self.batch_size: int = args.batch_size
         self.max_seq_len: int = args.max_seq_len
         self.include_short_term: bool = args.short
 
@@ -242,9 +241,6 @@ class Config:
                 f"Model name '{self.model_name}' must be one of {get_args(ModelName)}"
             )
 
-        # Path for fsrs_optimizer (used for dynamic import)
-        self.fsrs_optimizer_module_path: str = "../fsrs-optimizer/src/fsrs_optimizer/"
-
         # Device configuration
         if torch.cuda.is_available() and self.model_name in [
             "GRU",
@@ -259,8 +255,7 @@ class Config:
         else:
             self.device = torch.device("cpu")
 
-        # Verbosity (can be made configurable later)
-        self.verbose_logging: bool = False
+        # Verbosity
         self.verbose_inadequate_data: bool = False
 
         # Derived file names
@@ -296,44 +291,13 @@ class Config:
             _file_name_parts.append("-dev")
 
         self.base_file_name: str = "".join(_file_name_parts)
-        self.optimizer_name_suffix: str = "_opt"
-
-        # Stability (S) parameters
-        _s_min_base = 0.0001 if self.use_secs_intervals else 0.01
-        if self.model_name.startswith("FSRS-6"):
-            self.s_min: float = 0.001 if not self.use_secs_intervals else _s_min_base
-        else:
-            self.s_min = _s_min_base
-
-        self.init_s_max: float = 100.0  # Max initial stability
-        self.s_max: float = 36500.0  # Max stability (e.g., 100 years)
 
         # Seed for reproducibility
         self.seed: int = 42
 
-        # Apply global warning filters (can also be done in main.py)
-        # warnings.filterwarnings("ignore", category=UserWarning, module="torch.optim.lr_scheduler") # Example for scheduler
-        # warnings.filterwarnings("ignore", category=UserWarning) # Original broad filter
-
     def get_evaluation_file_name(self) -> str:
         """Returns the base name for output files (e.g., for results, plots)."""
         return self.base_file_name
-
-    def get_optimizer_file_name(self) -> str:
-        """Returns the base name for optimizer state files."""
-        return self.base_file_name + self.optimizer_name_suffix
-
-    def get_lstm_tensor_feature_names(self) -> List[str]:
-        """
-        Returns the ordered feature names used to build LSTM tensors.
-
-        Delta interval is always included, duration is optional, and rating is appended last.
-        """
-        features: List[str] = ["delta_t_secs" if self.use_secs_intervals else "delta_t"]
-        if self.lstm_use_duration:
-            features.append("duration")
-        features.append("rating")
-        return features
 
     def __repr__(self) -> str:
         """Provides a string representation of the configuration."""
@@ -344,96 +308,3 @@ class Config:
         }
         return f"Config({attrs})"
 
-
-_config_instance: Optional[Config] = None
-
-
-def load_config(custom_args_list: Optional[List[str]] = None) -> Config:
-    """
-    Parses command-line arguments (or custom arguments) and returns a singleton Config instance.
-
-    Args:
-        custom_args_list: An optional list of strings representing command-line arguments.
-                          If None, sys.argv will be used.
-
-    Returns:
-        The Config instance.
-    """
-    global _config_instance
-    if (
-        _config_instance is None or custom_args_list is not None
-    ):  # Re-parse if custom_args are given
-        parser = create_parser()
-        if custom_args_list is not None:
-            args, _ = parser.parse_known_args(custom_args_list)
-        else:
-            args, _ = parser.parse_known_args()  # Uses sys.argv by default
-
-        current_config = Config(args)
-        if (
-            custom_args_list is not None
-        ):  # Don't overwrite global instance if it's a custom load for test
-            return current_config
-        _config_instance = current_config
-
-    return _config_instance
-
-
-# --- Example Usage (typically this would be in your main script) ---
-if __name__ == "__main__":
-    print("--- Loading default configuration (from command line or defaults) ---")
-    config = load_config()
-    print(f"Model Name: {config.model_name}")
-    print(f"Device: {config.device}")
-    print(f"S_MIN: {config.s_min}")
-    print(f"Effective Short Term: {config.include_short_term}")
-    print(f"Evaluation File Name: {config.get_evaluation_file_name()}")
-    print(f"Optimizer File Name: {config.get_optimizer_file_name()}")
-    print(f"Data Path: {config.data_path}")
-    if config.dev_mode:
-        print(f"FSRS Optimizer Module Path: {config.fsrs_optimizer_module_path}")
-    print(repr(config))
-
-    print("\n--- Loading configuration with custom arguments for testing ---")
-    test_args = ["--algo", "FSRSv2", "--secs", "--dev", "--short"]
-    test_config = load_config(custom_args_list=test_args)
-    print(f"Test Model Name: {test_config.model_name}")
-    print(f"Test Use Secs: {test_config.use_secs_intervals}")
-    print(f"Test Dev Mode: {test_config.dev_mode}")
-    print(f"Test S_MIN: {test_config.s_min}")  # Should be 1e-6
-    print(f"Test Short Term Enabled: {test_config.include_short_term}")  # True
-    print(
-        f"Test Eval File Has '-short': {'-short' in test_config.get_evaluation_file_name()}"
-    )  # True
-
-    print("\n--- Testing FSRS-6 S_MIN logic ---")
-    fsrs6_no_secs_config = load_config(custom_args_list=["--algo", "FSRS-6"])
-    print(f"FSRS-6 (no secs) S_MIN: {fsrs6_no_secs_config.s_min}")  # Expected: 0.001
-
-    fsrs6_secs_config = load_config(custom_args_list=["--algo", "FSRS-6", "--secs"])
-    print(f"FSRS-6 (with secs) S_MIN: {fsrs6_secs_config.s_min}")  # Expected: 1e-6
-
-    print("\n--- Testing short-term flag propagation ---")
-    fsrs5_config_with_short_arg = load_config(
-        custom_args_list=["--algo", "FSRS-5", "--short"]
-    )
-    print(
-        f"FSRS-5 (with --short arg) Include Short: {fsrs5_config_with_short_arg.include_short_term}, Eval File: {fsrs5_config_with_short_arg.get_evaluation_file_name()}"
-    )  # E: True / '-short' present
-
-    fsrs5_config_no_short_arg = load_config(custom_args_list=["--algo", "FSRS-5"])
-    print(
-        f"FSRS-5 (no --short arg) Include Short: {fsrs5_config_no_short_arg.include_short_term}, Eval File: {fsrs5_config_no_short_arg.get_evaluation_file_name()}"
-    )  # E: False / '-short' absent
-
-    fsrs4_config_with_short_arg = load_config(
-        custom_args_list=["--algo", "FSRS-4.5", "--short"]
-    )
-    print(
-        f"FSRS-4.5 (with --short arg) Include Short: {fsrs4_config_with_short_arg.include_short_term}, Eval File: {fsrs4_config_with_short_arg.get_evaluation_file_name()}"
-    )  # E: True / '-short' present
-
-    fsrs4_config_no_short_arg = load_config(custom_args_list=["--algo", "FSRS-4.5"])
-    print(
-        f"FSRS-4.5 (no --short arg) Include Short: {fsrs4_config_no_short_arg.include_short_term}, Eval File: {fsrs4_config_no_short_arg.get_evaluation_file_name()}"
-    )  # E: False / '-short' absent
