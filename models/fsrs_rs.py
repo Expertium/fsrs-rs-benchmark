@@ -28,19 +28,32 @@ def convert_to_items(df: pd.DataFrame, config: Config):
             "fsrs-rs-python is not installed. Please install it to use the FSRS-rs backend."
         )
 
+    def parse_int(value: object, *, clamp_nonnegative: bool = False) -> int:
+        parsed = int(float(value))
+        return max(0, parsed) if clamp_nonnegative else parsed
+
+    def parse_history(history: object, *, clamp_nonnegative: bool = False) -> List[int]:
+        if pd.isna(history):
+            return []
+        return [
+            parse_int(value.strip(), clamp_nonnegative=clamp_nonnegative)
+            for value in str(history).split(",")
+            if value.strip()
+        ]
+
     def accumulate(group):
         items = []
         for _, row in group.iterrows():
-            t_history = [max(0, int(t)) for t in row["t_history"].split(",")] + [
-                row["delta_t"]
+            t_history = parse_history(row["t_history"], clamp_nonnegative=True) + [
+                parse_int(row["delta_t"], clamp_nonnegative=True)
             ]
-            r_history = [int(t) for t in row["r_history"].split(",")] + [row["rating"]]
+            r_history = parse_history(row["r_history"]) + [parse_int(row["rating"])]
             items.append(
                 (
                     row["review_th"],
                     FSRSItem(
                         reviews=[
-                            FSRSReview(delta_t=int(x[0]), rating=int(x[1]))
+                            FSRSReview(delta_t=x[0], rating=x[1])
                             for x in zip(t_history, r_history)
                         ]
                     ),
