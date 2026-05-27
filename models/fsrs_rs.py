@@ -65,6 +65,17 @@ def convert_to_items(df: pd.DataFrame, config: Config):
 class FSRSRsBackend:
     """Wrapper for FSRS-rs backend."""
 
+    @staticmethod
+    def default_parameters() -> List[float]:
+        try:
+            from fsrs_rs_python import DEFAULT_PARAMETERS
+        except ImportError:
+            raise ImportError(
+                "fsrs-rs-python is not installed. Please install it to use FSRS-rs models."
+            )
+
+        return list(DEFAULT_PARAMETERS)
+
     def __init__(self, config: Config):
         """
         Initialize FSRS-rs backend.

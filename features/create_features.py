@@ -2,7 +2,7 @@ import copy
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
-from .factory import create_feature_engineer
+from .fsrs_engineer import FSRSFeatureEngineer
 from config import Config
 
 
@@ -36,13 +36,7 @@ def _create_features_standard(df: pd.DataFrame, config) -> pd.DataFrame:
     Returns:
         Processed dataframe
     """
-    # Create the appropriate feature engineer
-    feature_engineer = create_feature_engineer(config)
-
-    # Create features using the feature engineer
-    processed_df = feature_engineer.create_features(df)
-
-    return processed_df
+    return FSRSFeatureEngineer(config).create_features(df)
 
 
 def _create_features_with_equalized_test(
@@ -62,13 +56,13 @@ def _create_features_with_equalized_test(
     # Create non-seconds features
     config_non_secs = copy.deepcopy(config)
     config_non_secs.use_secs_intervals = False
-    engineer_non_secs = create_feature_engineer(config_non_secs)
+    engineer_non_secs = FSRSFeatureEngineer(config_non_secs)
     df_non_secs = engineer_non_secs.create_features(df.copy())
 
     # Create seconds features
     config_secs = copy.deepcopy(config)
     config_secs.use_secs_intervals = True
-    engineer_secs = create_feature_engineer(config_secs)
+    engineer_secs = FSRSFeatureEngineer(config_secs)
     df_secs = engineer_secs.create_features(df.copy())
 
     # Set lapses for RMSE (bins)

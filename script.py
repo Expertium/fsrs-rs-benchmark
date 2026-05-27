@@ -11,17 +11,17 @@ def _bootstrap_models_package() -> None:
 
     package = types.ModuleType(package_name)
     from pathlib import Path as _Path
+
     package.__path__ = [str(_Path(__file__).resolve().parent / package_name)]
     sys.modules[package_name] = package
 
-    for submodule in ("trainable", "fsrs_rs"):
-        module_name = f"{package_name}.{submodule}"
-        module_path = _Path(__file__).resolve().parent / package_name / f"{submodule}.py"
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
+    module_name = f"{package_name}.fsrs_rs"
+    module_path = _Path(__file__).resolve().parent / package_name / "fsrs_rs.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
 
 
 _bootstrap_models_package()
@@ -54,30 +54,6 @@ config.partitions = "none"
 
 torch.manual_seed(config.seed)
 tqdm.pandas()
-
-FSRS6_INIT_W = [
-    0.212,
-    1.2931,
-    2.3065,
-    8.2956,
-    6.4133,
-    0.8334,
-    3.0194,
-    0.001,
-    1.8722,
-    0.1666,
-    0.796,
-    1.4835,
-    0.0614,
-    0.2629,
-    1.6483,
-    0.6014,
-    1.8729,
-    0.5425,
-    0.0912,
-    0.0658,
-    0.1542,
-]
 
 
 @catch_exceptions
@@ -117,12 +93,16 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
 
         testsets.append(test_set)
         try:
-            weights = FSRS6_INIT_W if config.default_params else fsrs_rs.train(train_set)
+            weights = (
+                FSRSRsBackend.default_parameters()
+                if config.default_params
+                else fsrs_rs.train(train_set)
+            )
         except Exception as exc:
             if str(exc).endswith("inadequate."):
                 if config.verbose_inadequate_data:
                     print("Skipping - Inadequate data")
-                weights = FSRS6_INIT_W
+                weights = FSRSRsBackend.default_parameters()
             else:
                 print(f"User: {user_id}")
                 raise exc

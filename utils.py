@@ -3,23 +3,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import traceback
 import torch
-from torch import Tensor
 from pathlib import Path
 from sklearn.metrics import root_mean_squared_error  # type: ignore
 from functools import wraps
 from itertools import accumulate
 from numbers import Real
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, Hashable, Mapping, TypeAlias, cast
 from config import Config
-from models.trainable import (
-    ModelState,
-    ParameterList,
-    PartitionedModelState,
-    TrainingState,
-)
 
-if TYPE_CHECKING:
-    from models.trainable import TrainableModel
+ParameterList: TypeAlias = list[float]
+TorchStateDict: TypeAlias = Mapping[str, Any]
+ModelState: TypeAlias = ParameterList | TorchStateDict
+PartitionedModelState: TypeAlias = dict[Hashable, ModelState]
+TrainingState: TypeAlias = ModelState | PartitionedModelState
 
 
 def catch_exceptions(func):
@@ -44,10 +40,6 @@ def catch_exceptions(func):
             return None, error_msg
 
     return wrapper
-
-
-def get_model_state(model: "TrainableModel") -> ModelState:
-    return model.benchmark_state()
 
 
 def mean_bias_error(y, p):
@@ -193,85 +185,6 @@ def save_evaluation_file(user_id, df, config: Config):
             sep="\t",
             index=False,
         )
-
-
-def batch_process_wrapper(
-    model: "TrainableModel", batch: tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
-) -> dict[str, Tensor]:
-    """
-    Wrapper function for batch processing of model predictions.
-
-    Args:
-        model: Trainable model instance
-        batch: Tuple of (sequences, delta_ts, labels, seq_lens, weights)
-
-    Returns:
-        Dictionary containing model outputs including labels and weights
-    """
-    sequences, delta_ts, labels, seq_lens, weights = batch
-    real_batch_size = seq_lens.shape[0]
-    result = {"labels": labels, "weights": weights}
-    outputs = model.batch_process(sequences, delta_ts, seq_lens, real_batch_size)
-    result.update(outputs)
-    return result
-
-
-class Collection:
-    """Collection class for batch prediction with trainable models."""
-
-    def __init__(self, model: "TrainableModel", config: Config) -> None:
-        """
-        Initialize collection with a model.
-
-        Args:
-            model: Trainable model instance
-            config: Configuration object
-        """
-        self.model = model.to(device=config.device)
-        self.model.eval()
-        self.config = config
-
-    def batch_predict(self, dataset):
-        """
-        Perform batch prediction on dataset.
-
-        Args:
-            dataset: DataFrame containing review data
-
-        Returns:
-            Tuple of (retentions, stabilities, difficulties)
-        """
-        try:
-            from fsrs_optimizer import BatchDataset, BatchLoader, DevicePrefetchLoader  # type: ignore
-        except ImportError:
-            raise ImportError(
-                "fsrs_optimizer is required for batch prediction. "
-                "Please install it to use Collection.batch_predict()"
-            )
-
-        batch_dataset = BatchDataset(
-            dataset,
-            batch_size=8192,
-            sort_by_length=False,
-        )
-        batch_loader = BatchLoader(batch_dataset, shuffle=False)
-        device_loader = DevicePrefetchLoader(
-            batch_loader,
-            target_device=self.config.device,
-        )
-        retentions = []
-        stabilities = []
-        difficulties = []
-        with torch.no_grad():
-            for batch in device_loader:
-                result = batch_process_wrapper(self.model, batch)
-                retentions.extend(result["retentions"].cpu().tolist())
-                if "stabilities" in result:
-                    stabilities.extend(result["stabilities"].cpu().tolist())
-                if "difficulties" in result:
-                    difficulties.extend(result["difficulties"].cpu().tolist())
-
-        return retentions, stabilities, difficulties
 
 
 def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
