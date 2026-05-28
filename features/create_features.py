@@ -21,21 +21,6 @@ def create_features(df: pd.DataFrame, config: Config) -> pd.DataFrame:
     # Handle special case for equalized test with non-seconds
     if all([config.use_secs_intervals, config.equalize_test_with_non_secs]):
         return _create_features_with_equalized_test(df, config)
-    else:
-        return _create_features_standard(df, config)
-
-
-def _create_features_standard(df: pd.DataFrame, config) -> pd.DataFrame:
-    """
-    Standard feature creation using the appropriate feature engineer
-
-    Args:
-        df: Input dataframe
-        config: Configuration object
-
-    Returns:
-        Processed dataframe
-    """
     return FSRSFeatureEngineer(config).create_features(df)
 
 

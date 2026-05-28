@@ -160,35 +160,6 @@ def create_parser():
     return parser
 
 
-def _parse_cuda_devices(raw: Optional[str]) -> Optional[List[int]]:
-    def _inner() -> Optional[List[int]]:
-        if raw is None:
-            return None
-        value = raw.strip()
-        if not value:
-            return None
-        value_lower = value.lower()
-        if value_lower in {"all", "*"}:
-            if not torch.cuda.is_available():
-                return []
-            return list(range(torch.cuda.device_count()))
-
-        def _parse_part(part: str) -> int:
-            try:
-                device_id = int(part)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
-                ) from exc
-            if device_id < 0:
-                raise ValueError("CUDA device IDs must be >= 0.")
-            return device_id
-
-        return list(map(_parse_part, filter(None, re.split(r"[,\s]+", value))))
-
-    return _inner()
-
-
 class Config:
     """Holds all application configurations derived from command-line arguments and defaults."""
 
@@ -216,6 +187,32 @@ class Config:
         self.data_path: Path = Path(args.data)
         self.use_recency_weighting: bool = args.recency
         self.train_equals_test: bool = args.train_equals_test
+
+        def _parse_cuda_devices(raw: Optional[str]) -> Optional[List[int]]:
+            if raw is None:
+                return None
+            value = raw.strip()
+            if not value:
+                return None
+            value_lower = value.lower()
+            if value_lower in {"all", "*"}:
+                if not torch.cuda.is_available():
+                    return []
+                return list(range(torch.cuda.device_count()))
+
+            def _parse_part(part: str) -> int:
+                try:
+                    device_id = int(part)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
+                    ) from exc
+                if device_id < 0:
+                    raise ValueError("CUDA device IDs must be >= 0.")
+                return device_id
+
+            return list(map(_parse_part, filter(None, re.split(r"[,\s]+", value))))
+
         self.cuda_device_ids: Optional[List[int]] = _parse_cuda_devices(args.gpus)
 
         # Training/data parameters from parser (with defaults)
@@ -274,10 +271,6 @@ class Config:
 
         # Seed for reproducibility
         self.seed: int = 42
-
-    def get_evaluation_file_name(self) -> str:
-        """Returns the base name for output files (e.g., for results, plots)."""
-        return self.base_file_name
 
     def __repr__(self) -> str:
         """Provides a string representation of the configuration."""

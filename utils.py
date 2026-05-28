@@ -41,10 +41,6 @@ def catch_exceptions(func):
     return wrapper
 
 
-def mean_bias_error(y, p):
-    return np.mean(np.array(p) - np.array(y))
-
-
 def rmse_matrix(df):
     tmp = df.copy()
     tmp["delta_t"] = tmp["elapsed_days"].map(
@@ -80,15 +76,6 @@ def cum_concat(x):
     return list(accumulate(x))
 
 
-def save_evaluation_file(user_id, df, config: Config):
-    if config.save_evaluation_file:
-        df.to_csv(
-            f"evaluation/{config.get_evaluation_file_name()}/{user_id}.tsv",
-            sep="\t",
-            index=False,
-        )
-
-
 def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
     """
     Evaluate model predictions and generate statistics.
@@ -116,7 +103,7 @@ def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
     rmse_raw = root_mean_squared_error(y_true=y, y_pred=p)
     logloss = log_loss(y_true=y, y_pred=p, labels=[0, 1])
     rmse_bins = rmse_matrix(df)
-    mbe = mean_bias_error(y, p)
+    mbe = np.mean(np.array(p) - np.array(y))
     smECE = relplot.smECE(np.array(p), np.array(y))
     y_hat_90 = (np.array(p) >= 0.9).astype(int)
     precision_90 = precision_score(y, y_hat_90, zero_division=0)
@@ -163,18 +150,17 @@ def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
     return stats, _build_raw()
 
 
-def rounded_parameter_list(state: ParameterList) -> ParameterList:
-    return list(map(lambda x: round(float(x), 6), state))
-
-
 def result_parameters(
     state: TrainingState,
 ) -> ParameterList | dict[str, ParameterList] | None:
     def is_parameter_list(s: Any) -> bool:
         return isinstance(s, list) and all(map(lambda x: isinstance(x, Real), s))
 
+    def _round(lst: ParameterList) -> ParameterList:
+        return list(map(lambda x: round(float(x), 6), lst))
+
     if is_parameter_list(state):
-        return rounded_parameter_list(cast(ParameterList, state))
+        return _round(cast(ParameterList, state))
 
     def _dict_result():
         if not isinstance(state, dict):
@@ -182,7 +168,7 @@ def result_parameters(
         if all(map(is_parameter_list, state.values())):
             return dict(zip(
                 map(str, state.keys()),
-                map(lambda v: rounded_parameter_list(cast(ParameterList, v)), state.values()),
+                map(lambda v: _round(cast(ParameterList, v)), state.values()),
             ))
         return None
 

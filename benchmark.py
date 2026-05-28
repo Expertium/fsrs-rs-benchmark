@@ -22,7 +22,7 @@ from tqdm.auto import tqdm  # type: ignore
 
 from config import create_parser, Config
 from data_loader import UserDataLoader
-from utils import catch_exceptions, evaluate, save_evaluation_file, sort_jsonl
+from utils import catch_exceptions, evaluate, sort_jsonl
 from fsrs_rs_python import FSRS, FSRSItem, FSRSReview, DEFAULT_PARAMETERS  # type: ignore[import-untyped]
 
 # ---------------------------------------------------------------------------
@@ -56,9 +56,8 @@ def _parse_scalar(value: object, type_name: str) -> str:
     return _inner()
 
 
-def parse_interval(value: object, *, clamp_nonnegative: bool = False) -> float:
-    parsed = float(_parse_scalar(value, "numeric review"))
-    return max(0.0, parsed) if clamp_nonnegative else parsed
+def parse_interval(value: object) -> float:
+    return max(0.0, float(_parse_scalar(value, "numeric review")))
 
 
 def parse_rating(value: object) -> int:
@@ -69,29 +68,17 @@ def parse_rating(value: object) -> int:
 def parse_history(
     history: object,
     parser: Callable[..., ParsedValue],
-    *,
-    clamp_nonnegative: bool = False,
-    supports_clamp: bool = False,
 ) -> List[ParsedValue]:
     if pd.isna(history):
         return []
-    values = list(filter(None, map(str.strip, str(history).split(","))))
-
-    def _apply_parser():
-        if supports_clamp:
-            return list(map(lambda v: parser(v, clamp_nonnegative=clamp_nonnegative), values))
-        return list(map(parser, values))
-
-    return _apply_parser()
+    return list(map(parser, filter(None, map(str.strip, str(history).split(",")))))
 
 
 def build_reviews(row: pd.Series, *, include_current: bool = False):
-    t_history = parse_history(
-        row["t_history"], parse_interval, clamp_nonnegative=True, supports_clamp=True
-    )
+    t_history = parse_history(row["t_history"], parse_interval)
     r_history = parse_history(row["r_history"], parse_rating)
     if include_current:
-        t_history = [*t_history, parse_interval(row["delta_t"], clamp_nonnegative=True)]
+        t_history = [*t_history, parse_interval(row["delta_t"])]
         r_history = [*r_history, parse_rating(row["rating"])]
 
     def _make_reviews():

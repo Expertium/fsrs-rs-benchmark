@@ -254,37 +254,6 @@ class BaseFeatureEngineer(ABC):
         )
         return df
 
-    def get_time_history_list(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Get time history list for feature engineering
-
-        Args:
-            df: Input dataframe
-
-        Returns:
-            Time history list as pandas Series
-        """
-        if all([self.config.use_secs_intervals, not self.config.equalize_test_with_non_secs]):
-            col = "delta_t_secs"
-        else:
-            col = "delta_t"
-        return df.groupby("card_id", group_keys=False)[col].apply(_to_history_list)
-
-    def get_rating_history_list(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Get rating history list for feature engineering
-
-        Args:
-            df: Input dataframe
-
-        Returns:
-            Rating history list as pandas Series
-        """
-        r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
-            _to_history_list
-        )
-        return r_history_list
-
     def get_history_lists(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
         """
         Get history record lists for feature engineering
@@ -292,8 +261,12 @@ class BaseFeatureEngineer(ABC):
         Returns:
             Tuple of (time_history_list, rating_history_list)
         """
-        t_history_list = self.get_time_history_list(df)
-        r_history_list = self.get_rating_history_list(df)
+        if all([self.config.use_secs_intervals, not self.config.equalize_test_with_non_secs]):
+            col = "delta_t_secs"
+        else:
+            col = "delta_t"
+        t_history_list = df.groupby("card_id", group_keys=False)[col].apply(_to_history_list)
+        r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(_to_history_list)
         return t_history_list, r_history_list
 
     def _model_specific_postprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
