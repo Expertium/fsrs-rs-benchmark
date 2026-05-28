@@ -121,17 +121,36 @@ def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
     y_hat_90 = (np.array(p) >= 0.9).astype(int)
     precision_90 = precision_score(y, y_hat_90, zero_division=0)
     recall_90 = recall_score(y, y_hat_90, zero_division=0)
-    try:
-        auc = round(roc_auc_score(y_true=y, y_score=p), 6)
-    except Exception:
-        auc = None
+    def _compute_auc():
+        try:
+            return round(roc_auc_score(y_true=y, y_score=p), 6)
+        except Exception:
+            return None
+
+    def _handle_weights(stats):
+        if w_list:
+            parameters = result_parameters(w_list[-1])
+            if parameters is not None:
+                cast(Any, stats)["parameters"] = parameters
+            elif config.save_weights:
+                save_model_state(w_list[-1], file_name, user_id)
+
+    def _build_raw():
+        if config.save_raw_output:
+            return {
+                "user": int(user_id),
+                "p": list(map(lambda x: round(x, 4), p)),
+                "y": list(map(int, y)),
+            }
+        return None
+
     stats = {
         "metrics": {
             "RMSE": round(rmse_raw, 6),
             "LogLoss": round(logloss, 6),
             "RMSE(bins)": round(rmse_bins, 6),
             "smECE": round(smECE, 6),
-            "AUC": auc,
+            "AUC": _compute_auc(),
             "precision@90": round(precision_90, 6),
             "recall@90": round(recall_90, 6),
             "ICI": round(ici, 6),
@@ -140,44 +159,34 @@ def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
         "user": int(user_id),
         "size": len(y),
     }
-    if w_list:
-        parameters = result_parameters(w_list[-1])
-        if parameters is not None:
-            cast(Any, stats)["parameters"] = parameters
-        elif config.save_weights:
-            save_model_state(w_list[-1], file_name, user_id)
-    if config.save_raw_output:
-        raw = {
-            "user": int(user_id),
-            "p": list(map(lambda x: round(x, 4), p)),
-            "y": list(map(int, y)),
-        }
-    else:
-        raw = None
-    return stats, raw
-
-
-def is_parameter_list(state: Any) -> bool:
-    return isinstance(state, list) and all(map(lambda x: isinstance(x, Real), state))
+    _handle_weights(stats)
+    return stats, _build_raw()
 
 
 def rounded_parameter_list(state: ParameterList) -> ParameterList:
-    return [round(float(x), 6) for x in state]
+    return list(map(lambda x: round(float(x), 6), state))
 
 
 def result_parameters(
     state: TrainingState,
 ) -> ParameterList | dict[str, ParameterList] | None:
+    def is_parameter_list(s: Any) -> bool:
+        return isinstance(s, list) and all(map(lambda x: isinstance(x, Real), s))
+
     if is_parameter_list(state):
         return rounded_parameter_list(cast(ParameterList, state))
 
-    if isinstance(state, dict) and all(map(is_parameter_list, state.values())):
-        return dict(zip(
-            map(str, state.keys()),
-            map(lambda v: rounded_parameter_list(cast(ParameterList, v)), state.values()),
-        ))
+    def _dict_result():
+        if not isinstance(state, dict):
+            return None
+        if all(map(is_parameter_list, state.values())):
+            return dict(zip(
+                map(str, state.keys()),
+                map(lambda v: rounded_parameter_list(cast(ParameterList, v)), state.values()),
+            ))
+        return None
 
-    return None
+    return _dict_result()
 
 
 def save_model_state(state: TrainingState, file_name: str, user_id: int) -> None:

@@ -46,13 +46,14 @@ ParsedValue = TypeVar("ParsedValue", int, float)
 
 
 def _parse_scalar(value: object, type_name: str) -> str:
-    if pd.isna(value):
-        raise ValueError(f"Expected a {type_name} history value, got missing data")
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
+    def _inner() -> str:
+        if pd.isna(value):
+            raise ValueError(f"Expected a {type_name} history value, got missing data")
+        result = str(value).strip()
+        if not result:
             raise ValueError(f"Expected a {type_name} history value, got empty text")
-    return str(value)
+        return result
+    return _inner()
 
 
 def parse_interval(value: object, *, clamp_nonnegative: bool = False) -> float:
@@ -75,9 +76,13 @@ def parse_history(
     if pd.isna(history):
         return []
     values = list(filter(None, map(str.strip, str(history).split(","))))
-    if supports_clamp:
-        return [parser(value, clamp_nonnegative=clamp_nonnegative) for value in values]
-    return list(map(parser, values))
+
+    def _apply_parser():
+        if supports_clamp:
+            return list(map(lambda v: parser(v, clamp_nonnegative=clamp_nonnegative), values))
+        return list(map(parser, values))
+
+    return _apply_parser()
 
 
 def build_reviews(row: pd.Series, *, include_current: bool = False):
@@ -89,13 +94,12 @@ def build_reviews(row: pd.Series, *, include_current: bool = False):
         t_history = [*t_history, parse_interval(row["delta_t"], clamp_nonnegative=True)]
         r_history = [*r_history, parse_rating(row["rating"])]
 
-    if len(t_history) != len(r_history):
-        raise ValueError("Review history lengths do not match")
+    def _make_reviews():
+        if len(t_history) != len(r_history):
+            raise ValueError("Review history lengths do not match")
+        return list(map(lambda p: FSRSReview(delta_t=p[0], rating=p[1]), zip(t_history, r_history)))
 
-    return [
-        FSRSReview(delta_t=delta_t, rating=rating)
-        for delta_t, rating in zip(t_history, r_history)
-    ]
+    return _make_reviews()
 
 
 def convert_to_items(df: pd.DataFrame) -> List[FSRSItem]:
@@ -178,10 +182,10 @@ def predict(
 
     predictor = FSRS(parameters=weights)
     testset_copy = testset.copy()
-    history_items = [FSRSItem(reviews=build_reviews(row)) for _, row in testset_copy.iterrows()]
+    history_items = list(map(lambda r: FSRSItem(reviews=build_reviews(r[1])), testset_copy.iterrows()))
     memory_states = predictor.memory_state_batch(history_items)
-    testset_copy["stability"] = [state.stability for state in memory_states]
-    testset_copy["difficulty"] = [state.difficulty for state in memory_states]
+    testset_copy["stability"] = list(map(lambda s: s.stability, memory_states))
+    testset_copy["difficulty"] = list(map(lambda s: s.difficulty, memory_states))
     testset_copy["p"] = fsrs7_forgetting_curve(testset_copy["delta_t"], testset_copy["stability"])
 
     p = testset_copy["p"].tolist()
@@ -210,11 +214,23 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
     data_loader = UserDataLoader(config)
     dataset = data_loader.load_user_data(user_id)
 
-    w_list = []
-    testsets = []
-    tscv = TimeSeriesSplit(n_splits=config.n_splits)
+    def _get_weights(train_set):
+        try:
+            return (
+                default_parameters()
+                if config.default_params
+                else train(train_set)
+            )
+        except Exception as exc:
+            if str(exc).endswith("inadequate."):
+                if config.verbose_inadequate_data:
+                    print("Skipping - Inadequate data")
+                return default_parameters()
+            else:
+                print(f"User: {user_id}")
+                raise exc
 
-    for split_i, (train_index, test_index) in enumerate(tscv.split(dataset)):
+    def _select_splits(split_i, train_index, test_index):
         if not config.train_equals_test:
             train_set = dataset.iloc[train_index]
             test_set = dataset.iloc[test_index]
@@ -226,48 +242,47 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
             test_set = dataset[
                 dataset["review_th"] >= dataset.iloc[test_index]["review_th"].min()
             ].copy()
+        return train_set, test_set
 
+    def _filter_same_day(train_set, test_set):
         if config.no_test_same_day:
             test_set = test_set[test_set["elapsed_days"] > 0].copy()
         if config.no_train_same_day:
             train_set = train_set[train_set["elapsed_days"] > 0].copy()
+        return train_set, test_set
 
-        if any([train_set.empty, test_set.empty]):
-            continue
+    def _build_splits():
+        w_list = []
+        testsets = []
+        tscv = TimeSeriesSplit(n_splits=config.n_splits)
+        for split_i, (train_index, test_index) in enumerate(tscv.split(dataset)):
+            train_set, test_set = _select_splits(split_i, train_index, test_index)
+            train_set, test_set = _filter_same_day(train_set, test_set)
+            if any([train_set.empty, test_set.empty]):
+                continue
+            testsets.append(test_set)
+            w_list.append(_get_weights(train_set))
+            if config.train_equals_test:
+                break
+        return w_list, testsets
 
-        testsets.append(test_set)
-        try:
-            weights = (
-                default_parameters()
-                if config.default_params
-                else train(train_set)
-            )
-        except Exception as exc:
-            if str(exc).endswith("inadequate."):
-                if config.verbose_inadequate_data:
-                    print("Skipping - Inadequate data")
-                weights = default_parameters()
-            else:
-                print(f"User: {user_id}")
-                raise exc
-        w_list.append(weights)
+    w_list, testsets = _build_splits()
 
-        if config.train_equals_test:
-            break
+    def _run_predictions():
+        p_acc: list = []
+        y_acc: list = []
+        save_tmp = []
+        for weights, testset in zip(w_list, testsets):
+            p_partition, y_partition, testset_pred = predict(testset, weights)
+            p_acc.extend(p_partition)
+            y_acc.extend(y_partition)
+            save_tmp.append(testset_pred)
+        save_tmp_df = pd.concat(save_tmp)
+        if "tensor" in save_tmp_df:
+            del save_tmp_df["tensor"]
+        return p_acc, y_acc, save_tmp_df
 
-    p = []
-    y = []
-    save_tmp = []
-
-    for weights, testset in zip(w_list, testsets):
-        p_partition, y_partition, testset_pred = predict(testset, weights)
-        p.extend(p_partition)
-        y.extend(y_partition)
-        save_tmp.append(testset_pred)
-
-    save_tmp_df = pd.concat(save_tmp)
-    if "tensor" in save_tmp_df:
-        del save_tmp_df["tensor"]
+    p, y, save_tmp_df = _run_predictions()
     save_evaluation_file(user_id, save_tmp_df, config)
 
     stats, raw = evaluate(

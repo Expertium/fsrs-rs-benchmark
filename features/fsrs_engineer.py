@@ -21,9 +21,9 @@ class FSRSFeatureEngineer(BaseFeatureEngineer):
 
         # Create tensor features with shape (sequence_length, 2)
         # Each row contains [time_interval, rating] for that step
-        cast(Any, df)["tensor"] = [
-            torch.tensor((t_item[:-1], r_item[:-1]), dtype=torch.float32).transpose(0, 1)
-            for t_item, r_item in chain.from_iterable(map(zip, t_history_list, r_history_list))
-        ]
+        cast(Any, df)["tensor"] = list(map(
+            lambda pair: torch.tensor((pair[0][:-1], pair[1][:-1]), dtype=torch.float32).transpose(0, 1),
+            chain.from_iterable(map(zip, t_history_list, r_history_list))
+        ))
 
         return df

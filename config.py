@@ -161,30 +161,32 @@ def create_parser():
 
 
 def _parse_cuda_devices(raw: Optional[str]) -> Optional[List[int]]:
-    if raw is None:
-        return None
-    value = raw.strip()
-    if value == "":
-        return None
-    value_lower = value.lower()
-    if value_lower in {"all", "*"}:
-        if not torch.cuda.is_available():
-            return []
-        return list(range(torch.cuda.device_count()))
+    def _inner() -> Optional[List[int]]:
+        if raw is None:
+            return None
+        value = raw.strip()
+        if not value:
+            return None
+        value_lower = value.lower()
+        if value_lower in {"all", "*"}:
+            if not torch.cuda.is_available():
+                return []
+            return list(range(torch.cuda.device_count()))
 
-    parts = list(filter(None, re.split(r"[,\s]+", value)))
-    device_ids: List[int] = []
-    for part in parts:
-        try:
-            device_id = int(part)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
-            ) from exc
-        if device_id < 0:
-            raise ValueError("CUDA device IDs must be >= 0.")
-        device_ids.append(device_id)
-    return device_ids
+        def _parse_part(part: str) -> int:
+            try:
+                device_id = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
+                ) from exc
+            if device_id < 0:
+                raise ValueError("CUDA device IDs must be >= 0.")
+            return device_id
+
+        return list(map(_parse_part, filter(None, re.split(r"[,\s]+", value))))
+
+    return _inner()
 
 
 class Config:
@@ -227,25 +229,24 @@ class Config:
         # if hasattr(torch, "set_num_interop_threads"):
         #     torch.set_num_interop_threads(args.torch_num_interop_threads)
 
-        # Validate model name
-        if self.model_name not in get_args(ModelName):
-            raise ValueError(
-                f"Model name '{self.model_name}' must be one of {get_args(ModelName)}"
-            )
+        def _validate_model():
+            if self.model_name not in get_args(ModelName):
+                raise ValueError(
+                    f"Model name '{self.model_name}' must be one of {get_args(ModelName)}"
+                )
 
+        def _select_device():
+            if all([torch.cuda.is_available(), self.model_name in [
+                "GRU", "LSTM", "RNN", "NN-17", "Transformer",
+            ]]):
+                return torch.device("cuda")
+            if all([torch.backends.mps.is_available(), self.model_name == "LSTM"]):
+                return torch.device("mps")
+            return torch.device("cpu")
+
+        _validate_model()
         # Device configuration
-        if all([torch.cuda.is_available(), self.model_name in [
-            "GRU",
-            "LSTM",
-            "RNN",
-            "NN-17",
-            "Transformer",
-        ]]):
-            self.device: torch.device = torch.device("cuda")
-        elif all([torch.backends.mps.is_available(), self.model_name == "LSTM"]):
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
+        self.device: torch.device = _select_device()
 
         # Verbosity
         self.verbose_inadequate_data: bool = False
@@ -280,10 +281,12 @@ class Config:
 
     def __repr__(self) -> str:
         """Provides a string representation of the configuration."""
-        attrs = {
-            k: v
-            for k, v in self.__dict__.items()
-            if not k.startswith("_")
-        }
-        return f"Config({attrs})"
+        def _inner() -> str:
+            attrs = {
+                k: v
+                for k, v in self.__dict__.items()
+                if not k.startswith("_")
+            }
+            return f"Config({attrs})"
+        return _inner()
 

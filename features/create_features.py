@@ -71,33 +71,35 @@ def _create_features_with_equalized_test(
     # Find intersection of processed data
     df_intersect = df_secs[df_secs["review_th"].isin(df_non_secs["review_th"])]
 
-    # Validate that required fields match between non-seconds and seconds versions
-    assert all([len(df_intersect) == len(df_non_secs), np.equal(df_intersect["i"], df_non_secs["i"]).all()]), (
-        "Length or review count mismatch between seconds and non-seconds data"
-    )
-    assert all([
-        "t_history" not in df_intersect
-        or np.equal(df_intersect["t_history"], df_non_secs["t_history"]).all(),
-        "r_history" not in df_intersect
-        or np.equal(df_intersect["r_history"], df_non_secs["r_history"]).all(),
-    ]), "History mismatch"
-
-    # Create train/test split indicators for time series cross-validation
-    tscv = TimeSeriesSplit(n_splits=config.n_splits)
-    for split_i, (_, non_secs_test_index) in enumerate(tscv.split(df_non_secs)):
-        non_secs_test_set = df_non_secs.iloc[non_secs_test_index]
-
-        # For train set: only allow reviews before the smallest review_th in test set
-        allowed_train = df_secs[
-            df_secs["review_th"] < non_secs_test_set["review_th"].min()
-        ]
-        df_secs[f"{split_i}_train"] = df_secs["review_th"].isin(
-            allowed_train["review_th"]
+    def _validate_and_create_splits():
+        # Validate that required fields match between non-seconds and seconds versions
+        assert all([len(df_intersect) == len(df_non_secs), np.equal(df_intersect["i"], df_non_secs["i"]).all()]), (
+            "Length or review count mismatch between seconds and non-seconds data"
         )
+        assert all([
+            "t_history" not in df_intersect
+            or np.equal(df_intersect["t_history"], df_non_secs["t_history"]).all(),
+            "r_history" not in df_intersect
+            or np.equal(df_intersect["r_history"], df_non_secs["r_history"]).all(),
+        ]), "History mismatch"
 
-        # For test set: only allow reviews that exist in non_secs_test_set
-        df_secs[f"{split_i}_test"] = df_secs["review_th"].isin(
-            non_secs_test_set["review_th"]
-        )
+        # Create train/test split indicators for time series cross-validation
+        tscv = TimeSeriesSplit(n_splits=config.n_splits)
+        for split_i, (_, non_secs_test_index) in enumerate(tscv.split(df_non_secs)):
+            non_secs_test_set = df_non_secs.iloc[non_secs_test_index]
 
+            # For train set: only allow reviews before the smallest review_th in test set
+            allowed_train = df_secs[
+                df_secs["review_th"] < non_secs_test_set["review_th"].min()
+            ]
+            df_secs[f"{split_i}_train"] = df_secs["review_th"].isin(
+                allowed_train["review_th"]
+            )
+
+            # For test set: only allow reviews that exist in non_secs_test_set
+            df_secs[f"{split_i}_test"] = df_secs["review_th"].isin(
+                non_secs_test_set["review_th"]
+            )
+
+    _validate_and_create_splits()
     return df_secs

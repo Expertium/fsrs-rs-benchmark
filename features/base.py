@@ -12,7 +12,7 @@ def _to_history_list(col):
 
 
 def _fmt_history(history_list):
-    return [",".join(map(str, item[:-1])) for item in chain.from_iterable(history_list)]
+    return list(map(lambda item: ",".join(map(str, item[:-1])), chain.from_iterable(history_list)))
 
 
 class BaseFeatureEngineer(ABC):
@@ -75,26 +75,30 @@ class BaseFeatureEngineer(ABC):
         # Process time intervals
         df = self._process_time_intervals(df)
 
-        # Handle short-term reviews
-        if not self.config.include_short_term:
-            df.drop(df[df["elapsed_days"] == 0].index, inplace=True)
-            df["i"] = df.groupby("card_id").cumcount() + 1
+        def _handle_short_term():
+            # Handle short-term reviews
+            if not self.config.include_short_term:
+                df.drop(df[df["elapsed_days"] == 0].index, inplace=True)
+                df["i"] = df.groupby("card_id").cumcount() + 1
 
+        _handle_short_term()
         return df
 
     def _process_time_intervals(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process time interval related fields
         """
-        if (
-            "delta_t" not in df.columns
-            and {"elapsed_days", "elapsed_seconds"}.issubset(df.columns)
-        ):
+        def _maybe_init_delta_t():
+            if "delta_t" in df.columns:
+                return
+            if not {"elapsed_days", "elapsed_seconds"}.issubset(df.columns):
+                return
             df["delta_t"] = df["elapsed_days"]
             if self.config.use_secs_intervals:
                 df["delta_t_secs"] = df["elapsed_seconds"] / 86400
                 df["delta_t_secs"] = df["delta_t_secs"].map(lambda x: max(0, x))
 
+        _maybe_init_delta_t()
         df["delta_t"] = df["delta_t"].map(lambda x: max(0, x))
         df["delta_t_int"] = df["elapsed_days"].map(lambda x: max(0, x))
         return df
@@ -108,12 +112,15 @@ class BaseFeatureEngineer(ABC):
             "delta_t"
         ].apply(_to_history_list)
 
-        # Calculate time history (seconds)
-        t_history_secs_list: Optional[pd.Series] = None
-        if self.config.use_secs_intervals:
-            t_history_secs_list = df.groupby("card_id", group_keys=False)[
-                "delta_t_secs"
-            ].apply(_to_history_list)
+        def _secs_history():
+            # Calculate time history (seconds)
+            if self.config.use_secs_intervals:
+                return df.groupby("card_id", group_keys=False)[
+                    "delta_t_secs"
+                ].apply(_to_history_list)
+            return None
+
+        t_history_secs_list: Optional[pd.Series] = _secs_history()
 
         # Calculate rating history
         r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
@@ -142,14 +149,16 @@ class BaseFeatureEngineer(ABC):
         """
         Calculate the previous rating for each review
         """
-        return [
-            next(
-                map(lambda pr: pr[1], filter(lambda pr: pr[0] > 0, zip(reversed(t[:-1]), reversed(r[:-1])))),
-                r[0],
-            )
-            for t_sublist, r_sublist in zip(t_history_list, r_history_list)
-            for t, r in zip(t_sublist, r_sublist)
-        ]
+        def _compute():
+            return [
+                next(
+                    map(lambda pr: pr[1], filter(lambda pr: pr[0] > 0, zip(reversed(t[:-1]), reversed(r[:-1])))),
+                    r[0],
+                )
+                for t_sublist, r_sublist in zip(t_history_list, r_history_list)
+                for t, r in zip(t_sublist, r_sublist)
+            ]
+        return _compute()
 
     def _set_time_histories(
         self,
@@ -160,16 +169,18 @@ class BaseFeatureEngineer(ABC):
         """
         Set time history string fields
         """
-        if t_history_secs_list is not None:
-            if self.config.equalize_test_with_non_secs:
-                df["t_history"] = _fmt_history(t_history_non_secs_list)
-                df["t_history_secs"] = _fmt_history(t_history_secs_list)
+        def _assign():
+            if t_history_secs_list is not None:
+                if self.config.equalize_test_with_non_secs:
+                    df["t_history"] = _fmt_history(t_history_non_secs_list)
+                    df["t_history_secs"] = _fmt_history(t_history_secs_list)
+                else:
+                    df["t_history"] = _fmt_history(t_history_secs_list)
+                df["delta_t"] = df["delta_t_secs"]
             else:
-                df["t_history"] = _fmt_history(t_history_secs_list)
-            df["delta_t"] = df["delta_t_secs"]
-        else:
-            df["t_history"] = _fmt_history(t_history_non_secs_list)
+                df["t_history"] = _fmt_history(t_history_non_secs_list)
 
+        _assign()
         return df
 
     @abstractmethod
@@ -204,21 +215,23 @@ class BaseFeatureEngineer(ABC):
         )
         df.drop(columns=["is_lapse"], inplace=True)
 
-        # Handle short-term reviews
-        if self.config.include_short_term:
-            df = df[(df["delta_t"] != 0) | (df["i"] == 1)].copy()
-
         # Recalculate review sequence number
         df["i"] = df["elapsed_days"].gt(0).groupby(df["card_id"]).cumsum().add(1)
 
-        # Handle outliers and non-continuous rows (only for non-seconds intervals)
-        if not self.config.use_secs_intervals:
-            df = self._handle_outliers_and_continuity(df)
-            if df.empty:
-                raise ValueError(
-                    "No data after handling outliers and non-continuous rows"
-                )
+        def _filter_and_validate(df):
+            # Handle short-term reviews
+            if self.config.include_short_term:
+                df = df[(df["delta_t"] != 0) | (df["i"] == 1)].copy()
+            # Handle outliers and non-continuous rows (only for non-seconds intervals)
+            if not self.config.use_secs_intervals:
+                df = self._handle_outliers_and_continuity(df)
+                if df.empty:
+                    raise ValueError(
+                        "No data after handling outliers and non-continuous rows"
+                    )
+            return df
 
+        df = _filter_and_validate(df)
         return df[df["delta_t"] > 0].sort_values(by=["review_th"])
 
     def _handle_outliers_and_continuity(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -34,31 +34,32 @@ class UserDataLoader:
         if dataset.shape[0] < 6:
             raise Exception(f"{user_id} does not have enough data.")
 
-        # Handle partitions if needed
-        if self.config.partitions != "none":
-            # Load cards and decks
-            df_cards = pd.read_parquet(
-                self.data_path / "cards", filters=[("user_id", "=", user_id)]
-            )
-            df_cards.drop(columns=["user_id"], inplace=True)
+        def _add_partition(dataset):
+            if self.config.partitions != "none":
+                # Load cards and decks
+                df_cards = pd.read_parquet(
+                    self.data_path / "cards", filters=[("user_id", "=", user_id)]
+                )
+                df_cards.drop(columns=["user_id"], inplace=True)
 
-            df_decks = pd.read_parquet(
-                self.data_path / "decks", filters=[("user_id", "=", user_id)]
-            )
-            df_decks.drop(columns=["user_id"], inplace=True)
+                df_decks = pd.read_parquet(
+                    self.data_path / "decks", filters=[("user_id", "=", user_id)]
+                )
+                df_decks.drop(columns=["user_id"], inplace=True)
 
-            # Merge all data
-            dataset = dataset.merge(df_cards, on="card_id", how="left").merge(
-                df_decks, on="deck_id", how="left"
-            )
-            dataset.fillna(-1, inplace=True)
+                # Merge all data
+                dataset = dataset.merge(df_cards, on="card_id", how="left").merge(
+                    df_decks, on="deck_id", how="left"
+                )
+                dataset.fillna(-1, inplace=True)
 
-            # Set partition based on config
-            if self.config.partitions == "preset":
-                dataset["partition"] = dataset["preset_id"].astype(int)
-            elif self.config.partitions == "deck":
-                dataset["partition"] = dataset["deck_id"].astype(int)
-        else:
-            dataset["partition"] = 0
+                # Set partition based on config
+                if self.config.partitions == "preset":
+                    dataset["partition"] = dataset["preset_id"].astype(int)
+                elif self.config.partitions == "deck":
+                    dataset["partition"] = dataset["deck_id"].astype(int)
+            else:
+                dataset["partition"] = 0
+            return dataset
 
-        return dataset
+        return _add_partition(dataset)
