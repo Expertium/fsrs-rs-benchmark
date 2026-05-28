@@ -45,25 +45,24 @@ FSRS7_S_WEIGHT_POWER2_INDEX = 34
 ParsedValue = TypeVar("ParsedValue", int, float)
 
 
-def parse_interval(value: object, *, clamp_nonnegative: bool = False) -> float:
+def _parse_scalar(value: object, type_name: str) -> str:
     if pd.isna(value):
-        raise ValueError("Expected a numeric review history value, got missing data")
+        raise ValueError(f"Expected a {type_name} history value, got missing data")
     if isinstance(value, str):
         value = value.strip()
         if not value:
-            raise ValueError("Expected a numeric review history value, got empty text")
-    parsed = float(value)
+            raise ValueError(f"Expected a {type_name} history value, got empty text")
+    return str(value)
+
+
+def parse_interval(value: object, *, clamp_nonnegative: bool = False) -> float:
+    parsed = float(_parse_scalar(value, "numeric review"))
     return max(0.0, parsed) if clamp_nonnegative else parsed
 
 
 def parse_rating(value: object) -> int:
-    if pd.isna(value):
-        raise ValueError("Expected a rating history value, got missing data")
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError("Expected a rating history value, got empty text")
-    return int(float(value))
+    return int(float(_parse_scalar(value, "rating")))
+
 
 
 def parse_history(
@@ -75,10 +74,10 @@ def parse_history(
 ) -> List[ParsedValue]:
     if pd.isna(history):
         return []
-    values = [value.strip() for value in str(history).split(",") if value.strip()]
+    values = list(filter(None, map(str.strip, str(history).split(","))))
     if supports_clamp:
         return [parser(value, clamp_nonnegative=clamp_nonnegative) for value in values]
-    return [parser(value) for value in values]
+    return list(map(parser, values))
 
 
 def build_reviews(row: pd.Series, *, include_current: bool = False):
@@ -233,7 +232,7 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
         if config.no_train_same_day:
             train_set = train_set[train_set["elapsed_days"] > 0].copy()
 
-        if train_set.empty or test_set.empty:
+        if any([train_set.empty, test_set.empty]):
             continue
 
         testsets.append(test_set)

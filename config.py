@@ -172,7 +172,7 @@ def _parse_cuda_devices(raw: Optional[str]) -> Optional[List[int]]:
             return []
         return list(range(torch.cuda.device_count()))
 
-    parts = [p for p in re.split(r"[,\s]+", value) if p]
+    parts = list(filter(None, re.split(r"[,\s]+", value)))
     device_ids: List[int] = []
     for part in parts:
         try:
@@ -192,7 +192,7 @@ class Config:
 
     def __init__(self, args: argparse.Namespace):
         # Store raw args for reference if needed, though direct access should be minimized
-        self.raw_args: argparse.Namespace = args
+        self._raw_args: argparse.Namespace = args
 
         # Basic arguments from parser
         self.dev_mode: bool = args.dev
@@ -234,15 +234,15 @@ class Config:
             )
 
         # Device configuration
-        if torch.cuda.is_available() and self.model_name in [
+        if all([torch.cuda.is_available(), self.model_name in [
             "GRU",
             "LSTM",
             "RNN",
             "NN-17",
             "Transformer",
-        ]:
+        ]]):
             self.device: torch.device = torch.device("cuda")
-        elif torch.backends.mps.is_available() and self.model_name == "LSTM":
+        elif all([torch.backends.mps.is_available(), self.model_name == "LSTM"]):
             self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
@@ -252,32 +252,22 @@ class Config:
 
         # Derived file names
         _file_name_parts: list[str] = [self.model_name]
-        if self.default_params:
-            _file_name_parts.append("-default")
-        if self.only_S0:
-            _file_name_parts.append("-S0")
-        if self.sched_penalties:
-            _file_name_parts.append("-sched_penalties")
-        if self.include_short_term:
-            _file_name_parts.append("-short")
-        if self.use_secs_intervals:
-            _file_name_parts.append("-secs")
-        if self.model_name == "LSTM" and self.lstm_use_duration:
-            _file_name_parts.append("-duration")
-        if self.use_recency_weighting:
-            _file_name_parts.append("-recency")
-        if self.no_test_same_day:
-            _file_name_parts.append("-no_test_same_day")
-        if self.no_train_same_day:
-            _file_name_parts.append("-no_train_same_day")
-        if self.equalize_test_with_non_secs:
-            _file_name_parts.append("-equalize_test_with_non_secs")
-        if self.train_equals_test:
-            _file_name_parts.append("-train_equals_test")
-        if self.partitions != "none":
-            _file_name_parts.append(f"-{self.partitions}")
-        if self.dev_mode:
-            _file_name_parts.append("-dev")
+        _suffix_conditions = [
+            (self.default_params, "-default"),
+            (self.only_S0, "-S0"),
+            (self.sched_penalties, "-sched_penalties"),
+            (self.include_short_term, "-short"),
+            (self.use_secs_intervals, "-secs"),
+            (all([self.model_name == "LSTM", self.lstm_use_duration]), "-duration"),
+            (self.use_recency_weighting, "-recency"),
+            (self.no_test_same_day, "-no_test_same_day"),
+            (self.no_train_same_day, "-no_train_same_day"),
+            (self.equalize_test_with_non_secs, "-equalize_test_with_non_secs"),
+            (self.train_equals_test, "-train_equals_test"),
+            (self.partitions != "none", f"-{self.partitions}"),
+            (self.dev_mode, "-dev"),
+        ]
+        _file_name_parts += list(map(lambda cs: cs[1], filter(lambda cs: cs[0], _suffix_conditions)))
 
         self.base_file_name: str = "".join(_file_name_parts)
 
@@ -293,7 +283,7 @@ class Config:
         attrs = {
             k: v
             for k, v in self.__dict__.items()
-            if k != "raw_args" and not k.startswith("_")
+            if not k.startswith("_")
         }
         return f"Config({attrs})"
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import itertools
 import shutil
 import subprocess
 import sys
@@ -14,29 +15,29 @@ _MANIFEST_PATH = _CRATE_DIR / "Cargo.toml"
 _MODULE_NAME = f"{__name__}.fsrs_rs_python"
 _EXTENSION_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES)
 _EXTENSION_BASENAMES = ("libfsrs_rs_python", "fsrs_rs_python")
+_PYD_SUFFIX = next((s for s in _EXTENSION_SUFFIXES if s.endswith(".pyd")), None)
 
 
 def _load_extension() -> ModuleType | None:
     """Try to load a pre-built extension from the Cargo target directory."""
     candidates: list[Path] = []
     seen: set[Path] = set()
-    for profile in ("release", "debug"):
-        for subdir in ("", "deps"):
-            d = _CRATE_DIR / "target" / profile / subdir
-            if d.exists():
-                for basename in _EXTENSION_BASENAMES:
-                    for candidate in sorted(d.glob(f"{basename}.*")):
-                        if candidate not in seen:
-                            candidates.append(candidate)
-                            seen.add(candidate)
+    for profile, subdir, basename in itertools.product(
+        ("release", "debug"), ("", "deps"), _EXTENSION_BASENAMES
+    ):
+        d = _CRATE_DIR / "target" / profile / subdir
+        if d.exists():
+            for candidate in sorted(d.glob(f"{basename}.*")):
+                if candidate not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate)
 
     # On Windows, Cargo produces a .dll; copy it to .pyd so Python can import it.
     if sys.platform == "win32":
-        pyd_suffix = next((s for s in _EXTENSION_SUFFIXES if s.endswith(".pyd")), None)
-        if pyd_suffix:
+        if _PYD_SUFFIX:
             for candidate in list(candidates):
                 if candidate.suffix == ".dll":
-                    alias = candidate.with_name(candidate.stem + pyd_suffix)
+                    alias = candidate.with_name(candidate.stem + _PYD_SUFFIX)
                     if not alias.exists():
                         try:
                             shutil.copy2(candidate, alias)
@@ -47,7 +48,7 @@ def _load_extension() -> ModuleType | None:
                         seen.add(alias)
 
     for candidate in candidates:
-        if not any(candidate.name.endswith(s) for s in _EXTENSION_SUFFIXES):
+        if not any(map(candidate.name.endswith, _EXTENSION_SUFFIXES)):
             continue
         spec = importlib.util.spec_from_file_location(_MODULE_NAME, candidate)
         if spec is None or spec.loader is None:
@@ -81,9 +82,7 @@ def _build_extension() -> None:
             "Please install Rust/Cargo first."
         ) from exc
     except subprocess.CalledProcessError as exc:
-        details = "\n".join(
-            part.strip() for part in (exc.stdout, exc.stderr) if part and part.strip()
-        )
+        details = "\n".join(filter(None, map(str.strip, filter(None, (exc.stdout, exc.stderr)))))
         raise ImportError(
             "Failed to build fsrs-rs-python. "
             "Please make sure Rust/Cargo is installed and available on PATH."

@@ -19,7 +19,7 @@ def create_features(df: pd.DataFrame, config: Config) -> pd.DataFrame:
     """
 
     # Handle special case for equalized test with non-seconds
-    if config.use_secs_intervals and config.equalize_test_with_non_secs:
+    if all([config.use_secs_intervals, config.equalize_test_with_non_secs]):
         return _create_features_with_equalized_test(df, config)
     else:
         return _create_features_standard(df, config)
@@ -72,18 +72,15 @@ def _create_features_with_equalized_test(
     df_intersect = df_secs[df_secs["review_th"].isin(df_non_secs["review_th"])]
 
     # Validate that required fields match between non-seconds and seconds versions
-    assert len(df_intersect) == len(df_non_secs), (
-        "Length mismatch between seconds and non-seconds data"
+    assert all([len(df_intersect) == len(df_non_secs), np.equal(df_intersect["i"], df_non_secs["i"]).all()]), (
+        "Length or review count mismatch between seconds and non-seconds data"
     )
-    assert np.equal(df_intersect["i"], df_non_secs["i"]).all(), "Review count mismatch"
-    assert (
+    assert all([
         "t_history" not in df_intersect
-        or np.equal(df_intersect["t_history"], df_non_secs["t_history"]).all()
-    ), "Time history mismatch"
-    assert (
+        or np.equal(df_intersect["t_history"], df_non_secs["t_history"]).all(),
         "r_history" not in df_intersect
-        or np.equal(df_intersect["r_history"], df_non_secs["r_history"]).all()
-    ), "Rating history mismatch"
+        or np.equal(df_intersect["r_history"], df_non_secs["r_history"]).all(),
+    ]), "History mismatch"
 
     # Create train/test split indicators for time series cross-validation
     tscv = TimeSeriesSplit(n_splits=config.n_splits)

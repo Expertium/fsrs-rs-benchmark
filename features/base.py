@@ -1,9 +1,18 @@
 from abc import ABC, abstractmethod
+from itertools import chain
 from typing import Optional, List, Tuple
 import pandas as pd
 from config import Config
 from utils import cum_concat
 from fsrs_optimizer import remove_outliers, remove_non_continuous_rows  # type: ignore
+
+
+def _to_history_list(col):
+    return cum_concat(list(map(lambda x: [x], col)))
+
+
+def _fmt_history(history_list):
+    return [",".join(map(str, item[:-1])) for item in chain.from_iterable(history_list)]
 
 
 class BaseFeatureEngineer(ABC):
@@ -79,8 +88,7 @@ class BaseFeatureEngineer(ABC):
         """
         if (
             "delta_t" not in df.columns
-            and "elapsed_days" in df.columns
-            and "elapsed_seconds" in df.columns
+            and {"elapsed_days", "elapsed_seconds"}.issubset(df.columns)
         ):
             df["delta_t"] = df["elapsed_days"]
             if self.config.use_secs_intervals:
@@ -98,18 +106,18 @@ class BaseFeatureEngineer(ABC):
         # Calculate time history (non-seconds)
         t_history_non_secs_list = df.groupby("card_id", group_keys=False)[
             "delta_t"
-        ].apply(lambda x: cum_concat([[i] for i in x]))
+        ].apply(_to_history_list)
 
         # Calculate time history (seconds)
         t_history_secs_list: Optional[pd.Series] = None
         if self.config.use_secs_intervals:
             t_history_secs_list = df.groupby("card_id", group_keys=False)[
                 "delta_t_secs"
-            ].apply(lambda x: cum_concat([[i] for i in x]))
+            ].apply(_to_history_list)
 
         # Calculate rating history
         r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
-            lambda x: cum_concat([[i] for i in x])
+            _to_history_list
         )
 
         # Calculate last rating
@@ -117,11 +125,7 @@ class BaseFeatureEngineer(ABC):
         df["last_rating"] = last_rating
 
         # Set history record strings
-        df["r_history"] = [
-            ",".join(map(str, item[:-1]))
-            for sublist in r_history_list
-            for item in sublist
-        ]
+        df["r_history"] = _fmt_history(r_history_list)
 
         # Process time history strings
         df = self._set_time_histories(
@@ -138,18 +142,14 @@ class BaseFeatureEngineer(ABC):
         """
         Calculate the previous rating for each review
         """
-        last_rating = []
-        for t_sublist, r_sublist in zip(t_history_list, r_history_list):
-            for t_history, r_history in zip(t_sublist, r_sublist):
-                flag = True
-                for t, r in zip(reversed(t_history[:-1]), reversed(r_history[:-1])):
-                    if t > 0:
-                        last_rating.append(r)
-                        flag = False
-                        break
-                if flag:
-                    last_rating.append(r_history[0])
-        return last_rating
+        return [
+            next(
+                map(lambda pr: pr[1], filter(lambda pr: pr[0] > 0, zip(reversed(t[:-1]), reversed(r[:-1])))),
+                r[0],
+            )
+            for t_sublist, r_sublist in zip(t_history_list, r_history_list)
+            for t, r in zip(t_sublist, r_sublist)
+        ]
 
     def _set_time_histories(
         self,
@@ -162,29 +162,13 @@ class BaseFeatureEngineer(ABC):
         """
         if t_history_secs_list is not None:
             if self.config.equalize_test_with_non_secs:
-                df["t_history"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_non_secs_list
-                    for item in sublist
-                ]
-                df["t_history_secs"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_secs_list
-                    for item in sublist
-                ]
+                df["t_history"] = _fmt_history(t_history_non_secs_list)
+                df["t_history_secs"] = _fmt_history(t_history_secs_list)
             else:
-                df["t_history"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_secs_list
-                    for item in sublist
-                ]
+                df["t_history"] = _fmt_history(t_history_secs_list)
             df["delta_t"] = df["delta_t_secs"]
         else:
-            df["t_history"] = [
-                ",".join(map(str, item[:-1]))
-                for sublist in t_history_non_secs_list
-                for item in sublist
-            ]
+            df["t_history"] = _fmt_history(t_history_non_secs_list)
 
         return df
 
@@ -267,19 +251,11 @@ class BaseFeatureEngineer(ABC):
         Returns:
             Time history list as pandas Series
         """
-        if self.config.use_secs_intervals:
-            t_history_list = df.groupby("card_id", group_keys=False)[
-                (
-                    "delta_t_secs"
-                    if not self.config.equalize_test_with_non_secs
-                    else "delta_t"
-                )
-            ].apply(lambda x: cum_concat([[i] for i in x]))
+        if all([self.config.use_secs_intervals, not self.config.equalize_test_with_non_secs]):
+            col = "delta_t_secs"
         else:
-            t_history_list = df.groupby("card_id", group_keys=False)["delta_t"].apply(
-                lambda x: cum_concat([[i] for i in x])
-            )
-        return t_history_list
+            col = "delta_t"
+        return df.groupby("card_id", group_keys=False)[col].apply(_to_history_list)
 
     def get_rating_history_list(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -292,7 +268,7 @@ class BaseFeatureEngineer(ABC):
             Rating history list as pandas Series
         """
         r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
-            lambda x: cum_concat([[i] for i in x])
+            _to_history_list
         )
         return r_history_list
 

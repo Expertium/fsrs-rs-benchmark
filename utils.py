@@ -56,11 +56,7 @@ def rmse_matrix(df):
         lambda x: round(1.99 * np.power(1.89, np.floor(np.log(x) / np.log(1.89))), 0)
     )
     tmp["rmse_bins_lapse"] = tmp["rmse_bins_lapse"].map(
-        lambda x: (
-            round(1.65 * np.power(1.73, np.floor(np.log(x) / np.log(1.73))), 0)
-            if x != 0
-            else 0
-        )
+        lambda x: (x > 0) * round(1.65 * np.power(1.73, np.floor(np.log(max(x, 1e-6)) / np.log(1.73))), 0)
     )
     if "weights" not in tmp.columns:
         tmp["weights"] = 1
@@ -162,7 +158,7 @@ def evaluate(y, p, df, file_name, user_id, config: Config, w_list=None):
 
 
 def is_parameter_list(state: Any) -> bool:
-    return isinstance(state, list) and all(isinstance(x, Real) for x in state)
+    return isinstance(state, list) and all(map(lambda x: isinstance(x, Real), state))
 
 
 def rounded_parameter_list(state: ParameterList) -> ParameterList:
@@ -175,12 +171,11 @@ def result_parameters(
     if is_parameter_list(state):
         return rounded_parameter_list(cast(ParameterList, state))
 
-    if isinstance(state, dict) and all(is_parameter_list(w) for w in state.values()):
-        partition_state = state
-        return {
-            str(partition): rounded_parameter_list(cast(ParameterList, w))
-            for partition, w in partition_state.items()
-        }
+    if isinstance(state, dict) and all(map(is_parameter_list, state.values())):
+        return dict(zip(
+            map(str, state.keys()),
+            map(lambda v: rounded_parameter_list(cast(ParameterList, v)), state.values()),
+        ))
 
     return None
 
@@ -191,9 +186,8 @@ def save_model_state(state: TrainingState, file_name: str, user_id: int) -> None
 
 
 def sort_jsonl(file):
-    data = list(map(lambda x: json.loads(x), open(file, encoding="utf-8").readlines()))
+    data = list(map(json.loads, open(file, encoding="utf-8").readlines()))
     data.sort(key=lambda x: x["user"])
     with file.open("w", encoding="utf-8", newline="\n") as jsonl_file:
-        for json_data in data:
-            jsonl_file.write(json.dumps(json_data, ensure_ascii=False) + "\n")
+        jsonl_file.write("\n".join(map(lambda d: json.dumps(d, ensure_ascii=False), data)) + "\n")
     return data
