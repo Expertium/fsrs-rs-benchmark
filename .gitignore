@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+fsrs-rs/target/
+fsrs-rs-python/target/
