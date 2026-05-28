@@ -24,7 +24,7 @@ from tqdm.auto import tqdm  # type: ignore
 from config import create_parser, Config
 from data_loader import UserDataLoader
 from utils import catch_exceptions, evaluate, save_evaluation_file, sort_jsonl
-from fsrs_rs_python import FSRS, FSRSItem, FSRSReview, DEFAULT_PARAMETERS  # type: ignore
+from fsrs_rs_python import FSRS, FSRSItem, FSRSReview, DEFAULT_PARAMETERS  # type: ignore[import-untyped]
 
 # ---------------------------------------------------------------------------
 # FSRS-rs helpers (formerly models/fsrs_rs.py)
