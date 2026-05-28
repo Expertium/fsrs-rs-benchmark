@@ -63,7 +63,5 @@ Run `uv run benchmark.py --help` for the full list. Common options include:
 | `--no_test_same_day` | Exclude reviews with `elapsed_days=0` from the test set. | off |
 | `--no_train_same_day` | Exclude reviews with `elapsed_days=0` from the training set. | off |
 | `--equalize_test_with_non_secs` | Test only on reviews that would be included in non-secs tests. | off |
-| `--two_buttons` | Treat Hard and Easy ratings as Good. | off |
 | `--raw` | Save raw per-review predictions to `raw/<name>.jsonl`. | off |
 | `--file` | Save per-user evaluation results to `evaluation/<name>/`. | off |
-| `--plot` | Save evaluation plots to `evaluation/<name>/`. | off |

@@ -83,9 +83,6 @@ def create_parser():
         action="store_true",
         help="Enable FSRS-7 scheduling penalties (penalty 1 & 2). L2 penalty is always on. (default: False)",
     )
-    parser.add_argument(
-        "--two_buttons", action="store_true", help="treat Hard and Easy as Good"
-    )
 
     # download revlogs from huggingface
     parser.add_argument(
@@ -125,9 +122,6 @@ def create_parser():
     parser.add_argument("--raw", action="store_true", help="save raw predictions")
     parser.add_argument(
         "--file", action="store_true", help="save evaluation results to file"
-    )
-    parser.add_argument(
-        "--plot", action="store_true", help="save evaluation plots to file"
     )
 
     parser.add_argument("--algo", default="FSRSv3", help="algorithm name")
@@ -210,11 +204,9 @@ class Config:
         self.no_test_same_day: bool = args.no_test_same_day
         self.no_train_same_day: bool = args.no_train_same_day
         self.equalize_test_with_non_secs: bool = args.equalize_test_with_non_secs
-        self.two_buttons: bool = args.two_buttons
         self.only_S0: bool = args.S0
         self.sched_penalties: bool = args.sched_penalties  # only for FSRS-7
         self.save_evaluation_file: bool = args.file
-        self.generate_plots: bool = args.plot
         self.save_weights: bool = args.weights
         self.partitions: str = args.partitions
         self.save_raw_output: bool = args.raw
@@ -266,9 +258,6 @@ class Config:
             _file_name_parts.append("-S0")
         if self.sched_penalties:
             _file_name_parts.append("-sched_penalties")
-        if self.two_buttons:
-            # Suffix is '-binary' for backward compatibility with existing analysis scripts.
-            _file_name_parts.append("-binary")
         if self.include_short_term:
             _file_name_parts.append("-short")
         if self.use_secs_intervals:

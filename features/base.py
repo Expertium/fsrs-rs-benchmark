@@ -59,10 +59,6 @@ class BaseFeatureEngineer(ABC):
         # Filter invalid ratings
         df.drop(df[~df["rating"].isin([1, 2, 3, 4])].index, inplace=True)
 
-        # Handle two-button mode
-        if self.config.two_buttons:
-            df["rating"] = df["rating"].replace({2: 3, 4: 3})
-
         # Calculate review count
         df["i"] = df.groupby("card_id").cumcount() + 1
         df.drop(df[df["i"] > self.config.max_seq_len * 2].index, inplace=True)

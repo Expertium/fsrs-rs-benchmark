@@ -13,7 +13,6 @@ import multiprocessing as mp
 from pathlib import Path
 from typing import Callable, List, Optional, TypeVar
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq  # type: ignore
@@ -208,7 +207,6 @@ tqdm.pandas()
 def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Optional[dict]]:
     """Process a single user with the FSRS-rs benchmark."""
     del device_id
-    plt.close("all")
 
     data_loader = UserDataLoader(config)
     dataset = data_loader.load_user_data(user_id)
