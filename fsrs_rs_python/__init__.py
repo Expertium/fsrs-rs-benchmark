@@ -11,18 +11,24 @@ from types import ModuleType
 _CRATE_DIR = Path(__file__).resolve().parent
 _ROOT = _CRATE_DIR.parent
 _MANIFEST_PATH = _CRATE_DIR / "Cargo.toml"
-_MODULE_NAME = f"{__name__}._native"
+_MODULE_NAME = f"{__name__}.fsrs_rs_python"
 _EXTENSION_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+_EXTENSION_BASENAMES = ("libfsrs_rs_python", "fsrs_rs_python")
 
 
 def _load_extension() -> ModuleType | None:
     """Try to load a pre-built extension from the Cargo target directory."""
     candidates: list[Path] = []
+    seen: set[Path] = set()
     for profile in ("release", "debug"):
         for subdir in ("", "deps"):
             d = _CRATE_DIR / "target" / profile / subdir
             if d.exists():
-                candidates.extend(sorted(d.glob("*fsrs_rs_python*")))
+                for basename in _EXTENSION_BASENAMES:
+                    for candidate in sorted(d.glob(f"{basename}.*")):
+                        if candidate not in seen:
+                            candidates.append(candidate)
+                            seen.add(candidate)
 
     # On Windows, Cargo produces a .dll; copy it to .pyd so Python can import it.
     if sys.platform == "win32":
@@ -36,8 +42,9 @@ def _load_extension() -> ModuleType | None:
                             shutil.copy2(candidate, alias)
                         except PermissionError:
                             pass
-                    if alias not in candidates:
+                    if alias not in seen:
                         candidates.append(alias)
+                        seen.add(alias)
 
     for candidate in candidates:
         if not any(candidate.name.endswith(s) for s in _EXTENSION_SUFFIXES):
