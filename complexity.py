@@ -2,11 +2,11 @@
 complexity.py — repo-wide code complexity metrics
 
 Walks all Python and Rust source files in the repository (excluding build
-artefacts in `target/` directories and Python caches in `__pycache__/`) and
+artifacts in `target/` directories and Python caches in `__pycache__/`) and
 prints three aggregate metrics:
 
   * AST node count  — Python: stdlib `ast`; Rust: tree-sitter CST
-  * Cyclomatic complexity — both languages: `lizard`
+  * Cyclomatic complexity — Python: `radon`; Rust: `lizard`
   * Lines of code (LOC) — raw line count for each file
 
 Usage:
@@ -59,8 +59,19 @@ def _collect_files(root: Path, suffix: str) -> list[Path]:
     return files
 
 
-def _count_rust_ast_nodes(node) -> int:
-    return 1 + sum(_count_rust_ast_nodes(child) for child in node.children)
+def _count_rust_ast_nodes(root) -> int:
+    """Iterative node count to avoid recursion-depth issues on large files."""
+    total = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        total += 1
+        stack.extend(node.children)
+    return total
+
+
+def _loc(text: str) -> int:
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -77,24 +88,18 @@ class FileMetrics(NamedTuple):
 def _python_metrics(path: Path) -> FileMetrics:
     source = path.read_text(encoding="utf-8")
 
-    loc = source.count("\n") + (1 if source and not source.endswith("\n") else 0)
-
     tree = ast.parse(source)
     ast_nodes = sum(1 for _ in ast.walk(tree))
 
     cyclo_blocks = cc_visit(source)
     cyclomatic = sum(block.complexity for block in cyclo_blocks)
 
-    return FileMetrics(path=path, loc=loc, ast_nodes=ast_nodes, cyclomatic=cyclomatic)
+    return FileMetrics(path=path, loc=_loc(source), ast_nodes=ast_nodes, cyclomatic=cyclomatic)
 
 
 def _rust_metrics(path: Path) -> FileMetrics:
     source_bytes = path.read_bytes()
     source_text = source_bytes.decode("utf-8", errors="replace")
-
-    loc = source_text.count("\n") + (
-        1 if source_text and not source_text.endswith("\n") else 0
-    )
 
     ts_tree = _rust_parser.parse(source_bytes)
     ast_nodes = _count_rust_ast_nodes(ts_tree.root_node)
@@ -102,7 +107,7 @@ def _rust_metrics(path: Path) -> FileMetrics:
     lz = lizard.analyze_file.analyze_source_code(path.name, source_text)
     cyclomatic = sum(fn.cyclomatic_complexity for fn in lz.function_list)
 
-    return FileMetrics(path=path, loc=loc, ast_nodes=ast_nodes, cyclomatic=cyclomatic)
+    return FileMetrics(path=path, loc=_loc(source_text), ast_nodes=ast_nodes, cyclomatic=cyclomatic)
 
 
 # ---------------------------------------------------------------------------
