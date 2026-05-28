@@ -1,4 +1,4 @@
 __pycache__/
 *.pyc
 fsrs-rs/target/
-fsrs-rs-python/target/
+fsrs_rs_python/target/

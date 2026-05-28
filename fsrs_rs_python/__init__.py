@@ -10,7 +10,7 @@ from types import ModuleType
 
 
 _ROOT = Path(__file__).resolve().parent.parent
-_CRATE_DIR = _ROOT / "fsrs-rs-python"
+_CRATE_DIR = Path(__file__).resolve().parent
 _MANIFEST_PATH = _CRATE_DIR / "Cargo.toml"
 _MODULE_NAME = f"{__name__}.fsrs_rs_python"
 _VALID_EXTENSION_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES)
