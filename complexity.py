@@ -156,6 +156,7 @@ def main() -> None:
     print(f"  {'Rust':<58}  {rs_loc:>6}  {rs_ast:>10}  {rs_cyclo:>10}")
     print()
     print(f"  {'TOTAL':<58}  {total_loc:>6}  {total_ast:>10}  {total_cyclo:>10}")
+    print(f"  Score={int(total_loc*0.3 + total_ast*0.05 + total_cyclo*4.25)}")
 
 
 if __name__ == "__main__":
