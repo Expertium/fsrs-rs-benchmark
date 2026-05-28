@@ -879,7 +879,7 @@ mod tests {
     use super::*;
     use crate::{
         FSRSReview, convertor_tests::anki21_sample_file_converted_to_fsrs,
-        current_retrievability, dataset::filter_outlier, test_helpers::TestHelper,
+        current_retrievability, filter_outlier, test_helpers::TestHelper,
     };
 
     static PARAMETERS: &[f32] = &[

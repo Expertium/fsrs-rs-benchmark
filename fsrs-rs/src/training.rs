@@ -1448,7 +1448,6 @@ mod tests {
     #[test]
     fn test_from_anki() {
         use burn::data::dataloader::Dataset;
-        use burn::tensor::Tolerance;
 
         let dataset = FSRSDataset::from(constant_weighted_fsrs_items(
             anki21_sample_file_converted_to_fsrs(),
@@ -1470,8 +1469,6 @@ mod tests {
         );
 
         let batcher = FSRSBatcher::<NdArray<f32>>::new();
-        use burn::backend::ndarray::NdArrayDevice;
-        static DEVICE: NdArrayDevice = NdArrayDevice::Cpu;
         use burn::data::dataloader::DataLoaderBuilder;
         let dataloader = DataLoaderBuilder::new(batcher)
             .batch_size(1)

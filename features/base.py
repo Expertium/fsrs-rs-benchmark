@@ -54,7 +54,6 @@ class BaseFeatureEngineer(ABC):
         """
         # Add review sequence number
         df["review_th"] = range(1, df.shape[0] + 1)
-        df["nth_today"] = df.groupby("day_offset").cumcount() + 1
         df.sort_values(by=["card_id", "review_th"], inplace=True)
 
         # Filter invalid ratings
@@ -300,15 +299,6 @@ class BaseFeatureEngineer(ABC):
             lambda x: cum_concat([[i] for i in x])
         )
         return r_history_list
-
-    def get_nth_today_history_list(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Get nth today history list for feature engineering
-        """
-        n_history_list = df.groupby("card_id", group_keys=False)["nth_today"].apply(
-            lambda x: cum_concat([[i] for i in x])
-        )
-        return n_history_list
 
     def get_history_lists(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
         """
