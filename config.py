@@ -273,6 +273,7 @@ class Config:
         self.seed: int = 42
 
     def get_evaluation_file_name(self) -> str:
+        """Return the derived output file stem used for evaluation artifacts."""
         return self.base_file_name
 
     def __repr__(self) -> str:
