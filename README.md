@@ -65,3 +65,5 @@ Run `uv run benchmark.py --help` for the full list. Common options include:
 | `--equalize_test_with_non_secs` | Test only on reviews that would be included in non-secs tests. | off |
 | `--raw` | Save raw per-review predictions to `raw/<name>.jsonl`. | off |
 | `--file` | Save per-user evaluation results to `evaluation/<name>/`. | off |
+# fsrs-rs-speed-autoresearch
+A version of [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark) ONLY for FSRS-rs. I'll use Claude 4.8 Opus (max effort) to speed up `compute_parameters()`.
