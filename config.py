@@ -272,6 +272,9 @@ class Config:
         # Seed for reproducibility
         self.seed: int = 42
 
+    def get_evaluation_file_name(self) -> str:
+        return self.base_file_name
+
     def __repr__(self) -> str:
         """Provides a string representation of the configuration."""
         def _inner() -> str:
@@ -282,4 +285,3 @@ class Config:
             }
             return f"Config({attrs})"
         return _inner()
-
