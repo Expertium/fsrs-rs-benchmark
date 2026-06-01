@@ -57,6 +57,17 @@ Run `uv run benchmark.py --help` for the full list.
 | `--raw` | Save raw per-review predictions to `raw/<name>.jsonl`. | off |
 | `--file` | Save per-user evaluation results to `evaluation/<name>/`. | off |
 
+## Tracking progress
+
+`plot_history.py` reads `result/history.jsonl` and renders two stacked views vs iteration to `result/history_plot.png`:
+
+```bash
+uv run plot_history.py
+```
+
+1. **Cumulative speedup** — the running product of the accepted iterations' median `speed_ratio`. This is the accept metric (the median of per-user speed ratios) compounded, so it's what "progress" means here, and it's drift-immune.
+2. **Median per-user time (ms)** — intuitive, but **machine-specific and measured per session, so it is *not* the metric used to accept or reject candidates** (each candidate is judged by its median per-user speed ratio, re-measured against the champion in the same session). Treat the time curve as informational context only.
+
 ## Repo tour
 
 `compute_parameters.py` (speed harness) · `benchmark.py` (reference) · `fsrs-rs/src/{model,training,inference}.rs` (the Rust FSRS crate — the optimization target) · `fsrs_rs_python/` (PyO3 binding) · `features/` (review preprocessing) · `complexity.py` (the complexity score) · `profiling/` (profiling tools). The full annotated map is the *Code layout* section of [`CLAUDE.md`](CLAUDE.md).

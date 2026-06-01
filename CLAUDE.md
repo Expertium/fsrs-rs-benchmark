@@ -110,8 +110,12 @@ Keep a `.jsonl` log and a human-readable `.md`. Each entry records:
 11. A summary of the change **written before timing it** (≤15 words; one number = one word)
 12. (`.jsonl` only) A private comment to your future self (e.g. notes to survive a compaction), but it must not be displayed in the .md file
 
-**Progress plot (`plot_history.py`): plot the cumulative `speed_ratio`** — the running product of the *accepted* iterations' median `speed_ratio` (item 5); rejected iters leave it unchanged (×1). Read it as "the median user is now X× faster than the iter-0 baseline." This is the right curve because it's the accept metric (constraint 12) compounded, and it's **drift-immune**: each `speed_ratio` is a *within-session paired* ratio, so the cross-session machine drift (~1%) cancels. Do **not** plot raw median time across iterations — that's the ratio *of medians* (not the median *of ratios* that gates accepts), and each iteration is timed in a separate session, so it jitters with drift and won't track the metric. Items 3–4 stay in the log as evidence, not as the progress curve.
+**Progress plots (`plot_history.py`): two stacked views vs iteration.**
+1. **Cumulative `speed_ratio`** (the headline) — the running product of the *accepted* iterations' median `speed_ratio` (item 5; rejects ×1). Read as "the median user is now X× faster than the iter-0 baseline." This *is* the accept metric (constraint 12) compounded, and it's **drift-immune**: each `speed_ratio` is a *within-session paired* ratio, so cross-session machine drift (~1%) cancels.
+2. **Median per-user time (ms)** — intuitive, but **machine-specific and per-session, so it is NOT the accept/reject metric** (it's the ratio *of medians*, not the median *of ratios* that gates accepts, and it jitters with cross-session drift). Informational only; items 3–4 are its log evidence.
 - **Caveat — the product is upward-biased:** you accept only when a noisy `speed_ratio` clears 1.05, so accepted ratios are selected high (winner's curse) and the ~1–2% paired noise compounds. **Anchor it** — every ~10–20 iters, re-measure the current champion vs the iter-0 baseline back-to-back in one session and plot that as a point: a direct, unbiased cumulative speedup whose gap to the product line is the accumulated bias. The final **1000-user** re-validation (see *Champion & compounding*) is the official total.
+
+**Compaction:** run `/compact` every 5 iterations, unconditionally (regardless of how many were accepted vs rejected) — over a 150–300-iteration campaign this keeps the context window fresh so per-iteration reasoning doesn't degrade. The history `.jsonl`/`.md` above is the durable record across compactions, so nothing important is lost.
 
 ## Notes
 
