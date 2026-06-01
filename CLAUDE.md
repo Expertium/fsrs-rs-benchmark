@@ -7,6 +7,10 @@ You are the autoresearcher. Your job is to make FSRS-7 parameter optimization **
 
 You pick the directions, run the experiments, and report. Balancing broad exploration against squeezing one idea dry is your call. Budget: ~150–300 iterations over ~2 weeks — plenty of room for bold structural bets, so don't fear "wasting" iterations or declare convergence early. The user is a Python/PyTorch person, not a Rust dev: ask only for high-level feedback, never Rust technicalities.
 
+## Host machine
+
+- Windows 10 Pro 22H2 (build 19045), 64 GB RAM, Ryzen 9 5950x
+
 ## Running it
 
 ```
@@ -79,7 +83,7 @@ Build artifacts (`*/target/`, `__pycache__/`) and the external dataset (`../anki
 9. Any non-deterministic operation must be seeded; choose the seed once and never change it.
 10. Feel free to build or import your own profiling tools and do profiling-only runs, but never modify the value written to the final .jsonl, and keep Python untimed. Also, profiling-only runs shouldn't be added to history.
 11. **Mutation surface:** you may modify `compute_parameters()` and anything it calls, plus FSRS-7 itself (as long as the math stays the same, per 3a). You may **not** modify `evaluate()` — the Rust scorer in `fsrs-rs/src/inference.rs`, invoked as `evaluate(items, |_| true)` by the binding (`fsrs_rs_python/src/lib.rs`) and as `predictor.evaluate(items)` in `compute_parameters.py`. It's the anti-cheating anchor.
-    - Don't shift timed Rust work into untimed Python/preprocessing to beat the timer — the work has to actually disappear, not move off-clock. (For the same reason `complexity.py` counts both Python and Rust, so you can't move Rust into Python and call it a "simplification." `evaluate.py` is excluded from the complexity score.)
+    - Don't shift timed Rust work into untimed Python/preprocessing to beat the timer — the work has to actually disappear, not move off-clock. (For the same reason `complexity.py` counts both Python and Rust, so you can't move Rust into Python and call it a "simplification." `evaluate.py` and a few other diagnostics-only files are excluded from the complexity score.)
     - Optimizations must speed up **one user in isolation**. Anything that only pays off by batching 50 users (cross-user caching/amortization) is an artifact — a real Anki user optimizes one collection at a time.
 12. **Acceptance — speed:** for each of the 50 users the per-user speedup is `s_u = t_champion_u / t_candidate_u` (each time = the min of its 3 runs). The single speed metric is **`speed_ratio` = the median of the 50 `s_u`** (the typical user's speedup). **Accept only if `speed_ratio ≥ 1.05`** (the median user is ≥5% faster). The median — not the mean of times — is used so a few slow/large collections can't carry the result and the ~1.5% warm-up drift can't fake a 5% median. Report the mean speedup too, but only as an informational "is one user dominating?" tell. (A paired Wilcoxon test was dropped: with per-user noise this low, the ~1-1.5% drift between two *identical* runs already drives p ≈ 0, so it fired on drift alone.)
 13. **Acceptance — complexity:** the speedup must out-run added complexity — `speed_ratio ≥ complexity_ratio^2.5`, using the same median `speed_ratio` from constraint 12, with `complexity_ratio = c_candidate / c_champion` (>1 = more complex; see `complexity.py`). Examples: +1% complexity needs ≥ +2.52% speed; +5% needs ≥ +12.97%; +50% needs ≥ 2.76×. If complexity is flat or drops, only the 5% floor (constraint 12) binds. (Self-consistent under compounding: N changes each sitting on the limit keep cumulative speed vs. complexity on the same curve.)
@@ -95,16 +99,19 @@ The champion is the current fastest accepted version. Every candidate is measure
 Keep a `.jsonl` log and a human-readable `.md`. Each entry records:
 1. Iteration (0 = baseline, 1 = first change)
 2. Timestamp
-3. Median time (50 users) before the change 
+3. Median time (50 users) before the change
 4. Median time (50 users) after
-5. % time difference
+5. **Median speed ratio** (see constraint 12 above, it is not the ratio of medians, but the **median of ratios**)
 6. Complexity score before
 7. Complexity score after (see `complexity.py`)
-8. % complexity difference
+8. **Complexity ratio**
 9. True/False for "did all checks (log loss within bands, same number of reviews, same parameters (for changes that don't trade precision), etc.) pass?"
 10. "accepted"/"rejected" status. "rejected" could mean either "improvement in speed wasn't sufficient" or "checks didn't pass"
 11. A summary of the change **written before timing it** (≤15 words; one number = one word)
-You may also add a private comment to your future self (e.g. notes to survive a compaction), but it must not be displayed in the .md file.
+12. (`.jsonl` only) A private comment to your future self (e.g. notes to survive a compaction), but it must not be displayed in the .md file
+
+**Progress plot (`plot_history.py`): plot the cumulative `speed_ratio`** — the running product of the *accepted* iterations' median `speed_ratio` (item 5); rejected iters leave it unchanged (×1). Read it as "the median user is now X× faster than the iter-0 baseline." This is the right curve because it's the accept metric (constraint 12) compounded, and it's **drift-immune**: each `speed_ratio` is a *within-session paired* ratio, so the cross-session machine drift (~1%) cancels. Do **not** plot raw median time across iterations — that's the ratio *of medians* (not the median *of ratios* that gates accepts), and each iteration is timed in a separate session, so it jitters with drift and won't track the metric. Items 3–4 stay in the log as evidence, not as the progress curve.
+- **Caveat — the product is upward-biased:** you accept only when a noisy `speed_ratio` clears 1.05, so accepted ratios are selected high (winner's curse) and the ~1–2% paired noise compounds. **Anchor it** — every ~10–20 iters, re-measure the current champion vs the iter-0 baseline back-to-back in one session and plot that as a point: a direct, unbiased cumulative speedup whose gap to the product line is the accumulated bias. The final **1000-user** re-validation (see *Champion & compounding*) is the official total.
 
 ## Notes
 
