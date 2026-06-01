@@ -84,10 +84,15 @@ pub struct MemoryState(fsrs::MemoryState);
 #[pymethods]
 impl MemoryState {
     #[new]
-    pub fn new(stability: f32, difficulty: f32) -> Self {
+    #[pyo3(signature = (stability, difficulty, stability_fast=None))]
+    pub fn new(stability: f32, difficulty: f32, stability_fast: Option<f32>) -> Self {
+        // Default the fast trace to the CUDA fsrs7_init fraction (0.8 * stability)
+        // when not supplied, so 2-arg construction stays backward-compatible.
+        let stability_fast = stability_fast.unwrap_or(0.8 * stability);
         Self(fsrs::MemoryState {
             stability,
             difficulty,
+            stability_fast,
         })
     }
     #[getter]
@@ -97,6 +102,10 @@ impl MemoryState {
     #[getter]
     pub fn difficulty(&self) -> f32 {
         self.0.difficulty
+    }
+    #[getter]
+    pub fn stability_fast(&self) -> f32 {
+        self.0.stability_fast
     }
     pub fn __repr__(&self) -> String {
         format!("{:?}", self.0)

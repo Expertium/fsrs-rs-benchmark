@@ -19,17 +19,24 @@ pub(crate) mod model_v7 {
 use super::{Fsrs7Ops, Get, MemoryStateTensors, Model, VersionOps, tensor_max, tensor_min};
 use burn::tensor::{Tensor, backend::Backend};
 
-pub(super) const PARAM_LEN: usize = 35;
+pub(super) const PARAM_LEN: usize = 36;
 
 impl<B: Backend> VersionOps<B> for Fsrs7Ops {
-    fn apply_freeze_short_term(initial_params: &mut [f32]) {
-        // FSRS-7: disable short-term contribution by forcing transition weight to 0,
-        // making coefficient == 1.0 for every delta_t.
-        initial_params[26] = 0.0;
+    fn apply_freeze_short_term(_initial_params: &mut [f32]) {
+        // Dual-trace FSRS-7 (iter-66 port): the old w[26] transition weight is gone
+        // (w[26] is now decay2), and the fast trace is intrinsic to the model, so
+        // "freeze short term" has nothing to zero — it is a no-op. Unused in the
+        // timed paths anyway (enable_short_term is always true there).
     }
 
-    fn power_forgetting_curve(model: &Model<B>, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
-        power_forgetting_curve(model, t, s)
+    fn power_forgetting_curve(
+        model: &Model<B>,
+        t: Tensor<B, 1>,
+        s: Tensor<B, 1>,
+        s_fast: Tensor<B, 1>,
+        d: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        power_forgetting_curve(model, t, s, s_fast, d)
     }
 
     fn update_state(
@@ -38,34 +45,41 @@ impl<B: Backend> VersionOps<B> for Fsrs7Ops {
         rating: Tensor<B, 1>,
         last_s: Tensor<B, 1>,
         last_d: Tensor<B, 1>,
+        last_s_fast: Tensor<B, 1>,
     ) -> MemoryStateTensors<B> {
         let delta_t = delta_t.clamp_min(0.0);
-        let retrievability = power_forgetting_curve(model, delta_t.clone(), last_s.clone());
-        let new_s_long_term = stability_for_set(
+        // DUAL-TRACE (iter-66 port): the curve mixes a fast-trace and a slow-trace
+        // recall component; after review the slow trace updates by the long-term
+        // dynamics (reading the slow trace) and the fast trace by the short-term
+        // dynamics (reading the fast trace). No elapsed-time transition blend.
+        let retrievability = power_forgetting_curve(
             model,
+            delta_t,
             last_s.clone(),
+            last_s_fast.clone(),
+            last_d.clone(),
+        );
+        let new_s_slow = stability_for_set(
+            model,
+            last_s,
             last_d.clone(),
             retrievability.clone(),
             rating.clone(),
             7,
         );
-        let new_s_short_term = stability_for_set(
+        let new_s_fast = stability_for_set(
             model,
-            last_s.clone(),
+            last_s_fast,
             last_d.clone(),
             retrievability,
             rating.clone(),
             16,
         );
-        let coefficient = transition_function(model, delta_t);
-        // If short-term is disabled, w[26]=0 => coefficient=1, so short_weight=0.
-        // That cancels the short-term branch and keeps only long-term stability.
-        let short_weight = coefficient.clone().neg().add_scalar(1.0);
-        let new_s = coefficient * new_s_long_term + short_weight * new_s_short_term;
         let new_d = next_difficulty(model, last_d, rating);
         MemoryStateTensors {
-            stability: new_s,
+            stability: new_s_slow,
             difficulty: new_d,
+            stability_fast: new_s_fast,
         }
     }
 }
@@ -74,24 +88,42 @@ pub(super) fn power_forgetting_curve<B: Backend>(
     model: &Model<B>,
     t: Tensor<B, 1>,
     s: Tensor<B, 1>,
+    s_fast: Tensor<B, 1>,
+    d: Tensor<B, 1>,
 ) -> Tensor<B, 1> {
-    let t_over_s = t.clamp_min(0.0) / s.clone();
+    // DUAL-TRACE forgetting curve (iter-66 port of fsrs7.cu). New 36-param layout:
+    // 25 decay1, 26 decay2, 27 base1, 28 base2, 29 base_weight1, 30 base_weight2,
+    // 31 s_weight_power1, 32 s_weight_power2, 33 d_weight, 34 d_decay, 35 s_decay1.
+    let t = t.clamp_min(0.0);
+    let t_over_s_fast = t.clone() / s_fast.clone();
+    let t_over_s_slow = t / s.clone();
 
-    let decay1 = -model.w.get(27);
-    let decay2 = -model.w.get(28);
-    let base1 = model.w.get(29);
-    let base2 = model.w.get(30);
+    // FAST component r1 reads the fast trace; its decay is S-modulated (s_decay1).
+    // factor1 is built in LOG-SPACE with the exponent clamped at 60 so both value
+    // and gradient stay finite (matches fsrs7.cu).
+    let decay1_mag = (model.w.get(25) * s_fast.clone().powf(model.w.get(35))).clamp(0.01, 0.95);
+    let decay1 = -decay1_mag;
+    let factor1 = (model.w.get(27).log() * decay1.clone().powi_scalar(-1))
+        .clamp_max(60.0)
+        .exp()
+        - 1.0;
+    let r1 = (t_over_s_fast * factor1 + 1.0).powf(decay1);
 
-    let factor1 = base1.clone().powf(decay1.clone().powi_scalar(-1)) - 1.0;
-    let factor2 = base2.clone().powf(decay2.clone().powi_scalar(-1)) - 1.0;
+    // SLOW component r2 reads the slow trace; its decay is D-modulated (d_decay).
+    let decay2_mag =
+        (model.w.get(26) * (d.clone().add_scalar(-5.0) * model.w.get(34)).exp()).clamp(0.01, 0.95);
+    let decay2 = -decay2_mag;
+    let factor2 = model.w.get(28).powf(decay2.clone().powi_scalar(-1)) - 1.0;
+    let r2 = (t_over_s_slow * factor2 + 1.0).powf(decay2);
 
-    let r1 = (t_over_s.clone() * factor1 + 1.0).powf(decay1);
-    let r2 = (t_over_s * factor2 + 1.0).powf(decay2);
+    // Mixture weights keyed to each trace; weight2 is D-modulated (d_weight).
+    let weight1 = model.w.get(29) * s_fast.powf(-model.w.get(31));
+    let weight2 =
+        model.w.get(30) * s.powf(model.w.get(32)) * (d.add_scalar(-5.0) * model.w.get(33)).exp();
 
-    let weight1 = model.w.get(31) * s.clone().powf(-model.w.get(33));
-    let weight2 = model.w.get(32) * s.powf(model.w.get(34));
-
-    (weight1.clone() * r1 + weight2.clone() * r2) / (weight1 + weight2)
+    let retention = (weight1.clone() * r1 + weight2.clone() * r2) / (weight1 + weight2);
+    // CUDA fsrs7_forgetting_curve final rescale: p = 1e-5 + (1 - 2e-5) * retention.
+    retention.mul_scalar(1.0 - 2e-5).add_scalar(1e-5)
 }
 
 pub(super) fn stability_for_set<B: Backend>(
@@ -125,15 +157,6 @@ pub(super) fn stability_for_set<B: Backend>(
     let new_s_success = tensor_max(pls.clone(), last_s * sinc);
     let success = rating.greater_elem(1);
     pls.mask_where(success, new_s_success)
-}
-
-pub(super) fn transition_function<B: Backend>(
-    model: &Model<B>,
-    delta_t: Tensor<B, 1>,
-) -> Tensor<B, 1> {
-    (model.w.get(26) * (-model.w.get(25) * delta_t).exp())
-        .neg()
-        .add_scalar(1.0)
 }
 
 pub(super) fn mean_reversion<B: Backend>(
@@ -197,22 +220,36 @@ fn tensor_max<B: Backend>(a: Tensor<B, 1>, b: Tensor<B, 1>) -> Tensor<B, 1> {
 
 pub(super) trait VersionOps<B: Backend> {
     fn apply_freeze_short_term(initial_params: &mut [f32]);
-    fn power_forgetting_curve(model: &Model<B>, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1>;
+    fn power_forgetting_curve(
+        model: &Model<B>,
+        t: Tensor<B, 1>,
+        s: Tensor<B, 1>,
+        s_fast: Tensor<B, 1>,
+        d: Tensor<B, 1>,
+    ) -> Tensor<B, 1>;
     fn update_state(
         model: &Model<B>,
         delta_t: Tensor<B, 1>,
         rating: Tensor<B, 1>,
         last_s: Tensor<B, 1>,
         last_d: Tensor<B, 1>,
+        last_s_fast: Tensor<B, 1>,
     ) -> MemoryStateTensors<B>;
 }
 
 pub(super) struct Fsrs7Ops;
 
 type ApplyFreezeShortTermFn = fn(&mut [f32]);
-type PowerForgettingCurveFn<B> = fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>) -> Tensor<B, 1>;
-type UpdateStateFn<B> =
-    fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) -> MemoryStateTensors<B>;
+type PowerForgettingCurveFn<B> =
+    fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) -> Tensor<B, 1>;
+type UpdateStateFn<B> = fn(
+    &Model<B>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+) -> MemoryStateTensors<B>;
 
 #[derive(Clone, Copy)]
 struct VersionFns<B: Backend> {
@@ -241,7 +278,8 @@ impl<B: Backend> Model<B> {
             initial_params[0..4].copy_from_slice(&initial_stability);
         }
         if let Some(initial_forgetting_curve) = config.initial_forgetting_curve {
-            initial_params[27..35].copy_from_slice(&initial_forgetting_curve);
+            // 8 curve params now live at indices 25..33 (was 27..35 pre-dual-trace).
+            initial_params[25..33].copy_from_slice(&initial_forgetting_curve);
         }
         if config.freeze_short_term_stability {
             let ops = VersionFns::<B>::from_version(version);
@@ -266,9 +304,15 @@ impl<B: Backend> Model<B> {
         self.version
     }
 
-    pub fn power_forgetting_curve(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
+    pub fn power_forgetting_curve(
+        &self,
+        t: Tensor<B, 1>,
+        s: Tensor<B, 1>,
+        s_fast: Tensor<B, 1>,
+        d: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
         let ops = VersionFns::<B>::from_version(self.version());
-        (ops.power_forgetting_curve)(self, t, s)
+        (ops.power_forgetting_curve)(self, t, s, s_fast, d)
     }
 
     pub(crate) fn init_stability(&self, rating: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -293,12 +337,14 @@ impl<B: Backend> Model<B> {
     ) -> MemoryStateTensors<B> {
         let last_s = state.stability.clone().clamp(S_MIN, S_MAX);
         let last_d = state.difficulty.clone().clamp(D_MIN, D_MAX);
+        let last_s_fast = state.stability_fast.clone().clamp(S_MIN, S_MAX);
         let mut new_state = (ops.update_state)(
             self,
             delta_t.clone(),
             rating.clone(),
             last_s.clone(),
             last_d.clone(),
+            last_s_fast.clone(),
         );
 
         if nth == 0 {
@@ -307,8 +353,12 @@ impl<B: Backend> Model<B> {
             let init_d = self
                 .init_difficulty(rating.clone().clamp(1, 4))
                 .clamp(D_MIN, D_MAX);
+            // CUDA fsrs7_init: the fast trace starts at 0.8 * initial slow stability.
+            let init_s_fast = init_s.clone().mul_scalar(0.8);
             new_state.stability = new_state.stability.mask_where(is_initial.clone(), init_s);
-            new_state.difficulty = new_state.difficulty.mask_where(is_initial, init_d);
+            new_state.difficulty = new_state.difficulty.mask_where(is_initial.clone(), init_d);
+            new_state.stability_fast =
+                new_state.stability_fast.mask_where(is_initial, init_s_fast);
         }
 
         // mask padding zeros for rating
@@ -318,7 +368,11 @@ impl<B: Backend> Model<B> {
             .clamp(S_MIN, S_MAX);
         new_state.difficulty = new_state
             .difficulty
-            .mask_where(rating.equal_elem(0), last_d);
+            .mask_where(rating.clone().equal_elem(0), last_d);
+        new_state.stability_fast = new_state
+            .stability_fast
+            .mask_where(rating.equal_elem(0), last_s_fast)
+            .clamp(S_MIN, S_MAX);
 
         new_state
     }
@@ -351,6 +405,7 @@ impl<B: Backend> Model<B> {
 pub(crate) struct MemoryStateTensors<B: Backend> {
     pub stability: Tensor<B, 1>,
     pub difficulty: Tensor<B, 1>,
+    pub stability_fast: Tensor<B, 1>,
 }
 
 impl<B: Backend> MemoryStateTensors<B> {
@@ -359,6 +414,7 @@ impl<B: Backend> MemoryStateTensors<B> {
         MemoryStateTensors {
             stability: Tensor::zeros([batch_size], &device),
             difficulty: Tensor::zeros([batch_size], &device),
+            stability_fast: Tensor::zeros([batch_size], &device),
         }
     }
 }
@@ -404,9 +460,6 @@ impl<B: Backend> FSRS<B> {
     }
 }
 
-// Maximum initial stability for FSRS-7 parameter clipping
-const INIT_S_MAX: f32 = 100.0;
-
 fn clamp_safe(value: f32, low: f32, high: f32) -> f32 {
     let low = if low.is_finite() { low } else { 0.0 };
     let high = if high.is_finite() { high } else { low };
@@ -420,20 +473,23 @@ fn clamp_safe(value: f32, low: f32, high: f32) -> f32 {
 }
 
 fn clip_fsrs7_parameters(parameters: &mut [f32]) {
-    const FSRS7_PARAM_LEN: usize = 35;
+    const FSRS7_PARAM_LEN: usize = 36;
     if parameters.len() < FSRS7_PARAM_LEN {
         return;
     }
 
-    parameters[0] = clamp_safe(parameters[0], S_MIN, INIT_S_MAX / 2.0);
-    parameters[1] = clamp_safe(parameters[1], parameters[0], INIT_S_MAX);
-    parameters[2] = clamp_safe(parameters[2], parameters[1], INIT_S_MAX);
-    parameters[3] = clamp_safe(parameters[3], parameters[2], INIT_S_MAX);
+    // Independent per-parameter clamps matching fsrs-autoresearch FSRS_MIN/MAX_VALUES
+    // for the iter-66 dual-trace layout (no cross-parameter monotonicity, as in CUDA).
+    parameters[0] = clamp_safe(parameters[0], 0.0001, 50.0);
+    parameters[1] = clamp_safe(parameters[1], 0.0001, 100.0);
+    parameters[2] = clamp_safe(parameters[2], 0.0001, 100.0);
+    parameters[3] = clamp_safe(parameters[3], 0.0001, 100.0);
 
     parameters[4] = clamp_safe(parameters[4], 1.0, 10.0);
     parameters[5] = clamp_safe(parameters[5], 0.001, 4.0);
     parameters[6] = clamp_safe(parameters[6], 0.1, 4.0);
 
+    // 7..15 long-term stability-after-review.
     parameters[7] = clamp_safe(parameters[7], 0.0, 4.0);
     parameters[8] = clamp_safe(parameters[8], 0.0, 1.2);
     parameters[9] = clamp_safe(parameters[9], 0.3, 3.0);
@@ -444,6 +500,7 @@ fn clip_fsrs7_parameters(parameters: &mut [f32]) {
     parameters[14] = clamp_safe(parameters[14], 0.0, 1.0);
     parameters[15] = clamp_safe(parameters[15], 1.0, 7.0);
 
+    // 16..24 short-term stability-after-review.
     parameters[16] = clamp_safe(parameters[16], 0.0, 4.0);
     parameters[17] = clamp_safe(parameters[17], 0.0, 2.0);
     parameters[18] = clamp_safe(parameters[18], 0.5, 6.0);
@@ -454,17 +511,27 @@ fn clip_fsrs7_parameters(parameters: &mut [f32]) {
     parameters[23] = clamp_safe(parameters[23], 0.0, 1.0);
     parameters[24] = clamp_safe(parameters[24], 1.0, 7.0);
 
-    parameters[25] = clamp_safe(parameters[25], 2.5, 15.0);
-    parameters[26] = clamp_safe(parameters[26], 0.0, 1.0);
+    // 25..32 forgetting curve.
+    parameters[25] = clamp_safe(parameters[25], 0.01, 0.25); // decay1
+    parameters[26] = clamp_safe(parameters[26], 0.01, 0.95); // decay2
+    parameters[27] = clamp_safe(parameters[27], 0.2, 0.85); // base1
+    parameters[28] = clamp_safe(parameters[28], 0.5, 0.99); // base2
+    parameters[29] = clamp_safe(parameters[29], 0.01, 1.0); // base_weight1
+    parameters[30] = clamp_safe(parameters[30], 0.1, 1.0); // base_weight2
+    parameters[31] = clamp_safe(parameters[31], 0.0, 0.9); // s_weight_power1
+    parameters[32] = clamp_safe(parameters[32], 0.1, 1.1); // s_weight_power2
 
-    parameters[27] = clamp_safe(parameters[27], 0.01, 0.25);
-    parameters[28] = clamp_safe(parameters[28], parameters[27], 0.95);
-    parameters[29] = clamp_safe(parameters[29], 0.5, 0.85);
-    parameters[30] = clamp_safe(parameters[30], parameters[29], 0.99);
-    parameters[31] = clamp_safe(parameters[31], 0.01, 1.0);
-    parameters[32] = clamp_safe(parameters[32], 0.1, 1.0);
-    parameters[33] = clamp_safe(parameters[33], 0.0, 0.9);
-    parameters[34] = clamp_safe(parameters[34], 0.1, 1.1);
+    // 33..35 difficulty/stability modulation of the curve.
+    parameters[33] = clamp_safe(parameters[33], -0.5, 0.5); // d_weight
+    parameters[34] = clamp_safe(parameters[34], -0.3, 0.3); // d_decay
+    parameters[35] = clamp_safe(parameters[35], -0.3, 0.3); // s_decay1
+
+    // Cross-parameter monotonicity, applied AFTER the box clamps — matches CUDA
+    // apply_parameter_clipper: initial stability non-decreasing in rating, base2 >= base1.
+    parameters[1] = parameters[1].max(parameters[0]);
+    parameters[2] = parameters[2].max(parameters[1]);
+    parameters[3] = parameters[3].max(parameters[2]);
+    parameters[28] = parameters[28].max(parameters[27]);
 }
 
 pub(crate) fn clip_parameters(parameters: &Parameters) -> Vec<f32> {

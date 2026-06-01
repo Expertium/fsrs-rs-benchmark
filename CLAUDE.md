@@ -4,6 +4,7 @@ You are the autoresearcher. Your job is to make FSRS-7 parameter optimization **
 
 - A speedup that only works on AVX-512 CPUs and Void Linux doesn't count.
 - A speedup that makes FSRS less accurate doesn't count (that's what the correctness bars are for).
+- A speedup that only works when processing multiple users in parallel doesn't count.
 
 You pick the directions, run the experiments, and report. Balancing broad exploration against squeezing one idea dry is your call. Budget: ~150–300 iterations over ~2 weeks — plenty of room for bold structural bets, so don't fear "wasting" iterations or declare convergence early. The user is a Python/PyTorch person, not a Rust dev: ask only for high-level feedback, never Rust technicalities.
 
@@ -71,8 +72,8 @@ Build artifacts (`*/target/`, `__pycache__/`) and the external dataset (`../anki
 2. At most **2 threads per user**. (Multiple users are already processed in parallel across processes; don't use more than 2 threads on a *single* user's data.)
 3. Two correctness bars, by change type:
    - **(a) Math-unchanged changes** (constraint 6 — fusing, caching, reordering, etc.): per-user results must reproduce the champion **bit-for-bit**. Verify with **both** harnesses (diff the result `.jsonl`; sanity-check aggregates with `evaluate.py`) — each catches what the other can't:
-     - **benchmark.py** records per-user **params + log loss** → check both. Reference: 50 users, **1,581,505 reviews**, log loss **0.3152**.
-     - **compute_parameters.py** records per-user **params + log loss** (and time) → diff the params and log loss; its recorded time naturally varies run-to-run (see the Noise floor note), so ignore time for the bit-for-bit check. Reference: 50 users, **1,897,936 items**, log loss **0.3085**. (Its params differ from benchmark.py's — different `max_seq_len` and train/test split — so treat each harness as its own within-harness bit-for-bit reference.)
+     - **benchmark.py** records per-user **params + log loss** → check both. Reference: 50 users, **1,581,505 reviews**, log loss **0.31205** (iter-66 dual-trace champion; was 0.3152 pre-port).
+     - **compute_parameters.py** records per-user **params + log loss** (and time) → diff the params and log loss; its recorded time naturally varies run-to-run (see the Noise floor note), so ignore time for the bit-for-bit check. Reference: 50 users, **1,897,936 items**, log loss **0.3098** (iter-66 dual-trace champion; was 0.3085 pre-port). (Its params differ from benchmark.py's — different `max_seq_len` and train/test split — so treat each harness as its own within-harness bit-for-bit reference.)
      Any drift means the math actually changed — investigate before doing anything else.
    - **(b) Precision-trading changes** (float32/float16): log loss may drift, but must stay **within ±0.0010** of the champion's log loss. A small regression or improvement inside that band is fine; a larger move either way means something broke. (Honestly, getting FSRS to work in float32/float16 without log loss exploding would be surprising.)
 4. Don't change batch size, number of epochs, or any other SGD hyperparameter. No early stopping. Don't change `max_seq_len`.
@@ -120,6 +121,7 @@ Keep a `.jsonl` log and a human-readable `.md`. Each entry records:
 ## Notes
 
 - **The O(N²) expanding window** (a card with N reviews becomes N−1 separate FSRSItems): you can try to make it O(N), but the original author says it makes log loss worse even when you normalize so both implementations take the same wall-clock time. Expect it to need many attempts, and it may not pan out at all.
+- **`result/*(old)*.jsonl`** — files in `result/` with `(old)` in their names are kept on purpose as comparison baselines (e.g. the pre-dual-trace single-trace numbers). They are not stale junk; leave them in place.
 
 ## Where the time goes (profiling)
 

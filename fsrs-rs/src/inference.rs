@@ -16,13 +16,16 @@ use burn::tensor::cast::ToElement;
 use burn::tensor::{Shape, Tensor, TensorData};
 use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
 
-/// FSRS-7 default parameters (35 values).
-pub static DEFAULT_PARAMETERS: [f32; 35] = [
+/// FSRS-7 default parameters (36 values, iter-66 dual-trace champion init_w).
+/// Layout: 0..24 s0/difficulty/long+short stability (unchanged), 25..32 forgetting
+/// curve (decay1, decay2, base1, base2, base_weight1, base_weight2, s_weight_power1,
+/// s_weight_power2), 33 d_weight, 34 d_decay, 35 s_decay1.
+pub static DEFAULT_PARAMETERS: [f32; 36] = [
     0.041, 2.4175, 4.1283, 11.9709, 5.6385, 0.4468, 3.262, 2.3054, 0.1688, 1.3325, 0.3524, 0.0049,
     0.7503, 0.0896, 0.6625, 1.3, 0.882, 0.3072, 3.5875, 0.303, 0.0107, 0.2279, 2.6413, 0.5594, 1.3,
-    2.5, 1.0, 0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862,
+    0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862, 0.0, 0.0, 0.0,
 ];
-/// This is a slice for efficiency, and should be 35 in length.
+/// This is a slice for efficiency, and should be 36 in length.
 pub type Parameters = [f32];
 
 fn infer<B: Backend>(
@@ -30,7 +33,12 @@ fn infer<B: Backend>(
     batch: FSRSBatch<B>,
 ) -> (MemoryStateTensors<B>, Tensor<B, 1>) {
     let state = model.forward(batch.t_historys, batch.r_historys, None);
-    let retrievability = model.power_forgetting_curve(batch.delta_ts, state.stability.clone());
+    let retrievability = model.power_forgetting_curve(
+        batch.delta_ts,
+        state.stability.clone(),
+        state.stability_fast.clone(),
+        state.difficulty.clone(),
+    );
     (state, retrievability)
 }
 
@@ -38,6 +46,7 @@ fn infer<B: Backend>(
 pub struct MemoryState {
     pub stability: f32,
     pub difficulty: f32,
+    pub stability_fast: f32,
 }
 
 impl<B: Backend> From<MemoryStateTensors<B>> for MemoryState {
@@ -45,6 +54,7 @@ impl<B: Backend> From<MemoryStateTensors<B>> for MemoryState {
         Self {
             stability: m.stability.into_scalar().elem(),
             difficulty: m.difficulty.into_scalar().elem(),
+            stability_fast: m.stability_fast.into_scalar().elem(),
         }
     }
 }
@@ -112,16 +122,20 @@ impl<B: Backend> FSRS<B> {
             return Ok(vec![]);
         }
         let (time_histories, rating_histories) = self.items_to_tensors(&items);
-        let (stabilities, difficulties) = starting_states
-            .iter()
-            .map(|starting_state| {
-                if let Some(state) = starting_state {
-                    (state.stability, state.difficulty)
-                } else {
-                    (0.0, 0.0)
-                }
-            })
-            .collect::<(Vec<f32>, Vec<f32>)>();
+        let mut stabilities = Vec::with_capacity(starting_states.len());
+        let mut difficulties = Vec::with_capacity(starting_states.len());
+        let mut stabilities_fast = Vec::with_capacity(starting_states.len());
+        for starting_state in &starting_states {
+            if let Some(state) = starting_state {
+                stabilities.push(state.stability);
+                difficulties.push(state.difficulty);
+                stabilities_fast.push(state.stability_fast);
+            } else {
+                stabilities.push(0.0);
+                difficulties.push(0.0);
+                stabilities_fast.push(0.0);
+            }
+        }
         let device = self.device();
         let starting_states = MemoryStateTensors {
             stability: Tensor::from_data(
@@ -142,18 +156,27 @@ impl<B: Backend> FSRS<B> {
                 ),
                 &device,
             ),
+            stability_fast: Tensor::from_data(
+                TensorData::new(
+                    stabilities_fast.clone(),
+                    Shape {
+                        dims: vec![stabilities_fast.len()],
+                    },
+                ),
+                &device,
+            ),
         };
         let state = self
             .model()
             .forward(time_histories, rating_histories, Some(starting_states));
         let stability = state.stability.to_data().to_vec::<f32>().unwrap();
         let difficulty = state.difficulty.to_data().to_vec::<f32>().unwrap();
-        Ok(stability
-            .into_iter()
-            .zip(difficulty)
-            .map(|(stability, difficulty)| MemoryState {
+        let stability_fast = state.stability_fast.to_data().to_vec::<f32>().unwrap();
+        Ok(izip!(stability, difficulty, stability_fast)
+            .map(|(stability, difficulty, stability_fast)| MemoryState {
                 stability,
                 difficulty,
+                stability_fast,
             })
             .collect())
     }

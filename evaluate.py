@@ -6,7 +6,9 @@ import numpy as np
 DEV_MODEL = "compute_parameters-FSRS-rs-short-secs-recency"
 MODELS = [
     DEV_MODEL,
-    "FSRS-rs-short-secs-recency (baseline)",
+    "FSRS-rs-short-secs-recency",
+    "FSRS-rs-default-short-secs",
+    "FSRS-rs-short-secs-recency (old)",
     "FSRS-7-short-secs-recency",
 ]
 

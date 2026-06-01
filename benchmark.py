@@ -33,14 +33,18 @@ MIN_STABILITY = 0.0001
 MIN_RETRIEVABILITY = 0.0001
 MAX_RETRIEVABILITY = 0.9999
 
-FSRS7_DECAY1_INDEX = 27
-FSRS7_DECAY2_INDEX = 28
-FSRS7_BASE1_INDEX = 29
-FSRS7_BASE2_INDEX = 30
-FSRS7_WEIGHT1_INDEX = 31
-FSRS7_WEIGHT2_INDEX = 32
-FSRS7_S_WEIGHT_POWER1_INDEX = 33
-FSRS7_S_WEIGHT_POWER2_INDEX = 34
+# Dual-trace FSRS-7 (iter-66) 36-param layout.
+FSRS7_DECAY1_INDEX = 25
+FSRS7_DECAY2_INDEX = 26
+FSRS7_BASE1_INDEX = 27
+FSRS7_BASE2_INDEX = 28
+FSRS7_WEIGHT1_INDEX = 29
+FSRS7_WEIGHT2_INDEX = 30
+FSRS7_S_WEIGHT_POWER1_INDEX = 31
+FSRS7_S_WEIGHT_POWER2_INDEX = 32
+FSRS7_D_WEIGHT_INDEX = 33
+FSRS7_D_DECAY_INDEX = 34
+FSRS7_S_DECAY1_INDEX = 35
 
 
 def _parse_scalar(value: object, type_name: str) -> str:
@@ -107,39 +111,54 @@ def predict(
 ) -> tuple[List[float], List[float], pd.DataFrame]:
     """Return (predictions, labels, testset_with_predictions)."""
 
-    def fsrs7_forgetting_curve(delta_t: pd.Series, stability: pd.Series) -> pd.Series:
-        stability_array = stability.clip(lower=MIN_STABILITY).to_numpy(dtype=float, copy=False)
-        delta_t_array = delta_t.clip(lower=0).to_numpy(dtype=float, copy=False)
-        t_over_s = delta_t_array / stability_array
+    def fsrs7_forgetting_curve(
+        delta_t: pd.Series,
+        stability: pd.Series,
+        stability_fast: pd.Series,
+        difficulty: pd.Series,
+    ) -> pd.Series:
+        # DUAL-TRACE curve (iter-66 port of fsrs7.cu). The fast component reads the
+        # fast trace, the slow component reads the slow trace; difficulty modulates
+        # the slow decay (d_decay) and the slow mixture weight (d_weight).
+        s_slow = stability.clip(lower=MIN_STABILITY).to_numpy(dtype=float, copy=False)
+        s_fast = stability_fast.clip(lower=MIN_STABILITY).to_numpy(dtype=float, copy=False)
+        d = difficulty.to_numpy(dtype=float, copy=False)
+        t = delta_t.clip(lower=0).to_numpy(dtype=float, copy=False)
+        t_over_s_fast = t / s_fast
+        t_over_s_slow = t / s_slow
 
-        decay1 = -weights[FSRS7_DECAY1_INDEX]
-        decay2 = -weights[FSRS7_DECAY2_INDEX]
+        decay1_param = weights[FSRS7_DECAY1_INDEX]
+        decay2_param = weights[FSRS7_DECAY2_INDEX]
         base1 = weights[FSRS7_BASE1_INDEX]
         base2 = weights[FSRS7_BASE2_INDEX]
+        d_weight = weights[FSRS7_D_WEIGHT_INDEX]
+        d_decay = weights[FSRS7_D_DECAY_INDEX]
+        s_decay1 = weights[FSRS7_S_DECAY1_INDEX]
 
-        if decay1 == 0 or decay2 == 0:
-            raise ValueError("FSRS-7 decay parameters must be non-zero")
+        # FAST component: decay S-modulated; factor1 in log-space, exponent clamped at 60.
+        decay1_mag = np.clip(decay1_param * s_fast**s_decay1, 0.01, 0.95)
+        decay1 = -decay1_mag
+        factor1 = np.exp(np.minimum((1.0 / decay1) * np.log(base1), 60.0)) - 1.0
+        r1 = (1.0 + factor1 * t_over_s_fast) ** decay1
 
-        factor1 = base1 ** (1 / decay1) - 1
-        factor2 = base2 ** (1 / decay2) - 1
-        r1 = (1 + factor1 * t_over_s) ** decay1
-        r2 = (1 + factor2 * t_over_s) ** decay2
+        # SLOW component: decay D-modulated.
+        decay2_mag = np.clip(decay2_param * np.exp(d_decay * (d - 5.0)), 0.01, 0.95)
+        decay2 = -decay2_mag
+        factor2 = base2 ** (1.0 / decay2) - 1.0
+        r2 = (1.0 + factor2 * t_over_s_slow) ** decay2
 
-        weight1 = weights[FSRS7_WEIGHT1_INDEX] * stability_array ** (
+        weight1 = weights[FSRS7_WEIGHT1_INDEX] * s_fast ** (
             -weights[FSRS7_S_WEIGHT_POWER1_INDEX]
         )
-        weight2 = weights[FSRS7_WEIGHT2_INDEX] * stability_array ** weights[
-            FSRS7_S_WEIGHT_POWER2_INDEX
-        ]
-
-        return pd.Series(
-            np.clip(
-                (weight1 * r1 + weight2 * r2) / (weight1 + weight2),
-                MIN_RETRIEVABILITY,
-                MAX_RETRIEVABILITY,
-            ),
-            index=stability.index,
+        weight2 = (
+            weights[FSRS7_WEIGHT2_INDEX]
+            * s_slow ** weights[FSRS7_S_WEIGHT_POWER2_INDEX]
+            * np.exp(d_weight * (d - 5.0))
         )
+        retention = (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
+        # CUDA fsrs7_forgetting_curve final rescale: p = 1e-5 + (1 - 2e-5) * retention.
+        p = 1e-5 + (1.0 - 2e-5) * retention
+        return pd.Series(np.clip(p, 1e-5, 1.0 - 1e-5), index=stability.index)
 
     predictor = FSRS(parameters=weights)
     testset_copy = testset.copy()
@@ -147,7 +166,13 @@ def predict(
     memory_states = predictor.memory_state_batch(history_items)
     testset_copy["stability"] = [s.stability for s in memory_states]
     testset_copy["difficulty"] = [s.difficulty for s in memory_states]
-    testset_copy["p"] = fsrs7_forgetting_curve(testset_copy["delta_t"], testset_copy["stability"])
+    testset_copy["stability_fast"] = [s.stability_fast for s in memory_states]
+    testset_copy["p"] = fsrs7_forgetting_curve(
+        testset_copy["delta_t"],
+        testset_copy["stability"],
+        testset_copy["stability_fast"],
+        testset_copy["difficulty"],
+    )
 
     p = testset_copy["p"].tolist()
     y = testset_copy["y"].tolist()

@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 mod training_v7 {
 use crate::model::{S_MAX, S_MIN};
 
-pub(crate) const PARAM_LEN: usize = 35;
+pub(crate) const PARAM_LEN: usize = 36;
 pub(crate) const PENALTY_W_1: f64 = 0.5;
 pub(crate) const PENALTY_W_2: f64 = 0.0015;
 pub(crate) const PENALTY_W_L2: f64 = 0.5;
@@ -44,11 +44,14 @@ pub(crate) const MAX_T: f32 = 36500.0;
 pub(crate) const ONE_DAY: f32 = 1.0;
 pub(crate) const SHORT_C: f32 = 600.0 / 86400.0;
 pub(crate) const INV_C: f32 = 1.0 / SHORT_C;
-pub(crate) const GRAD_LEN: usize = 35;
-pub(crate) const PARAMS_STDDEV: [f32; 35] = [
+pub(crate) const GRAD_LEN: usize = 36;
+// L2 prior sigmas for the iter-66 dual-trace layout (FSRS7_L2_SIGMA_35_VALUES).
+// 0..3 free (9999), 4..24 difficulty/long+short stability, 25..32 forgetting curve,
+// 33 d_weight, 34 d_decay, 35 s_decay1.
+pub(crate) const PARAMS_STDDEV: [f32; 36] = [
     9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.0829,
     0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
-    0.864, 0.4053, 0.162, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489,
+    0.864, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489, 0.2, 0.15, 0.15,
 ];
 
 pub(crate) fn l2_penalty_value_and_grad(
@@ -86,7 +89,13 @@ pub(crate) fn l2_penalty_value_and_grad(
 }
 
 // Keep Dual35 local to FSRS-7 training: the penalty objective and its gradients
-// are expressed against FSRS-7's fixed 35-parameter layout and index mapping.
+// are expressed against FSRS-7's parameter layout and index mapping.
+//
+// NOTE (iter-66 dual-trace port): the schedule penalty below is DISABLED by default
+// (enable_sched_penalties = false in every timed path) and was NOT migrated to the
+// new 36-param dual-trace layout — its w-indices (e.g. the curve at 27..34, the
+// transition blend at 25/26) still refer to the pre-port single-trace layout. Do
+// not enable it without first reworking these indices and the stability recurrence.
 #[derive(Clone, Copy, Debug)]
 struct Dual35 {
     value: f64,
@@ -583,8 +592,10 @@ type B = NdArray<f32>;
 
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
-const MIN_RETRIEVABILITY: f32 = 0.0001;
-const MAX_RETRIEVABILITY: f32 = 0.9999;
+// Match the CUDA curve's effective range (p = 1e-5 + (1-2e-5)*retention). The old
+// 1e-4/0.9999 training clamp was tighter than CUDA and damped extreme-error gradients.
+const MIN_RETRIEVABILITY: f32 = 1e-5;
+const MAX_RETRIEVABILITY: f32 = 1.0 - 1e-5;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
@@ -684,11 +695,11 @@ pub(crate) fn parameter_clipper<B: Backend>(
     enable_short_term: bool,
 ) -> Param<Tensor<B, 1>> {
     let (id, val) = parameters.consume();
-    let mut clipped = clip_parameters(&val.to_data().to_vec().unwrap());
-    if !enable_short_term {
-        // w[26] controls short-term mixing; forcing it to 0 disables the short-term path.
-        clipped[26] = 0.0;
-    }
+    let clipped = clip_parameters(&val.to_data().to_vec().unwrap());
+    // Dual-trace FSRS-7 has no separate short-term toggle (the old w[26] transition
+    // weight is gone); the fast trace is intrinsic. enable_short_term is kept in the
+    // signature for call-site compatibility but no longer zeros any parameter.
+    let _ = enable_short_term;
     Param::initialized(
         id,
         Tensor::from_data(TensorData::new(clipped, val.shape()), &val.device()).require_grad(),
@@ -1052,12 +1063,16 @@ pub(crate) fn sort_items_by_review_length(
 
 /// The input items should be sorted by the review timestamp.
 pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedFSRSItem> {
-    let length = (items.len() as f32 - 1.0).max(1.0);
+    // Denominator is the train-set size n (NOT n-1), matching CUDA gradient_weight:
+    // review_ord_lin = review_ord / training_set_size, review_ord 0-based (0..n-1).
+    let length = (items.len() as f32).max(1.0);
     items
         .into_iter()
         .enumerate()
         .map(|(idx, item)| WeightedFSRSItem {
-            weight: 0.25 + 0.75 * (idx as f32 / length).powi(3),
+            // iter-66 champion recency weighting: C0 + (1 - C0) * (idx/n)^EXP,
+            // C0 = 0.0666667, EXP = 11.25.
+            weight: 0.0666667 + 0.9333333 * (idx as f32 / length).powf(11.25),
             item,
         })
         .collect()
@@ -1116,7 +1131,12 @@ impl<B: Backend> Model<B> {
     ) -> Tensor<B, 1> {
         let state = self.forward(t_historys, r_historys, None);
         let retrievability = self
-            .power_forgetting_curve(delta_ts, state.stability)
+            .power_forgetting_curve(
+                delta_ts,
+                state.stability,
+                state.stability_fast,
+                state.difficulty,
+            )
             .clamp(MIN_RETRIEVABILITY, MAX_RETRIEVABILITY);
         BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
     }
@@ -1155,8 +1175,10 @@ impl<B: AutodiffBackend> Model<B> {
     fn freeze_short_term_stability(&self, mut grad: B::Gradients) -> B::Gradients {
         let grad_tensor = self.w.grad(&grad).unwrap();
         let device = grad_tensor.device();
-        let updated_grad_tensor = if grad_tensor.dims()[0] >= 35 {
-            grad_tensor.slice_assign([16..27], Tensor::zeros([11], &device))
+        // Dual-trace layout: the short-term stability-after-review params are 16..25
+        // (9 params). Unused in the timed paths (enable_short_term is always true).
+        let updated_grad_tensor = if grad_tensor.dims()[0] >= 36 {
+            grad_tensor.slice_assign([16..25], Tensor::zeros([9], &device))
         } else {
             grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device))
         };
@@ -1260,11 +1282,11 @@ pub(crate) struct TrainingConfig {
     pub enable_sched_penalties: bool,
     #[config(default = 8)]
     pub num_epochs: usize,
-    #[config(default = 1024)]
+    #[config(default = 512)]
     pub batch_size: usize,
     #[config(default = 2023)]
     pub seed: u64,
-    #[config(default = 2e-2)]
+    #[config(default = 0.045)]
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
@@ -1357,8 +1379,8 @@ pub fn compute_parameters(
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
         AdamConfig::new()
-            .with_beta_1(0.8)
-            .with_beta_2(0.85)
+            .with_beta_1(0.55)
+            .with_beta_2(0.955555)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
@@ -1425,8 +1447,8 @@ pub fn benchmark(
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
         AdamConfig::new()
-            .with_beta_1(0.8)
-            .with_beta_2(0.85)
+            .with_beta_1(0.55)
+            .with_beta_2(0.955555)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
