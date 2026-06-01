@@ -1,4 +1,7 @@
+target/
 __pycache__/
 *.pyc
-fsrs-rs/target/
-fsrs-rs-python/target/
+*.pyd
+*.so
+*.pdb
+.venv/

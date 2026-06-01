@@ -1,9 +1,17 @@
 from abc import ABC, abstractmethod
+from itertools import chain
 from typing import Optional, List, Tuple
 import pandas as pd
 from config import Config
 from utils import cum_concat
-from fsrs_optimizer import remove_outliers, remove_non_continuous_rows  # type: ignore
+
+
+def _to_history_list(col):
+    return cum_concat(list(map(lambda x: [x], col)))
+
+
+def _fmt_history(history_list):
+    return list(map(lambda item: ",".join(map(str, item[:-1])), chain.from_iterable(history_list)))
 
 
 class BaseFeatureEngineer(ABC):
@@ -59,10 +67,6 @@ class BaseFeatureEngineer(ABC):
         # Filter invalid ratings
         df.drop(df[~df["rating"].isin([1, 2, 3, 4])].index, inplace=True)
 
-        # Handle two-button mode
-        if self.config.two_buttons:
-            df["rating"] = df["rating"].replace({2: 3, 4: 3})
-
         # Calculate review count
         df["i"] = df.groupby("card_id").cumcount() + 1
         df.drop(df[df["i"] > self.config.max_seq_len * 2].index, inplace=True)
@@ -70,27 +74,30 @@ class BaseFeatureEngineer(ABC):
         # Process time intervals
         df = self._process_time_intervals(df)
 
-        # Handle short-term reviews
-        if not self.config.include_short_term:
-            df.drop(df[df["elapsed_days"] == 0].index, inplace=True)
-            df["i"] = df.groupby("card_id").cumcount() + 1
+        def _handle_short_term():
+            # Handle short-term reviews
+            if not self.config.include_short_term:
+                df.drop(df[df["elapsed_days"] == 0].index, inplace=True)
+                df["i"] = df.groupby("card_id").cumcount() + 1
 
+        _handle_short_term()
         return df
 
     def _process_time_intervals(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process time interval related fields
         """
-        if (
-            "delta_t" not in df.columns
-            and "elapsed_days" in df.columns
-            and "elapsed_seconds" in df.columns
-        ):
+        def _maybe_init_delta_t():
+            if "delta_t" in df.columns:
+                return
+            if not {"elapsed_days", "elapsed_seconds"}.issubset(df.columns):
+                return
             df["delta_t"] = df["elapsed_days"]
             if self.config.use_secs_intervals:
                 df["delta_t_secs"] = df["elapsed_seconds"] / 86400
                 df["delta_t_secs"] = df["delta_t_secs"].map(lambda x: max(0, x))
 
+        _maybe_init_delta_t()
         df["delta_t"] = df["delta_t"].map(lambda x: max(0, x))
         df["delta_t_int"] = df["elapsed_days"].map(lambda x: max(0, x))
         return df
@@ -102,18 +109,21 @@ class BaseFeatureEngineer(ABC):
         # Calculate time history (non-seconds)
         t_history_non_secs_list = df.groupby("card_id", group_keys=False)[
             "delta_t"
-        ].apply(lambda x: cum_concat([[i] for i in x]))
+        ].apply(_to_history_list)
 
-        # Calculate time history (seconds)
-        t_history_secs_list: Optional[pd.Series] = None
-        if self.config.use_secs_intervals:
-            t_history_secs_list = df.groupby("card_id", group_keys=False)[
-                "delta_t_secs"
-            ].apply(lambda x: cum_concat([[i] for i in x]))
+        def _secs_history():
+            # Calculate time history (seconds)
+            if self.config.use_secs_intervals:
+                return df.groupby("card_id", group_keys=False)[
+                    "delta_t_secs"
+                ].apply(_to_history_list)
+            return None
+
+        t_history_secs_list: Optional[pd.Series] = _secs_history()
 
         # Calculate rating history
         r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
-            lambda x: cum_concat([[i] for i in x])
+            _to_history_list
         )
 
         # Calculate last rating
@@ -121,11 +131,7 @@ class BaseFeatureEngineer(ABC):
         df["last_rating"] = last_rating
 
         # Set history record strings
-        df["r_history"] = [
-            ",".join(map(str, item[:-1]))
-            for sublist in r_history_list
-            for item in sublist
-        ]
+        df["r_history"] = _fmt_history(r_history_list)
 
         # Process time history strings
         df = self._set_time_histories(
@@ -142,18 +148,16 @@ class BaseFeatureEngineer(ABC):
         """
         Calculate the previous rating for each review
         """
-        last_rating = []
-        for t_sublist, r_sublist in zip(t_history_list, r_history_list):
-            for t_history, r_history in zip(t_sublist, r_sublist):
-                flag = True
-                for t, r in zip(reversed(t_history[:-1]), reversed(r_history[:-1])):
-                    if t > 0:
-                        last_rating.append(r)
-                        flag = False
-                        break
-                if flag:
-                    last_rating.append(r_history[0])
-        return last_rating
+        def _compute():
+            return [
+                next(
+                    map(lambda pr: pr[1], filter(lambda pr: pr[0] > 0, zip(reversed(t[:-1]), reversed(r[:-1])))),
+                    r[0],
+                )
+                for t_sublist, r_sublist in zip(t_history_list, r_history_list)
+                for t, r in zip(t_sublist, r_sublist)
+            ]
+        return _compute()
 
     def _set_time_histories(
         self,
@@ -164,32 +168,18 @@ class BaseFeatureEngineer(ABC):
         """
         Set time history string fields
         """
-        if t_history_secs_list is not None:
-            if self.config.equalize_test_with_non_secs:
-                df["t_history"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_non_secs_list
-                    for item in sublist
-                ]
-                df["t_history_secs"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_secs_list
-                    for item in sublist
-                ]
+        def _assign():
+            if t_history_secs_list is not None:
+                if self.config.equalize_test_with_non_secs:
+                    df["t_history"] = _fmt_history(t_history_non_secs_list)
+                    df["t_history_secs"] = _fmt_history(t_history_secs_list)
+                else:
+                    df["t_history"] = _fmt_history(t_history_secs_list)
+                df["delta_t"] = df["delta_t_secs"]
             else:
-                df["t_history"] = [
-                    ",".join(map(str, item[:-1]))
-                    for sublist in t_history_secs_list
-                    for item in sublist
-                ]
-            df["delta_t"] = df["delta_t_secs"]
-        else:
-            df["t_history"] = [
-                ",".join(map(str, item[:-1]))
-                for sublist in t_history_non_secs_list
-                for item in sublist
-            ]
+                df["t_history"] = _fmt_history(t_history_non_secs_list)
 
+        _assign()
         return df
 
     @abstractmethod
@@ -224,42 +214,17 @@ class BaseFeatureEngineer(ABC):
         )
         df.drop(columns=["is_lapse"], inplace=True)
 
-        # Handle short-term reviews
-        if self.config.include_short_term:
-            df = df[(df["delta_t"] != 0) | (df["i"] == 1)].copy()
-
         # Recalculate review sequence number
         df["i"] = df["elapsed_days"].gt(0).groupby(df["card_id"]).cumsum().add(1)
 
-        # Handle outliers and non-continuous rows (only for non-seconds intervals)
-        if not self.config.use_secs_intervals:
-            df = self._handle_outliers_and_continuity(df)
-            if df.empty:
-                raise ValueError(
-                    "No data after handling outliers and non-continuous rows"
-                )
+        def _filter_and_validate(df):
+            # Handle short-term reviews
+            if self.config.include_short_term:
+                df = df[(df["delta_t"] != 0) | (df["i"] == 1)].copy()
+            return df
 
+        df = _filter_and_validate(df)
         return df[df["delta_t"] > 0].sort_values(by=["review_th"])
-
-    def _handle_outliers_and_continuity(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Handle outliers and non-continuous rows
-        """
-
-        filtered_dataset = (
-            df[df["i"] == 2]
-            .groupby(by=["first_rating"], as_index=False, group_keys=False)[df.columns]
-            .apply(remove_outliers)
-        )
-        if filtered_dataset.empty:
-            return pd.DataFrame()
-
-        df[df["i"] == 2] = filtered_dataset
-        df.dropna(inplace=True)
-        df = df.groupby("card_id", as_index=False, group_keys=False)[df.columns].apply(
-            remove_non_continuous_rows
-        )
-        return df
 
     def get_time_history_list(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -271,19 +236,11 @@ class BaseFeatureEngineer(ABC):
         Returns:
             Time history list as pandas Series
         """
-        if self.config.use_secs_intervals:
-            t_history_list = df.groupby("card_id", group_keys=False)[
-                (
-                    "delta_t_secs"
-                    if not self.config.equalize_test_with_non_secs
-                    else "delta_t"
-                )
-            ].apply(lambda x: cum_concat([[i] for i in x]))
+        if all([self.config.use_secs_intervals, not self.config.equalize_test_with_non_secs]):
+            col = "delta_t_secs"
         else:
-            t_history_list = df.groupby("card_id", group_keys=False)["delta_t"].apply(
-                lambda x: cum_concat([[i] for i in x])
-            )
-        return t_history_list
+            col = "delta_t"
+        return df.groupby("card_id", group_keys=False)[col].apply(_to_history_list)
 
     def get_rating_history_list(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -296,7 +253,7 @@ class BaseFeatureEngineer(ABC):
             Rating history list as pandas Series
         """
         r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
-            lambda x: cum_concat([[i] for i in x])
+            _to_history_list
         )
         return r_history_list
 

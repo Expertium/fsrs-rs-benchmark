@@ -83,9 +83,6 @@ def create_parser():
         action="store_true",
         help="Enable FSRS-7 scheduling penalties (penalty 1 & 2). L2 penalty is always on. (default: False)",
     )
-    parser.add_argument(
-        "--two_buttons", action="store_true", help="treat Hard and Easy as Good"
-    )
 
     # download revlogs from huggingface
     parser.add_argument(
@@ -126,9 +123,6 @@ def create_parser():
     parser.add_argument(
         "--file", action="store_true", help="save evaluation results to file"
     )
-    parser.add_argument(
-        "--plot", action="store_true", help="save evaluation plots to file"
-    )
 
     parser.add_argument("--algo", default="FSRSv3", help="algorithm name")
     parser.add_argument(
@@ -167,30 +161,32 @@ def create_parser():
 
 
 def _parse_cuda_devices(raw: Optional[str]) -> Optional[List[int]]:
-    if raw is None:
-        return None
-    value = raw.strip()
-    if value == "":
-        return None
-    value_lower = value.lower()
-    if value_lower in {"all", "*"}:
-        if not torch.cuda.is_available():
-            return []
-        return list(range(torch.cuda.device_count()))
+    def _inner() -> Optional[List[int]]:
+        if raw is None:
+            return None
+        value = raw.strip()
+        if not value:
+            return None
+        value_lower = value.lower()
+        if value_lower in {"all", "*"}:
+            if not torch.cuda.is_available():
+                return []
+            return list(range(torch.cuda.device_count()))
 
-    parts = [p for p in re.split(r"[,\s]+", value) if p]
-    device_ids: List[int] = []
-    for part in parts:
-        try:
-            device_id = int(part)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
-            ) from exc
-        if device_id < 0:
-            raise ValueError("CUDA device IDs must be >= 0.")
-        device_ids.append(device_id)
-    return device_ids
+        def _parse_part(part: str) -> int:
+            try:
+                device_id = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid CUDA device id '{part}'. Use comma/space-separated integers."
+                ) from exc
+            if device_id < 0:
+                raise ValueError("CUDA device IDs must be >= 0.")
+            return device_id
+
+        return list(map(_parse_part, filter(None, re.split(r"[,\s]+", value))))
+
+    return _inner()
 
 
 class Config:
@@ -198,7 +194,7 @@ class Config:
 
     def __init__(self, args: argparse.Namespace):
         # Store raw args for reference if needed, though direct access should be minimized
-        self.raw_args: argparse.Namespace = args
+        self._raw_args: argparse.Namespace = args
 
         # Basic arguments from parser
         self.dev_mode: bool = args.dev
@@ -210,11 +206,9 @@ class Config:
         self.no_test_same_day: bool = args.no_test_same_day
         self.no_train_same_day: bool = args.no_train_same_day
         self.equalize_test_with_non_secs: bool = args.equalize_test_with_non_secs
-        self.two_buttons: bool = args.two_buttons
         self.only_S0: bool = args.S0
         self.sched_penalties: bool = args.sched_penalties  # only for FSRS-7
         self.save_evaluation_file: bool = args.file
-        self.generate_plots: bool = args.plot
         self.save_weights: bool = args.weights
         self.partitions: str = args.partitions
         self.save_raw_output: bool = args.raw
@@ -235,60 +229,46 @@ class Config:
         # if hasattr(torch, "set_num_interop_threads"):
         #     torch.set_num_interop_threads(args.torch_num_interop_threads)
 
-        # Validate model name
-        if self.model_name not in get_args(ModelName):
-            raise ValueError(
-                f"Model name '{self.model_name}' must be one of {get_args(ModelName)}"
-            )
+        def _validate_model():
+            if self.model_name not in get_args(ModelName):
+                raise ValueError(
+                    f"Model name '{self.model_name}' must be one of {get_args(ModelName)}"
+                )
 
+        def _select_device():
+            if all([torch.cuda.is_available(), self.model_name in [
+                "GRU", "LSTM", "RNN", "NN-17", "Transformer",
+            ]]):
+                return torch.device("cuda")
+            if all([torch.backends.mps.is_available(), self.model_name == "LSTM"]):
+                return torch.device("mps")
+            return torch.device("cpu")
+
+        _validate_model()
         # Device configuration
-        if torch.cuda.is_available() and self.model_name in [
-            "GRU",
-            "LSTM",
-            "RNN",
-            "NN-17",
-            "Transformer",
-        ]:
-            self.device: torch.device = torch.device("cuda")
-        elif torch.backends.mps.is_available() and self.model_name == "LSTM":
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
+        self.device: torch.device = _select_device()
 
         # Verbosity
         self.verbose_inadequate_data: bool = False
 
         # Derived file names
         _file_name_parts: list[str] = [self.model_name]
-        if self.default_params:
-            _file_name_parts.append("-default")
-        if self.only_S0:
-            _file_name_parts.append("-S0")
-        if self.sched_penalties:
-            _file_name_parts.append("-sched_penalties")
-        if self.two_buttons:
-            # Suffix is '-binary' for backward compatibility with existing analysis scripts.
-            _file_name_parts.append("-binary")
-        if self.include_short_term:
-            _file_name_parts.append("-short")
-        if self.use_secs_intervals:
-            _file_name_parts.append("-secs")
-        if self.model_name == "LSTM" and self.lstm_use_duration:
-            _file_name_parts.append("-duration")
-        if self.use_recency_weighting:
-            _file_name_parts.append("-recency")
-        if self.no_test_same_day:
-            _file_name_parts.append("-no_test_same_day")
-        if self.no_train_same_day:
-            _file_name_parts.append("-no_train_same_day")
-        if self.equalize_test_with_non_secs:
-            _file_name_parts.append("-equalize_test_with_non_secs")
-        if self.train_equals_test:
-            _file_name_parts.append("-train_equals_test")
-        if self.partitions != "none":
-            _file_name_parts.append(f"-{self.partitions}")
-        if self.dev_mode:
-            _file_name_parts.append("-dev")
+        _suffix_conditions = [
+            (self.default_params, "-default"),
+            (self.only_S0, "-S0"),
+            (self.sched_penalties, "-sched_penalties"),
+            (self.include_short_term, "-short"),
+            (self.use_secs_intervals, "-secs"),
+            (all([self.model_name == "LSTM", self.lstm_use_duration]), "-duration"),
+            (self.use_recency_weighting, "-recency"),
+            (self.no_test_same_day, "-no_test_same_day"),
+            (self.no_train_same_day, "-no_train_same_day"),
+            (self.equalize_test_with_non_secs, "-equalize_test_with_non_secs"),
+            (self.train_equals_test, "-train_equals_test"),
+            (self.partitions != "none", f"-{self.partitions}"),
+            (self.dev_mode, "-dev"),
+        ]
+        _file_name_parts += list(map(lambda cs: cs[1], filter(lambda cs: cs[0], _suffix_conditions)))
 
         self.base_file_name: str = "".join(_file_name_parts)
 
@@ -301,10 +281,12 @@ class Config:
 
     def __repr__(self) -> str:
         """Provides a string representation of the configuration."""
-        attrs = {
-            k: v
-            for k, v in self.__dict__.items()
-            if k != "raw_args" and not k.startswith("_")
-        }
-        return f"Config({attrs})"
+        def _inner() -> str:
+            attrs = {
+                k: v
+                for k, v in self.__dict__.items()
+                if not k.startswith("_")
+            }
+            return f"Config({attrs})"
+        return _inner()
 
