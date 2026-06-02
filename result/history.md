@@ -24,6 +24,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 17 | 172 | 145 | 1.156 | 6458 | 6460 | 1.000 | 1.001 | ✓ | accepted | Minimax (Remez) exp8 deg 6->4 and ln8 deg 4->2: 4 fewer FMAs |
 | 18 | 145 | 46 | 3.118 | 6460 | 7207 | 1.116 | 1.315 | ✓ | accepted | O(N) expanding window: one per-card pass scores every timestep, replacing O(N^2) per-prefix forward |
 | 19 | 47 | 40 | 1.145 | 7207 | 7204 | 1.000 | 0.999 | ✓ | accepted | Build host batches once (train==test): reuse for grad+validation, drop redundant clone+build |
+| 20 | 40 | 39 | 1.059 | 7204 | 7196 | 0.999 | 0.997 | ✓ | accepted | Unified BCE -ln(1-|label-r|) (Andrew): vectorize validation ln8 + one-division gradient seed |
 
-**Cumulative speed_ratio (product of accepted): ×75.031** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×79.443** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

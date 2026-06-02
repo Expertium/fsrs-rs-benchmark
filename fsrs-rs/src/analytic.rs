@@ -1209,9 +1209,13 @@ pub(crate) fn card_loss_and_grad_simd(
                 let lbl = load8(labels, base);
                 let r_raw = caches[t].curve_out();
                 let r = clamp8(r_raw, MIN_R, MAX_R);
-                // d/dr of -wt*BCE, with the [MIN_R,MAX_R] clamp zeroing the adjoint outside the range.
-                // Padding / filtered steps have wt==0 -> g_r==0 (r is clamped, so lbl/r never NaNs).
-                let g_r = (z - wt) * (lbl / r - (one - lbl) / (one - r));
+                // d/dr of -wt*BCE via the unified label identity: d[-ln(1-|label-r|)]/dr =
+                // -sign(label-r)/(1-|label-r|). ONE division instead of two (label is 0/1). Padding/
+                // filtered steps have wt==0 -> g_r==0; the [MIN_R,MAX_R] clamp zeroes the adjoint
+                // outside the range. Precision-trade (3b) vs the old lbl/r - (1-lbl)/(1-r).
+                let dd = lbl - r;
+                let sgn = dd.cmp_gt(z).blend(one, z - one);
+                let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
                 (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
             };
             let (gs0, gd0, gsf0) =
@@ -1252,17 +1256,16 @@ pub(crate) fn card_loss_simd(
             d = ns.1;
             sf = ns.2;
             if t >= 1 {
-                let r = clamp8(cache.curve_out(), MIN_R, MAX_R).to_array();
-                for (j, &rr) in r.iter().enumerate() {
-                    let idx = base + j;
-                    let wt = weights[idx] as f64;
-                    if wt != 0.0 {
-                        let rr = rr as f64;
-                        loss += -wt
-                            * (labels[idx] as f64 * rr.ln()
-                                + (1.0 - labels[idx] as f64) * (1.0 - rr).ln());
-                    }
-                }
+                // Per-prediction BCE via the unified identity  -ln(1 - |label - r|)  (= -ln(r) for
+                // label 1, -ln(1-r) for label 0). Being branchless, the whole 8-lane BCE is ONE
+                // vectorized ln8 instead of up to 8 scalar f64 libm lns + a per-lane loop. Padding /
+                // filtered lanes have weight 0 so they contribute 0. Precision-trade (3b band): f32
+                // ln8 + f32 lane-sum vs the old f64 libm ln + f64 accumulate.
+                let r = clamp8(cache.curve_out(), MIN_R, MAX_R);
+                let lbl = load8(labels, base);
+                let wt = load8(weights, base);
+                let arg = k(1.0) - (lbl - r).fast_max(r - lbl); // 1 - |label - r|  (label is 0 or 1)
+                loss += ((z - wt) * ln8(arg)).reduce_add() as f64;
             }
         }
     }
