@@ -1196,17 +1196,34 @@ pub(crate) fn card_loss_and_grad_simd(
     labels: &[f32], weights: &[f32], gw: &mut [f64],
 ) -> f64 {
     debug_assert!(batch % 8 == 0, "card_loss_and_grad_simd needs batch padded to a multiple of 8");
+    debug_assert!(seq_len >= 2, "windowed grad needs seq_len >= 2 (min surviving prefix length is 2)");
     let wc = wconsts(w);
     let k = f32x8::splat;
     let one = k(1.0);
     let z = k(0.0);
     let n_groups = batch / 8;
+    // d/dr of -wt*BCE via the unified label identity: d[-ln(1-|label-r|)]/dr = -sign(label-r)/
+    // (1-|label-r|). ONE division (label is 0/1); padding/filtered steps have wt==0 -> 0; the
+    // [MIN_R,MAX_R] clamp zeroes the adjoint outside the range. (3b trade vs lbl/r - (1-lbl)/(1-r).)
+    // Shared by the peeled last step and the reverse loop below.
+    let g_r_loss_at = |r_raw: f32x8, base: usize| -> f32x8 {
+        let wt = load8(weights, base);
+        let lbl = load8(labels, base);
+        let r = clamp8(r_raw, MIN_R, MAX_R);
+        let dd = lbl - r;
+        let sgn = dd.cmp_gt(z).blend(one, z - one);
+        let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
+        (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
+    };
     let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
     for g in 0..n_groups {
         let c0 = g * 8;
         caches.clear();
         let (mut s, mut d, mut sf) = (z, z, z);
-        for t in 0..seq_len {
+        // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
+        // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
+        // like card_loss_simd's validation skip-last.
+        for t in 0..seq_len - 1 {
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { z } else { load8(t_hist, base) };
@@ -1216,27 +1233,31 @@ pub(crate) fn card_loss_and_grad_simd(
             sf = ns.2;
             caches.push(cache);
         }
-        // Reverse pass. The final state (output of the last step) feeds no downstream loss, so its
-        // adjoint starts at 0; each step t>=1 injects its own per-timestep loss adjoint on curve.out.
+        // Last step (t = seq_len-1, always >= 1): curve ONLY, from the clamped incoming state — the
+        // exact curve step8_fwd would compute. (debug_assert seq_len>=2 guards the 0..seq_len-1 above.)
+        let lbase = (seq_len - 1) * batch + c0;
+        let dt_last = load8(t_hist, lbase).fast_max(z);
+        let (ls, lsf, ld) =
+            (clamp8(s, S_MIN, S_MAX), clamp8(sf, S_MIN, S_MAX), clamp8(d, D_MIN, D_MAX));
+        let fc_last = curve8_fwd::<true>(
+            w, dt_last, ls, lsf, ld, wc.ln_w27, wc.ln_w28, ln8::<true>(ls), ln8::<true>(lsf),
+        );
+        // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
+        // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
+        // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
         let mut gw_g = [f32x8::splat(0.0); 36];
-        let (mut g_s, mut g_d, mut g_sf) = (z, z, z);
-        for t in (0..seq_len).rev() {
+        let g_rraw_last = g_r_loss_at(fc_last.out, lbase);
+        let (g_ls, g_lsf, g_ld) = curve8_bwd(
+            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, &mut gw_g, wc.ln_w27, wc.ln_w28,
+        );
+        let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
+        let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
+        let mut g_sf = (sf.cmp_gt(k(S_MIN)) & sf.cmp_lt(k(S_MAX))).blend(g_lsf, z);
+        for t in (0..seq_len - 1).rev() {
             let g_r_loss = if t == 0 {
-                z // init step: no prediction (the minimum surviving prefix length is 2).
+                z // init step: no prediction (min surviving prefix length is 2).
             } else {
-                let base = t * batch + c0;
-                let wt = load8(weights, base);
-                let lbl = load8(labels, base);
-                let r_raw = caches[t].curve_out();
-                let r = clamp8(r_raw, MIN_R, MAX_R);
-                // d/dr of -wt*BCE via the unified label identity: d[-ln(1-|label-r|)]/dr =
-                // -sign(label-r)/(1-|label-r|). ONE division instead of two (label is 0/1). Padding/
-                // filtered steps have wt==0 -> g_r==0; the [MIN_R,MAX_R] clamp zeroes the adjoint
-                // outside the range. Precision-trade (3b) vs the old lbl/r - (1-lbl)/(1-r).
-                let dd = lbl - r;
-                let sgn = dd.cmp_gt(z).blend(one, z - one);
-                let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
-                (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
+                g_r_loss_at(caches[t].curve_out(), t * batch + c0)
             };
             let (gs0, gd0, gsf0) =
                 step8_bwd(w, &caches[t], (g_s, g_d, g_sf), g_r_loss, &mut gw_g, &wc);

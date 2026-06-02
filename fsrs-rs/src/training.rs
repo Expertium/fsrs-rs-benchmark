@@ -1417,22 +1417,24 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
 /// prefix-items, matching the per-prefix path so the penalty scaling is unchanged.
 fn build_batch_host_windowed(cards: &[Vec<WeightedFSRSItem>]) -> BatchHost {
     let predictions: usize = cards.iter().map(|p| p.len()).sum();
-    let full_len = |prefixes: &[WeightedFSRSItem]| {
-        prefixes.iter().map(|wi| wi.item.reviews.len()).max().unwrap_or(0)
-    };
     let n_cards = cards.len();
     // Pad the card/column count up to a multiple of 8 (all-zero pad columns, weight 0).
     let bsz = n_cards.div_ceil(8) * 8;
+    // Each card's longest surviving prefix carries that card's full review list. Find it ONCE per
+    // card (one scan) and reuse it for both `seq` and the per-card layout below (was two scans).
+    let longest: Vec<&WeightedFSRSItem> = cards
+        .iter()
+        .map(|p| p.iter().max_by_key(|wi| wi.item.reviews.len()).unwrap())
+        .collect();
     // seq = the longest full card length in the batch (= max reviews per surviving prefix).
-    let seq = cards.iter().map(|p| full_len(p)).max().unwrap_or(0);
+    let seq = longest.iter().map(|wi| wi.item.reviews.len()).max().unwrap_or(0);
     let mut th = vec![0.0f32; seq * bsz];
     let mut rh = vec![0.0f32; seq * bsz];
     let mut lbl = vec![0.0f32; seq * bsz];
     let mut wts = vec![0.0f32; seq * bsz];
     for (c, prefixes) in cards.iter().enumerate() {
-        // The longest surviving prefix carries the card's full review list q[0..K'-1]; lay it in.
-        let longest = prefixes.iter().max_by_key(|wi| wi.item.reviews.len()).unwrap();
-        for (t, r) in longest.item.reviews.iter().enumerate() {
+        // Lay in the card's full review list q[0..K'-1] (from its longest surviving prefix).
+        for (t, r) in longest[c].item.reviews.iter().enumerate() {
             th[t * bsz + c] = r.delta_t;
             rh[t * bsz + c] = r.rating as f32;
         }
@@ -1465,8 +1467,10 @@ fn group_cards_into_batches(
         cards.entry(wi.card_id).or_default().push(wi);
     }
     let mut card_list: Vec<Vec<WeightedFSRSItem>> = cards.into_values().collect();
-    // Total order (card_id is unique per card), so independent of HashMap iteration order.
-    card_list.sort_by_key(|prefixes| {
+    // Total order (card_id is unique per card), so independent of HashMap iteration order. Cached
+    // key: full_len scans the card's prefixes, so compute it once per card instead of per comparison
+    // (sort_by_key would). Same key => identical order => bit-for-bit batches.
+    card_list.sort_by_cached_key(|prefixes| {
         let full_len = prefixes
             .iter()
             .map(|wi| wi.item.reviews.len())
