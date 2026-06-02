@@ -1498,7 +1498,7 @@ fn train<B: AutodiffBackend>(
             let (schedule_value, _) =
                 schedule_penalty(&w_vec_valid, vb.real_batch_size, config.enable_sched_penalties);
             let schedule_penalty = schedule_value / total_size as f64;
-            let bce = crate::analytic::batch_loss(
+            let bce = crate::analytic::batch_loss_simd(
                 &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.dts, &vb.lbl, &vb.wts,
             );
             loss_valid += bce + l2_penalty_value + schedule_penalty;

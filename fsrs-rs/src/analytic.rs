@@ -9,6 +9,8 @@
 //! Result is not bit-for-bit vs autodiff (different FP order) but is judged by the
 //! ±0.0010 average-log-loss band.
 
+use wide::{CmpEq, CmpGt, f32x8, i32x8};
+
 const S_MIN: f32 = 0.0001;
 const S_MAX: f32 = 36500.0;
 const D_MIN: f32 = 1.0;
@@ -16,9 +18,56 @@ const D_MAX: f32 = 10.0;
 const MIN_R: f32 = 1e-5;
 const MAX_R: f32 = 1.0 - 1e-5;
 
+const LOG2E: f32 = std::f32::consts::LOG2_E;
+const LN2: f32 = std::f32::consts::LN_2;
+
 #[inline(always)]
 fn clamp(x: f32, lo: f32, hi: f32) -> f32 {
     x.max(lo).min(hi)
+}
+
+// ===================== portable SIMD transcendentals (8 lanes) =====================
+// These vectorize the analytic forward across 8 cards/lane. A wide::f32x8 exp is ~3.8x faster
+// than 8x scalar libm (microbench profiling/simd_bench) at ~2e-7 rel err — the forward is ~92%
+// transcendentals, so this is the lever. Precision-trading (3b band), portable (constraint 7).
+
+#[inline(always)]
+fn clamp8(x: f32x8, lo: f32, hi: f32) -> f32x8 {
+    x.fast_max(f32x8::splat(lo)).fast_min(f32x8::splat(hi))
+}
+
+/// exp over 8 lanes: 2^n · poly(r), x = n·ln2 + r. Same algorithm as the scalar floor-bench.
+#[inline(always)]
+fn exp8(x: f32x8) -> f32x8 {
+    let x = x.fast_max(f32x8::splat(-87.0)).fast_min(f32x8::splat(88.0));
+    let n = (x * f32x8::splat(LOG2E)).round();
+    let r = x - n * f32x8::splat(LN2);
+    let c = |v: f32| f32x8::splat(v);
+    let p = c(1.0)
+        + r * (c(1.0)
+            + r * (c(0.5) + r * (c(1.0 / 6.0) + r * (c(1.0 / 24.0) + r * (c(1.0 / 120.0) + r * c(1.0 / 720.0))))));
+    let bits: i32x8 = (n.round_int() + i32x8::splat(127)) << 23;
+    let two_n: f32x8 = bytemuck::cast(bits);
+    p * two_n
+}
+
+/// ln over 8 lanes: x = m·2^e, ln = e·ln2 + atanh-series in t=(m-1)/(m+1) through t^9 (~1e-6).
+/// All forward ln inputs are > 0 (stabilities ≥ S_MIN, difficulty ≥ 1, the b/qbase bases > 0).
+#[inline(always)]
+fn ln8(x: f32x8) -> f32x8 {
+    let bits: i32x8 = bytemuck::cast(x);
+    let e: i32x8 = ((bits >> 23) & i32x8::splat(0xff)) - i32x8::splat(127);
+    let mant_bits: i32x8 = (bits & i32x8::splat(0x007f_ffff)) | i32x8::splat(127 << 23);
+    let m: f32x8 = bytemuck::cast(mant_bits);
+    let one = f32x8::splat(1.0);
+    let t = (m - one) / (m + one);
+    let t2 = t * t;
+    let c = |v: f32| f32x8::splat(v);
+    let poly = c(2.0)
+        * t
+        * (one + t2 * (c(1.0 / 3.0) + t2 * (c(1.0 / 5.0) + t2 * (c(1.0 / 7.0) + t2 * c(1.0 / 9.0)))));
+    let e_f: f32x8 = e.round_float();
+    e_f * f32x8::splat(LN2) + poly
 }
 
 /// Loop-invariant (weight-only) subexpressions, computed ONCE per batch_loss[_and_grad] call
@@ -452,11 +501,10 @@ fn step_bwd(w: &[f32], c: &StepCache, g_out: (f64, f64, f64), gw: &mut [f64], wc
 
 // ===================== batch driver =====================
 
-/// Forward-only BCE loss for one batch. The per-epoch **validation** scorer (iter6) and the
-/// gradient unit test. `t_hist`/`r_hist` are row-major [seq_len, batch]; card c is column c.
-/// Single-threaded on purpose: 2-thread splitting (iter7) regressed under --processes 10
-/// (forward-only is memory-bound, so the 2nd thread just fights for saturated bandwidth).
-#[allow(clippy::too_many_arguments)]
+/// Scalar forward-only BCE loss for one batch — the reference oracle for the SIMD validation
+/// scorer (batch_loss_simd replaced it in the hot path at iter14; the unit test checks they agree)
+/// and for the finite-difference gradient test. `t_hist`/`r_hist` are row-major [seq_len, batch].
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn batch_loss(
     w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
     delta_ts: &[f32], labels: &[f32], weights: &[f32],
@@ -464,6 +512,159 @@ pub(crate) fn batch_loss(
     let wc = wconsts(w);
     let mut loss = 0.0f64;
     for c in 0..batch {
+        let mut state = (0.0f32, 0.0f32, 0.0f32);
+        for t in 0..seq_len {
+            state = step_fwd(w, t_hist[t * batch + c], r_hist[t * batch + c], state, t == 0, &wc).0;
+        }
+        let (s, d, sf) = state;
+        let r = clamp(
+            curve_fwd(w, delta_ts[c], s, sf, d, wc.ln_w27, wc.ln_w28, s.ln(), sf.ln()).out,
+            MIN_R,
+            MAX_R,
+        );
+        loss += -(weights[c] as f64)
+            * (labels[c] as f64 * (r as f64).ln() + (1.0 - labels[c] as f64) * (1.0 - r as f64).ln());
+    }
+    loss
+}
+
+// ===================== SIMD validation forward (8 cards/lane) =====================
+// Vectorized, FORWARD-ONLY mirror of step_fwd's recurrence + the final curve, used by the
+// per-epoch validation scorer. exp8/ln8 replace libm exp/ln (precision-trade, 3b band). The
+// data layout [seq_len, batch] makes 8 consecutive cards at one timestep a contiguous f32x8 load.
+
+#[inline(always)]
+fn load8(s: &[f32], i: usize) -> f32x8 {
+    f32x8::from([s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5], s[i + 6], s[i + 7]])
+}
+
+/// Retrievability for 8 cards (forward-only; mirrors curve_fwd's `out`).
+#[allow(clippy::too_many_arguments)]
+fn curve_out8(
+    w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, ln_w27: f32, ln_w28: f32,
+    ln_s: f32x8, ln_sf: f32x8,
+) -> f32x8 {
+    let sp = |i: usize| f32x8::splat(w[i]);
+    let k = f32x8::splat;
+    let t = t.fast_max(k(0.0));
+    let a = t / sf;
+    let bv = t / s;
+    let p35 = exp8(sp(35) * ln_sf);
+    let dm1 = clamp8(sp(25) * p35, 0.01, 0.95);
+    let decay1 = k(0.0) - dm1;
+    let e1 = exp8((k(ln_w27) / decay1).fast_min(k(60.0)));
+    let b1 = a * (e1 - k(1.0)) + k(1.0);
+    let r1 = exp8(decay1 * ln8(b1));
+    let dm2 = clamp8(sp(26) * exp8((d - k(5.0)) * sp(34)), 0.01, 0.95);
+    let decay2 = k(0.0) - dm2;
+    let inv2 = k(1.0) / decay2;
+    let p28 = exp8(inv2 * k(ln_w28));
+    let b2 = bv * (p28 - k(1.0)) + k(1.0);
+    let r2 = exp8(decay2 * ln8(b2));
+    let weight1 = sp(29) * exp8(k(-w[31]) * ln_sf);
+    let weight2 = sp(30) * exp8(sp(32) * ln_s) * exp8((d - k(5.0)) * sp(33));
+    let wsum = weight1 + weight2;
+    let num = weight1 * r1 + weight2 * r2;
+    (num / wsum) * k(1.0 - 2e-5) + k(1e-5)
+}
+
+/// Next stability for 8 cards (forward-only; mirrors stab_fwd's `out`).
+#[allow(clippy::too_many_arguments)]
+fn stab_out8(
+    w: &[f32], last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
+    ln_ls: f32x8, ln_ld: f32x8,
+) -> f32x8 {
+    let sp = |i: usize| f32x8::splat(w[i]);
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 7), one);
+    let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 8), one);
+    let pp = exp8(k(-w[start + 4]) * ln_ld);
+    let qbase = exp8(sp(start + 5) * ln8(last_s + one));
+    let rexp = exp8((one - r) * sp(start + 6));
+    let nsf_fail = sp(start + 3) * pp * (qbase - one) * rexp;
+    let pls = last_s.fast_min(nsf_fail);
+    let bb = k(11.0) - last_d;
+    let cc = exp8(k(-w[start + 1]) * ln_ls);
+    let expr = exp8((one - r) * sp(start + 2));
+    let sinc = k(aa) * bb * cc * (expr - one) * hard * easy + one;
+    let nss = pls.fast_max(last_s * sinc);
+    rating.cmp_gt(one).blend(nss, pls)
+}
+
+/// Next difficulty for 8 cards (forward-only; mirrors next_d_fwd's clamped output).
+fn next_d8(w: &[f32], last_d: f32x8, rating: f32x8, init: f32) -> f32x8 {
+    let k = f32x8::splat;
+    let delta_d = k(-w[6]) * (rating - k(3.0));
+    let new_d = last_d + (k(10.0) - last_d) * delta_d / k(9.0);
+    clamp8(k(0.01) * k(init) + k(0.99) * new_d, D_MIN, D_MAX)
+}
+
+/// Vectorized forward-only BCE loss (validation). Processes the batch 8 cards at a time; the
+/// remainder (<8) uses the scalar batch_loss path. Precision-trade vs batch_loss (exp8/ln8 differ
+/// from libm by ~1e-6) — judged by the 3b average-log-loss band. The BCE itself stays f64.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn batch_loss_simd(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    delta_ts: &[f32], labels: &[f32], weights: &[f32],
+) -> f64 {
+    let wc = wconsts(w);
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let mut loss = 0.0f64;
+    let n_groups = batch / 8;
+    for g in 0..n_groups {
+        let c0 = g * 8;
+        let (mut s, mut d, mut sf) = (k(0.0), k(0.0), k(0.0));
+        for t in 0..seq_len {
+            let base = t * batch + c0;
+            let rating = load8(r_hist, base);
+            if t == 0 {
+                // First review: initialise state from rating (mirrors step_fwd's nth0 override).
+                let rc = clamp8(rating, 1.0, 4.0);
+                let init_s = rc.cmp_eq(one).blend(
+                    k(w[0]),
+                    rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
+                );
+                let init_d = clamp8(k(w[4]) - exp8(k(w[5]) * (rc - one)) + one, D_MIN, D_MAX);
+                s = clamp8(init_s, S_MIN, S_MAX);
+                d = init_d;
+                sf = clamp8(k(0.8) * init_s, S_MIN, S_MAX);
+            } else {
+                let dt = load8(t_hist, base).fast_max(k(0.0));
+                let s_c = clamp8(s, S_MIN, S_MAX);
+                let d_c = clamp8(d, D_MIN, D_MAX);
+                let sf_c = clamp8(sf, S_MIN, S_MAX);
+                let ln_s = ln8(s_c);
+                let ln_sf = ln8(sf_c);
+                let ln_d = ln8(d_c);
+                let rr = curve_out8(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+                let ns = stab_out8(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d);
+                let nsf = stab_out8(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d);
+                let nd = next_d8(w, d_c, rating, wc.init);
+                // rating==0 (padding) passes the state through unchanged.
+                let m0 = rating.cmp_eq(k(0.0));
+                s = clamp8(m0.blend(s_c, ns), S_MIN, S_MAX);
+                d = m0.blend(d_c, nd);
+                sf = clamp8(m0.blend(sf_c, nsf), S_MIN, S_MAX);
+            }
+        }
+        let dts = load8(delta_ts, c0);
+        let r = clamp8(
+            curve_out8(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8(s), ln8(sf)),
+            MIN_R,
+            MAX_R,
+        );
+        let r_arr = r.to_array();
+        for (j, &rr) in r_arr.iter().enumerate() {
+            let c = c0 + j;
+            let rr = rr as f64;
+            loss += -(weights[c] as f64)
+                * (labels[c] as f64 * rr.ln() + (1.0 - labels[c] as f64) * (1.0 - rr).ln());
+        }
+    }
+    // Remainder (< 8 cards) via the scalar path.
+    for c in (n_groups * 8)..batch {
         let mut state = (0.0f32, 0.0f32, 0.0f32);
         for t in 0..seq_len {
             state = step_fwd(w, t_hist[t * batch + c], r_hist[t * batch + c], state, t == 0, &wc).0;
@@ -559,6 +760,53 @@ pub(crate) fn batch_loss_and_grad(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_transcendentals_accurate() {
+        // exp8 over [-87,88], ln8 over (1e-5, 4e4) vs true f64 — gate at 1e-4 (real impl ~1e-6).
+        let mut worst_exp = 0.0f64;
+        let mut x = -87.0f32;
+        while x <= 88.0 {
+            let v = exp8(f32x8::splat(x)).to_array()[0] as f64;
+            let b = (x as f64).exp();
+            worst_exp = worst_exp.max(((v - b) / b).abs());
+            x += 0.013;
+        }
+        assert!(worst_exp < 1e-4, "exp8 worst rel err {worst_exp:e}");
+        let mut worst_ln = 0.0f64;
+        let mut y = 1e-5f32;
+        while y <= 4e4 {
+            let v = ln8(f32x8::splat(y)).to_array()[0] as f64;
+            let b = (y as f64).ln();
+            worst_ln = worst_ln.max((v - b).abs());
+            y *= 1.05;
+        }
+        assert!(worst_ln < 1e-4, "ln8 worst abs err {worst_ln:e}");
+    }
+
+    #[test]
+    fn simd_batch_loss_matches_scalar() {
+        // batch=20 = two full f32x8 groups + 4 remainder; mixed history lengths (rating-0 padding),
+        // first review always real (1..4). The SIMD forward must match the scalar within the poly err.
+        let w: Vec<f32> = crate::DEFAULT_PARAMETERS.to_vec();
+        let (batch, seq) = (20usize, 4usize);
+        let mut th = vec![0.0f32; seq * batch];
+        let mut rh = vec![0.0f32; seq * batch];
+        for c in 0..batch {
+            let len = 1 + (c % seq); // 1..=seq real reviews, rest padded
+            for t in 0..len {
+                th[t * batch + c] = ((t + c) % 7) as f32;
+                rh[t * batch + c] = (1 + ((t + c) % 4)) as f32; // 1..4
+            }
+        }
+        let dts: Vec<f32> = (0..batch).map(|c| (1 + c % 30) as f32).collect();
+        let lbl: Vec<f32> = (0..batch).map(|c| (c % 2) as f32).collect();
+        let wts: Vec<f32> = (0..batch).map(|c| 0.5 + 0.1 * (c % 5) as f32).collect();
+        let a = batch_loss(&w, &th, &rh, seq, batch, &dts, &lbl, &wts);
+        let b = batch_loss_simd(&w, &th, &rh, seq, batch, &dts, &lbl, &wts);
+        let rel = ((a - b) / a.abs().max(1e-9)).abs();
+        assert!(rel < 1e-4, "simd batch_loss {b} vs scalar {a}, rel {rel:e}");
+    }
 
     fn fd_grad(
         w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,

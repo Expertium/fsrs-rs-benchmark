@@ -1,0 +1,16 @@
+[package]
+name = "simd_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wide = "0.7"
+bytemuck = "1"
+
+[[bin]]
+name = "simd_bench"
+path = "main.rs"
+
+[profile.release]
+opt-level = 3
