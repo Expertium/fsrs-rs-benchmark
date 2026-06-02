@@ -1417,36 +1417,28 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
     BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts, windowed: false }
 }
 
-/// Build ONE windowed batch's host arrays from a slice of weighted prefix-items spanning whole cards
-/// (the O(N) expanding-window layout). Re-groups the prefix-items by their originating card; each card
+/// Build ONE windowed batch's host arrays from its per-card prefix groups (already in COLUMN ORDER
+/// from group_cards_into_batches — sorted by (full_len, card_id); no second grouping pass). Each card
 /// becomes ONE column holding its FULL review sequence (taken from the card's longest surviving prefix
 /// — every shorter prefix is a head of it). A surviving prefix of length L predicts review L-1, so its
 /// recency weight is placed at wts[(L-1)*bsz + c] (label likewise); every other (t, c) stays weight 0
-/// (a filtered middle prefix, t==0, or padding). real_batch_size = the prediction count = chunk.len(),
-/// matching the per-prefix path so the penalty scaling is unchanged.
-fn build_batch_host_windowed(chunk: &[WeightedFSRSItem]) -> BatchHost {
-    let predictions = chunk.len();
-    // Group this batch's prefix-items by card.
-    let mut cards: HashMap<i64, Vec<&WeightedFSRSItem>> = HashMap::new();
-    for wi in chunk {
-        cards.entry(wi.card_id).or_default().push(wi);
-    }
-    // Deterministic column order (card_id is unique), matching group_cards_into_batches' ordering.
-    let mut card_list: Vec<(i64, Vec<&WeightedFSRSItem>)> = cards.into_iter().collect();
-    let full_len = |prefixes: &[&WeightedFSRSItem]| {
+/// (a filtered middle prefix, t==0, or padding). real_batch_size = the prediction count = total
+/// prefix-items, matching the per-prefix path so the penalty scaling is unchanged.
+fn build_batch_host_windowed(cards: &[Vec<WeightedFSRSItem>]) -> BatchHost {
+    let predictions: usize = cards.iter().map(|p| p.len()).sum();
+    let full_len = |prefixes: &[WeightedFSRSItem]| {
         prefixes.iter().map(|wi| wi.item.reviews.len()).max().unwrap_or(0)
     };
-    card_list.sort_by_key(|(cid, prefixes)| (full_len(prefixes), *cid));
-    let n_cards = card_list.len();
+    let n_cards = cards.len();
     // Pad the card/column count up to a multiple of 8 (all-zero pad columns, weight 0).
     let bsz = n_cards.div_ceil(8) * 8;
     // seq = the longest full card length in the batch (= max reviews per surviving prefix).
-    let seq = card_list.iter().map(|(_, p)| full_len(p)).max().unwrap_or(0);
+    let seq = cards.iter().map(|p| full_len(p)).max().unwrap_or(0);
     let mut th = vec![0.0f32; seq * bsz];
     let mut rh = vec![0.0f32; seq * bsz];
     let mut lbl = vec![0.0f32; seq * bsz];
     let mut wts = vec![0.0f32; seq * bsz];
-    for (c, (_cid, prefixes)) in card_list.iter().enumerate() {
+    for (c, prefixes) in cards.iter().enumerate() {
         // The longest surviving prefix carries the card's full review list q[0..K'-1]; lay it in.
         let longest = prefixes.iter().max_by_key(|wi| wi.item.reviews.len()).unwrap();
         for (t, r) in longest.item.reviews.iter().enumerate() {
@@ -1469,13 +1461,14 @@ fn build_batch_host_windowed(chunk: &[WeightedFSRSItem]) -> BatchHost {
 /// Windowed path (card ids present): group every prefix-item by its originating card and pack
 /// WHOLE cards into batches of at most `batch_size` predictions (a card is never split). Cards are
 /// ordered by full sequence length (tie-broken by card id) so a batch's prefix-items stay
-/// length-similar — less SIMD padding — and the order is reproducible. This is the ONLY change vs
-/// the plain path: each Adam step now sees a whole card's predictions together, exactly as the
-/// upcoming O(N) single-pass-per-card forward will, so this faithfully previews that trajectory.
+/// length-similar — less SIMD padding — and the order is reproducible. Returns each batch as its
+/// per-card prefix groups IN COLUMN ORDER, so build_batch_host_windowed lays them out directly with
+/// no second grouping pass. Each Adam step sees a whole card's predictions together, exactly as the
+/// O(N) single-pass-per-card forward consumes them.
 fn group_cards_into_batches(
     items: Vec<WeightedFSRSItem>,
     batch_size: usize,
-) -> Vec<Vec<WeightedFSRSItem>> {
+) -> Vec<Vec<Vec<WeightedFSRSItem>>> {
     let mut cards: HashMap<i64, Vec<WeightedFSRSItem>> = HashMap::new();
     for wi in items {
         cards.entry(wi.card_id).or_default().push(wi);
@@ -1490,13 +1483,18 @@ fn group_cards_into_batches(
             .unwrap_or(0);
         (full_len, prefixes[0].card_id)
     });
-    let mut batches: Vec<Vec<WeightedFSRSItem>> = Vec::new();
-    let mut current: Vec<WeightedFSRSItem> = Vec::new();
+    // Pack whole cards (each kept as its own Vec — the per-card structure the windowed builder needs)
+    // into batches of <= batch_size predictions. current_preds tracks the old flat prefix count.
+    let mut batches: Vec<Vec<Vec<WeightedFSRSItem>>> = Vec::new();
+    let mut current: Vec<Vec<WeightedFSRSItem>> = Vec::new();
+    let mut current_preds = 0usize;
     for prefixes in card_list {
-        if !current.is_empty() && current.len() + prefixes.len() > batch_size {
+        if !current.is_empty() && current_preds + prefixes.len() > batch_size {
             batches.push(std::mem::take(&mut current));
+            current_preds = 0;
         }
-        current.extend(prefixes);
+        current_preds += prefixes.len();
+        current.push(prefixes);
     }
     if !current.is_empty() {
         batches.push(current);
@@ -1514,7 +1512,7 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
     if items.first().is_some_and(|wi| wi.card_id >= 0) {
         return group_cards_into_batches(items, batch_size)
             .iter()
-            .map(|batch| build_batch_host_windowed(batch))
+            .map(|cards| build_batch_host_windowed(cards))
             .collect();
     }
     let items = sort_items_by_review_length(items);

@@ -43,12 +43,13 @@ fn exp8(x: f32x8) -> f32x8 {
     let n = (x * f32x8::splat(LOG2E)).round();
     let r = x - n * f32x8::splat(LN2);
     let c = |v: f32| f32x8::splat(v);
-    // degree-4 RELATIVE-minimax (Remez) of exp(r) over r in [-ln2/2, ln2/2]; max rel err
-    // 2.6e-6 (profiling/minimax_coeffs.py). 2 fewer FMAs than the old degree-6 Taylor, and
-    // still ~200x inside the +-0.0010 log-loss band. Precision-trade (3b), portable (c7).
-    let p = c(0.999999261446)
-        + r * (c(0.999963404853)
-            + r * (c(0.500043586613) + r * (c(0.167909072153) + r * c(0.0414586082011))));
+    // degree-3 RELATIVE-minimax (Remez) of exp(r) over r in [-ln2/2, ln2/2]; max rel err
+    // 7.5e-5 (profiling/minimax_coeffs.py). 1 fewer FMA than the old degree-4. The exp8 error
+    // only perturbs the TRAINING trajectory (and the per-epoch best-model pick) — the band
+    // metric is the frozen evaluate(), which does NOT use exp8 — so the accuracy cost is just a
+    // tiny shift in the final params, scored by the exact scorer. Precision-trade (3b), portable (c7).
+    let p = c(0.999928073539)
+        + r * (c(1.00016418577) + r * (c(0.50496326418) + r * c(0.165668423429)));
     let bits: i32x8 = (n.round_int() + i32x8::splat(127)) << 23;
     let two_n: f32x8 = bytemuck::cast(bits);
     p * two_n
