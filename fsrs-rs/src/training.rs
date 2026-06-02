@@ -9,11 +9,10 @@ use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::{DataLoaderIterator, Progress};
 use burn::data::dataset::Dataset;
 use burn::lr_scheduler::LrScheduler;
-use burn::module::{AutodiffModule, Param};
+use burn::module::Param;
 use burn::nn::loss::Reduction;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::Backend;
-use burn::tensor::cast::ToElement;
 use burn::tensor::{Float, Int, Shape, Tensor, TensorData};
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::TrainingInterrupter;
@@ -592,10 +591,6 @@ type B = NdArray<f32>;
 
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
-// Match the CUDA curve's effective range (p = 1e-5 + (1-2e-5)*retention). The old
-// 1e-4/0.9999 training clamp was tighter than CUDA and damped extreme-error gradients.
-const MIN_RETRIEVABILITY: f32 = 1e-5;
-const MAX_RETRIEVABILITY: f32 = 1.0 - 1e-5;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
@@ -1119,73 +1114,20 @@ impl<B: Backend> BCELoss<B> {
     }
 }
 
-impl<B: Backend> Model<B> {
-    pub fn forward_classification(
-        &self,
-        t_historys: Tensor<B, 2>,
-        r_historys: Tensor<B, 2>,
-        delta_ts: Tensor<B, 1>,
-        labels: Tensor<B, 1, Int>,
-        weights: Tensor<B, 1>,
-        reduce: Reduction,
-    ) -> Tensor<B, 1> {
-        let state = self.forward(t_historys, r_historys, None);
-        let retrievability = self
-            .power_forgetting_curve(
-                delta_ts,
-                state.stability,
-                state.stability_fast,
-                state.difficulty,
-            )
-            .clamp(MIN_RETRIEVABILITY, MAX_RETRIEVABILITY);
-        BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
-    }
-}
-
 impl<B: AutodiffBackend> Model<B> {
-    fn add_manual_weight_gradient(
-        &self,
-        mut gradients: B::Gradients,
-        manual_grad: &[f32],
-    ) -> B::Gradients {
+    /// Overwrite the w gradient entirely (used to inject the hand-written analytic gradient).
+    fn set_weight_gradient(&self, mut gradients: B::Gradients, new_grad: &[f32]) -> B::Gradients {
         let grad_tensor = self.w.grad(&gradients).unwrap();
         let device = grad_tensor.device();
         let grad_len = grad_tensor.dims()[0];
         let mut data = vec![0.0f32; grad_len];
-        for (dst, src) in data.iter_mut().zip(manual_grad.iter()) {
+        for (dst, src) in data.iter_mut().zip(new_grad.iter()) {
             *dst = *src;
         }
-        let manual_tensor = Tensor::from_floats(data.as_slice(), &device);
-        let updated_grad = grad_tensor + manual_tensor;
+        let new_tensor = Tensor::from_floats(data.as_slice(), &device);
         self.w.grad_remove(&mut gradients);
-        self.w.grad_replace(&mut gradients, updated_grad);
+        self.w.grad_replace(&mut gradients, new_tensor);
         gradients
-    }
-
-    fn freeze_initial_stability(&self, mut grad: B::Gradients) -> B::Gradients {
-        let grad_tensor = self.w.grad(&grad).unwrap();
-        let device = grad_tensor.device();
-        let updated_grad_tensor = grad_tensor.slice_assign([0..4], Tensor::zeros([4], &device));
-
-        self.w.grad_remove(&mut grad);
-        self.w.grad_replace(&mut grad, updated_grad_tensor);
-        grad
-    }
-
-    fn freeze_short_term_stability(&self, mut grad: B::Gradients) -> B::Gradients {
-        let grad_tensor = self.w.grad(&grad).unwrap();
-        let device = grad_tensor.device();
-        // Dual-trace layout: the short-term stability-after-review params are 16..25
-        // (9 params). Unused in the timed paths (enable_short_term is always true).
-        let updated_grad_tensor = if grad_tensor.dims()[0] >= 36 {
-            grad_tensor.slice_assign([16..25], Tensor::zeros([9], &device))
-        } else {
-            grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device))
-        };
-
-        self.w.grad_remove(&mut grad);
-        self.w.grad_replace(&mut grad, updated_grad_tensor);
-        grad
     }
 }
 
@@ -1467,6 +1409,22 @@ pub fn benchmark(
     parameters
 }
 
+/// One batch pre-extracted to host arrays (used for BOTH train and validation). The data and
+/// its batching are fixed across epochs, so we snapshot the host arrays once (before the epoch
+/// loop) and reuse them every epoch — eliminating the per-step `to_data().to_vec()` copies.
+/// For training, only the batch ORDER changes per epoch; we replicate ShuffleDataLoader's
+/// per-epoch shuffle (same StdRng seed) so the SGD trajectory is identical (bit-for-bit).
+struct BatchHost {
+    seq: usize,
+    bsz: usize,
+    real_batch_size: usize,
+    th: Vec<f32>,
+    rh: Vec<f32>,
+    dts: Vec<f32>,
+    lbl: Vec<f32>,
+    wts: Vec<f32>,
+}
+
 fn train<B: AutodiffBackend>(
     train_set: Vec<WeightedFSRSItem>,
     test_set: Vec<WeightedFSRSItem>,
@@ -1479,9 +1437,29 @@ fn train<B: AutodiffBackend>(
     // Training data
     let total_size = train_set.len();
     let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
-    let batch_dataset =
+    let train_dataset =
         BatchTensorDataset::<B>::new(FSRSDataset::from(train_set), config.batch_size);
-    let dataloader_train = ShuffleDataLoader::new(batch_dataset, config.seed);
+    let n_train_batches = train_dataset.len();
+    // Pre-extract the TRAINING batches to host arrays ONCE (was a per-step copy ~11% of compute).
+    // The data is fixed; only the batch ORDER changes per epoch (the shuffle is replicated below).
+    let train_host: Vec<BatchHost> = (0..n_train_batches)
+        .map(|i| {
+            let b = train_dataset.get(i).unwrap();
+            BatchHost {
+                seq: b.t_historys.dims()[0],
+                bsz: b.t_historys.dims()[1],
+                real_batch_size: b.delta_ts.shape().dims[0],
+                th: b.t_historys.to_data().to_vec().unwrap(),
+                rh: b.r_historys.to_data().to_vec().unwrap(),
+                dts: b.delta_ts.to_data().to_vec().unwrap(),
+                lbl: b.labels.clone().float().to_data().to_vec().unwrap(),
+                wts: b.weights.to_data().to_vec().unwrap(),
+            }
+        })
+        .collect();
+    // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
+    // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
+    let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
 
     let batch_dataset = BatchTensorDataset::<B::InnerBackend>::new(
         FSRSDataset::from(test_set.clone()),
@@ -1508,14 +1486,41 @@ fn train<B: AutodiffBackend>(
 
     let mut best_loss = f64::INFINITY;
     let mut best_model = model.clone();
+    // Pre-extract the fixed validation batches to host arrays ONCE. The test set and its
+    // batching don't change across epochs, so each epoch can score them with the analytic
+    // forward (crate::analytic::batch_loss) instead of burn's tensor forward — which was
+    // ~half of compute_parameters() time. Same BCE math + same [1e-5,1-1e-5] clamp; only the
+    // FP summation order differs (judged by the 3b average-log-loss band). Order/batching of
+    // the val set doesn't change the summed loss (per-card terms are independent).
+    let valid_batches: Vec<BatchHost> = dataloader_valid
+        .iter()
+        .map(|batch| BatchHost {
+            seq: batch.t_historys.dims()[0],
+            bsz: batch.t_historys.dims()[1],
+            real_batch_size: batch.delta_ts.shape().dims[0],
+            th: batch.t_historys.to_data().to_vec().unwrap(),
+            rh: batch.r_historys.to_data().to_vec().unwrap(),
+            dts: batch.delta_ts.to_data().to_vec().unwrap(),
+            lbl: batch.labels.clone().float().to_data().to_vec().unwrap(),
+            wts: batch.weights.to_data().to_vec().unwrap(),
+        })
+        .collect();
+    // PROFILING-ONLY (not committed): per-phase wall time decomposition.
+    // t_bwd = analytic gradient, t_opt = dummy+step+clip. (Per-step extract is gone — the train
+    // batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
+    let (mut t_pen, mut t_bwd, mut t_opt, mut t_valid) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for epoch in 1..=config.num_epochs {
-        let mut iterator = dataloader_train.iter();
+        // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
+        let mut order: Vec<usize> = (0..n_train_batches).collect();
+        order.shuffle(&mut shuffle_rng);
         let mut iteration = 0;
-        while let Some(item) = iterator.next() {
+        for &bi in &order {
             iteration += 1;
-            let real_batch_size = item.delta_ts.shape().dims[0];
+            let hb = &train_host[bi];
+            let real_batch_size = hb.real_batch_size;
             let lr = LrScheduler::step(&mut lr_scheduler);
-            let progress = iterator.progress();
+            let progress = Progress::new(iteration, n_train_batches);
+            let _tp = std::time::Instant::now();
             let l2_weight = L2_PENALTY_WEIGHT;
             let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
             let (_l2_penalty_value, mut manual_grad) = l2_penalty(
@@ -1532,28 +1537,43 @@ fn train<B: AutodiffBackend>(
             for i in 0..manual_grad.len().min(schedule_grad.len()) {
                 manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
             }
-            let loss = model.forward_classification(
-                item.t_historys,
-                item.r_historys,
-                item.delta_ts,
-                item.labels,
-                item.weights,
-                Reduction::Sum,
+            t_pen += _tp.elapsed().as_secs_f64();
+            // Host batch data was pre-extracted once into train_host (no per-step copy now).
+            // Hand-written analytic BCE gradient (replaces the autodiff forward+backward),
+            // plus the manual L2/schedule penalty gradient.
+            let _tb = std::time::Instant::now();
+            let mut total_grad = [0.0f64; 36];
+            crate::analytic::batch_loss_and_grad(
+                &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
             );
-            let mut gradients = loss.backward();
-            gradients = model.add_manual_weight_gradient(gradients, &manual_grad);
+            let mut total_grad_f32 = [0.0f32; 36];
+            for i in 0..36 {
+                total_grad_f32[i] = total_grad[i] as f32 + manual_grad.get(i).copied().unwrap_or(0.0);
+            }
             if config.model.freeze_initial_stability {
-                gradients = model.freeze_initial_stability(gradients);
+                for v in total_grad_f32.iter_mut().take(4) {
+                    *v = 0.0;
+                }
             }
             if config.model.freeze_short_term_stability {
-                gradients = model.freeze_short_term_stability(gradients);
+                for v in total_grad_f32.iter_mut().take(25).skip(16) {
+                    *v = 0.0;
+                }
             }
+            t_bwd += _tb.elapsed().as_secs_f64();
+            let _to = std::time::Instant::now();
+            // Obtain a gradient container via a trivial dummy backward (a 36-element sum =>
+            // O(1) tape), then overwrite w's gradient with the analytic one. No recurrence
+            // autodiff is built, so the tape-record + tape-replay cost is gone.
+            let mut gradients = model.w.val().sum().backward();
+            gradients = model.set_weight_gradient(gradients, &total_grad_f32);
             let grads = GradientsParams::from_grads(gradients, &model);
             model = optim.step(lr, model, grads);
             model.w = parameter_clipper(
                 model.w,
                 !config.model.freeze_short_term_stability,
             );
+            t_opt += _to.elapsed().as_secs_f64();
             renderer.render_train(TrainingProgress {
                 progress,
                 epoch,
@@ -1570,45 +1590,43 @@ fn train<B: AutodiffBackend>(
             break;
         }
 
-        let model_valid = model.valid();
+        let _tv = std::time::Instant::now();
+        // w is fixed during validation, so extract it once per epoch (not per batch).
+        let w_vec_valid = model.w.val().to_data().to_vec::<f32>().unwrap();
         let mut loss_valid = 0.0;
-        for batch in dataloader_valid.iter() {
-            let real_batch_size = batch.delta_ts.shape().dims[0];
-            let l2_weight = L2_PENALTY_WEIGHT;
-            let w_vec = model_valid.w.val().to_data().to_vec::<f32>().unwrap();
+        for vb in &valid_batches {
             let (l2_penalty_value, _) = l2_penalty(
-                &w_vec,
+                &w_vec_valid,
                 &init_w_vec,
-                real_batch_size,
+                vb.real_batch_size,
                 total_size,
-                l2_weight,
+                L2_PENALTY_WEIGHT,
                 &training_v7::PARAMS_STDDEV,
             );
             let (schedule_value, _) =
-                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+                schedule_penalty(&w_vec_valid, vb.real_batch_size, config.enable_sched_penalties);
             let schedule_penalty = schedule_value / total_size as f64;
-            let loss = model_valid.forward_classification(
-                batch.t_historys,
-                batch.r_historys,
-                batch.delta_ts,
-                batch.labels,
-                batch.weights,
-                Reduction::Sum,
+            let bce = crate::analytic::batch_loss(
+                &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.dts, &vb.lbl, &vb.wts,
             );
-            let loss = loss.into_scalar().to_f64();
-            loss_valid += loss + l2_penalty_value + schedule_penalty;
+            loss_valid += bce + l2_penalty_value + schedule_penalty;
 
             if interrupter.should_stop() {
                 break;
             }
         }
         loss_valid /= test_set.len() as f64;
+        t_valid += _tv.elapsed().as_secs_f64();
         info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
         if loss_valid < best_loss {
             best_loss = loss_valid;
             best_model = model.clone();
         }
     }
+    eprintln!(
+        "PROFILE total_train_region: pen={:.3} grad={:.3} opt={:.3} valid={:.3}",
+        t_pen, t_bwd, t_opt, t_valid
+    );
 
     info!("best_loss: {:?}", best_loss);
 

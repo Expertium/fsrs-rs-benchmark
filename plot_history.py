@@ -36,6 +36,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless: render straight to a file, no display needed
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import textwrap
 
 REPO = Path(__file__).resolve().parent
 HISTORY = REPO / "result" / "history.jsonl"
@@ -59,9 +60,16 @@ def load(path: Path) -> list[dict]:
     return rows
 
 
-def truncate(s: str, n: int) -> str:
+def truncate(s: str, n: int, width: int = 16) -> str:
     s = " ".join((s or "").split())
-    return s if len(s) <= n else s[:n].rsplit(" ", 1)[0] + "…"
+    if len(s) > n:
+        s = s[:n].rsplit(" ", 1)[0] + "…"
+    return "\n".join(textwrap.wrap(
+        s,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=True,
+    ))
 
 
 def cumulative(rows: list[dict]):
@@ -96,6 +104,8 @@ def main() -> None:
                     help="hide the champion summary labels on the speedup panel")
     ap.add_argument("--summary-len", type=int, default=44,
                     help="max chars of summary shown per champion (default 44)")
+    ap.add_argument("--summary-wrap", type=int, default=16,
+                    help="wrap summary labels at this many chars per line (default 16)")
     ap.add_argument("--rotation", type=float, default=40.0,
                     help="summary label angle, degrees (default 40)")
     args = ap.parse_args()
@@ -108,7 +118,7 @@ def main() -> None:
 
     xs = [r["iteration"] for r in rows]
     xmin, xmax = min(xs), max(xs)
-    xpad_hi = max(2.0, 0.08 * (xmax - xmin))
+    xpad_hi = max(1.0, 0.08 * (xmax - xmin))
 
     fig, (ax_sp, ax_t) = plt.subplots(2, 1, figsize=(14, 11), sharex=True)
 
@@ -125,19 +135,30 @@ def main() -> None:
         for it, y, r in champ_pts:
             if r["iteration"] == 0:
                 continue  # baseline has no change to describe
-            ax_sp.annotate(truncate(r.get("summary", ""), args.summary_len), (it, y),
-                           textcoords="offset points", xytext=(7, 7),
-                           rotation=args.rotation, rotation_mode="anchor",
-                           ha="left", va="bottom", fontsize=7, color=GREEN_DARK)
-    ax_sp.set_ylabel("Cumulative speedup vs baseline  (×)", fontsize=14)
+
+            ax_sp.annotate(
+                truncate(r.get("summary", ""), args.summary_len, args.summary_wrap),
+                (it, y),
+                textcoords="offset points",
+                xytext=(8, 3),
+                rotation=args.rotation,
+                rotation_mode="anchor",
+                ha="left",
+                va="center",
+                fontsize=7,
+                color=GREEN_DARK,
+                annotation_clip=False,
+                clip_on=False,
+            )
+    ax_sp.set_ylabel("Cumulative speedup vs baseline  (×)\nhigher=better", fontsize=14)
     ax_sp.set_title(
         f"FSRS-rs speed autoresearch — {len(champs) - 1} accepted speedups, "
         f"{len(rejects)} rejected   (cumulative ×{cy[-1]:.3f})", fontsize=17)
     ax_sp.grid(True, alpha=0.25)
-    ax_sp.legend(loc="upper left", framealpha=0.9)
+    ax_sp.legend(loc="upper right", framealpha=0.9)
     ylo, yhi = min(cy + [1.0]), max(cy + [1.0])
     yr = (yhi - ylo) or 1.0
-    pad_top = (0.45 if not args.no_summaries else 0.10) * yr
+    pad_top = (1.20 if not args.no_summaries else 0.10) * yr
     ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top + 0.01)
 
     # ---- Bottom panel: median time (machine-specific; NOT the accept metric) ----
@@ -150,20 +171,23 @@ def main() -> None:
                      s=28, c=GREY, zorder=2, label="rejected")
     _frontier(ax_t, [r["iteration"] for r in champs],
               [r["time_after"] for r in champs], xmax)
-    ax_t.set_ylabel("Median per-user time (ms)", fontsize=14)
+    ax_t.set_ylabel("Median per-user time (ms)\nlower=better", fontsize=14)
     ax_t.set_xlabel("Iteration", fontsize=14)
     ax_t.set_title("Median per-user time — machine-specific & per-session; "
                    "NOT the accept/reject metric (see README)",
                    fontsize=11, color="0.40")
     ax_t.grid(True, alpha=0.25)
     ax_t.legend(loc="upper right", framealpha=0.9)
-    ax_t.set_ylim(tmin - 0.06 * tr, tmax + 0.10 * tr)
+    ax_t.set_ylim(0, tmax + 0.10 * tr)
 
-    ax_t.xaxis.set_major_locator(ticker.MultipleLocator(5))
+    max_iter = max(xs)
+    x_step = max(1, int(max_iter / 10))
+    ax_t.xaxis.set_major_locator(ticker.MultipleLocator(x_step))
+    ax_t.xaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
     ax_t.set_xlim(xmin - 0.6, xmax + xpad_hi)
 
-    fig.tight_layout()
-    fig.savefig(args.out, dpi=130)
+    fig.tight_layout(rect=(0.03, 0.03, 0.98, 0.95))
+    fig.savefig(args.out, dpi=130, bbox_inches="tight", pad_inches=0.25)
     print(f"wrote {args.out}  ({len(champs)} champions, {len(rejects)} rejected, "
           f"latest iter {xmax}, cumulative ×{cy[-1]:.3f})")
 

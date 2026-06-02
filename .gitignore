@@ -4,4 +4,8 @@ __pycache__/
 *.pyd
 *.so
 *.pdb
+*.exe
 .venv/
+
+# Profiling-only measurement snapshots (transient; durable record is result/history.*)
+profiling/measure/
