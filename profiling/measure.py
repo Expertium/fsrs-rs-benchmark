@@ -167,9 +167,14 @@ def cmd_compare(champ: str, cand: str) -> int:
     avg_ll_delta = mean_ll_cand - mean_ll_champ           # THE correctness bar (per ruling)
     max_abs_ll = max(abs(d) for d in ll_deltas)           # per-user max: only a gross-bug tell
 
+    # Correctness gate (2026-06-02 ruling): an ABSOLUTE band on the candidate's aggregate mean
+    # LogLoss, anchored to the ORIGINAL (iter-0) baseline — NOT a per-step delta vs the champion.
+    # This bounds the cumulative accuracy cost of all compounding precision-trades together.
+    ORIG_LL, BAND = 0.3098, 0.0015          # compute_parameters.py reference -> [0.3083, 0.3113]
+    lo, hi = ORIG_LL - BAND, ORIG_LL + BAND
     bit_for_bit = (n_param_diff == 0)
     speed_ok = speed_ratio >= 1.05
-    corr_ok = abs(avg_ll_delta) <= 0.0010
+    corr_ok = lo <= mean_ll_cand <= hi
 
     print(f"  users compared      : {len(users)}", flush=True)
     print(f"  median time champ   : {champ_med_t:.1f} ms", flush=True)
@@ -178,7 +183,8 @@ def cmd_compare(champ: str, cand: str) -> int:
     print(f"  mean speedup        : {mean_speedup:.4f}   (informational)", flush=True)
     print(f"  mean LogLoss champ  : {mean_ll_champ:.6f}", flush=True)
     print(f"  mean LogLoss cand   : {mean_ll_cand:.6f}", flush=True)
-    print(f"  d_AVG LogLoss       : {avg_ll_delta:+.6f}  <- CORRECTNESS BAR: |d| <= 0.0010 (average, per ruling)  [{'OK' if corr_ok else 'FAIL'}]", flush=True)
+    print(f"  d_AVG LogLoss       : {avg_ll_delta:+.6f}  (vs champ; informational now that the gate is absolute)", flush=True)
+    print(f"  abs mean LogLoss    : {mean_ll_cand:.6f}  <- CORRECTNESS BAR: in [{lo:.4f}, {hi:.4f}] (orig {ORIG_LL} +-{BAND})  [{'OK' if corr_ok else 'FAIL'}]", flush=True)
     print(f"  max |per-user dLL|  : {max_abs_ll:.6f}   (diagnostic only: gross-bug tell, NOT the bar)", flush=True)
     print(f"  users w/ param diff : {n_param_diff}/{len(users)}   ({'bit-for-bit' if bit_for_bit else 'reordered (expected for graph changes)'})", flush=True)
     print(f"  max |param diff|    : {max_param_absdiff:g}   (diagnostic only)", flush=True)
