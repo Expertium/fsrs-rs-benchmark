@@ -226,7 +226,7 @@ def main() -> None:
     ax_sp.set_ylabel("Cumulative speedup vs baseline (×)\nhigher=better", fontsize=14)
     ax_sp.set_title(
         f"FSRS-rs speed autoresearch — {len(champs) - 1} accepted speedups, "
-        f"{len(rejects)} rejected (cumulative ×{cy[-1]:.3f})",
+        f"{len(rejects)} rejected (cumulative ×{cy[-1]:.1f})",
         fontsize=17,
     )
     ax_sp.grid(True, alpha=0.25)
@@ -234,7 +234,7 @@ def main() -> None:
 
     ylo, yhi = min(cy + [1.0]), max(cy + [1.0])
     yr = (yhi - ylo) or 1.0
-    pad_top = (0.85 if not args.no_summaries else 0.10) * yr
+    pad_top = (0.5 if not args.no_summaries else 0.10) * yr
     ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top + 0.01)
 
     # ---- Bottom panel: median time (machine-specific; NOT the accept metric) ----
@@ -277,7 +277,7 @@ def main() -> None:
 
     print(
         f"wrote {args.out}  ({len(champs)} champions, {len(rejects)} rejected, "
-        f"latest iter {xmax}, cumulative ×{cy[-1]:.3f})"
+        f"latest iter {xmax}, cumulative ×{cy[-1]:.1f})"
     )
 
 
