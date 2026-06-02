@@ -43,9 +43,12 @@ fn exp8(x: f32x8) -> f32x8 {
     let n = (x * f32x8::splat(LOG2E)).round();
     let r = x - n * f32x8::splat(LN2);
     let c = |v: f32| f32x8::splat(v);
-    let p = c(1.0)
-        + r * (c(1.0)
-            + r * (c(0.5) + r * (c(1.0 / 6.0) + r * (c(1.0 / 24.0) + r * (c(1.0 / 120.0) + r * c(1.0 / 720.0))))));
+    // degree-4 RELATIVE-minimax (Remez) of exp(r) over r in [-ln2/2, ln2/2]; max rel err
+    // 2.6e-6 (profiling/minimax_coeffs.py). 2 fewer FMAs than the old degree-6 Taylor, and
+    // still ~200x inside the +-0.0010 log-loss band. Precision-trade (3b), portable (c7).
+    let p = c(0.999999261446)
+        + r * (c(0.999963404853)
+            + r * (c(0.500043586613) + r * (c(0.167909072153) + r * c(0.0414586082011))));
     let bits: i32x8 = (n.round_int() + i32x8::splat(127)) << 23;
     let two_n: f32x8 = bytemuck::cast(bits);
     p * two_n
@@ -63,9 +66,9 @@ fn ln8(x: f32x8) -> f32x8 {
     let t = (m - one) / (m + one);
     let t2 = t * t;
     let c = |v: f32| f32x8::splat(v);
-    let poly = c(2.0)
-        * t
-        * (one + t2 * (c(1.0 / 3.0) + t2 * (c(1.0 / 5.0) + t2 * (c(1.0 / 7.0) + t2 * c(1.0 / 9.0)))));
+    // degree-2-in-u (u=t^2) minimax of atanh(t)/t over u in [0,1/9]; reconstructed abs ln err
+    // 4.9e-6 (profiling/minimax_coeffs.py). 2 fewer FMAs than the old t^9 atanh series.
+    let poly = c(2.0) * t * (c(1.0000073389) + t2 * (c(0.332179529507) + t2 * c(0.226577770996)));
     let e_f: f32x8 = e.round_float();
     e_f * f32x8::splat(LN2) + poly
 }
@@ -1212,7 +1215,11 @@ mod tests {
 
     #[test]
     fn simd_transcendentals_accurate() {
-        // exp8 over [-87,88], ln8 over (1e-5, 4e4) vs true f64 — gate at 1e-4 (real impl ~1e-6).
+        // exp8 over [-87,88] (rel) and ln8 over (1e-5, 4e4) (abs) vs true f64. Worst-case is the
+        // f32 range-reduction floor (exp: x - n*ln2 cancellation near x~88 ~6.7e-6; ln: e_f*ln2
+        // f32 add), NOT the minimax poly (exp ~2.6e-6, ln ~4.9e-6; profiling/minimax_coeffs.py).
+        // FSRS's actual args are modest, so the real error is the poly floor. Gates sit just above
+        // the reduction floor: still 10x tighter than the old 1e-4 and catch any coefficient typo.
         let mut worst_exp = 0.0f64;
         let mut x = -87.0f32;
         while x <= 88.0 {
@@ -1221,7 +1228,7 @@ mod tests {
             worst_exp = worst_exp.max(((v - b) / b).abs());
             x += 0.013;
         }
-        assert!(worst_exp < 1e-4, "exp8 worst rel err {worst_exp:e}");
+        assert!(worst_exp < 1e-5, "exp8 worst rel err {worst_exp:e}");
         let mut worst_ln = 0.0f64;
         let mut y = 1e-5f32;
         while y <= 4e4 {
@@ -1230,7 +1237,7 @@ mod tests {
             worst_ln = worst_ln.max((v - b).abs());
             y *= 1.05;
         }
-        assert!(worst_ln < 1e-4, "ln8 worst abs err {worst_ln:e}");
+        assert!(worst_ln < 1.5e-5, "ln8 worst abs err {worst_ln:e}");
     }
 
     #[test]

@@ -34,7 +34,30 @@ A candidate is **accepted only if** the median user gets **≥5% faster** *and* 
 ```bash
 uv run compute_parameters.py --algo FSRS-rs --short --secs --recency --processes 10 --max-user-id 50
 ```
-Per-user times (ms) are written to `result/compute_parameters-FSRS-rs-short-secs-recency.jsonl`. For the exact low-noise invocation (CPU pinning + priority) and the full measurement protocol, see *Running it* and *Measurement protocol* in [`CLAUDE.md`](CLAUDE.md).
+Per-user times (ms) are written to `result/compute_parameters-FSRS-rs-short-secs-recency.jsonl`. For the full measurement protocol (min-of-3, median-of-ratios accept metric, noise floor), see *Measurement protocol* in [`CLAUDE.md`](CLAUDE.md).
+
+#### Low-noise measurement (Windows)
+
+Timing noise muddies the ≥5% accept bar, so the campaign runs the speed harness at high priority pinned to specific cores. On Windows:
+
+```bat
+start /high /affinity 0xFFFFFFF0 python compute_parameters.py --algo FSRS-rs --short --secs --recency --processes 10 --max-user-id 50
+```
+
+- `/high` raises the process priority; `/affinity 0xFFFFFFF0` keeps the workers **off logical CPUs 0–3** (the four cleared low bits of the mask), where the OS and background apps tend to land. On top of that, `compute_parameters.py` pins each worker to its own pair of cores, so cross-worker contention stays constant instead of random.
+
+And pin the CPU clock so turbo/thermal drift can't change the timings between runs (cap the max and min processor state at 99%, which disables turbo and holds the clock flat):
+
+```bat
+powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 99
+powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 99
+powercfg /setactive SCHEME_CURRENT
+```
+
+If you want to reduce the noise further, you can:
+
+1. Turn off as many programs as you can. I didn't do that because I still want to use my PC for other things.
+2. Lock CPU fan speed and CPU voltage in BIOS. I just didn't want to bother.
 
 **Reference / correctness harness:**
 ```bash
