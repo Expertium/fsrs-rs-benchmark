@@ -158,7 +158,7 @@ def main() -> None:
     ax_sp.legend(loc="upper right", framealpha=0.9)
     ylo, yhi = min(cy + [1.0]), max(cy + [1.0])
     yr = (yhi - ylo) or 1.0
-    pad_top = (1.20 if not args.no_summaries else 0.10) * yr
+    pad_top = (0.5 if not args.no_summaries else 0.10) * yr
     ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top + 0.01)
 
     # ---- Bottom panel: median time (machine-specific; NOT the accept metric) ----
