@@ -27,6 +27,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 20 | 40 | 39 | 1.059 | 7204 | 7196 | 0.999 | 0.997 | ✓ | accepted | Unified BCE -ln(1-|label-r|) (Andrew): vectorize validation ln8 + one-division gradient seed |
 | 21 | 40 | 36 | 1.083 | 7196 | 7187 | 0.999 | 0.997 | ✓ | accepted | dedup card-regroup (bit-for-bit) + exp8 deg-3 minimax (1 fewer FMA) |
 | 22 | 36 | 34 | 1.077 | 7187 | 7180 | 0.999 | 0.998 | ✓ | accepted | hand-roll Adam + param clip on host f32, drop per-step burn tensor round-trips |
+| 23 | 33 | 30 | 1.096 | 7180 | 7219 | 1.005 | 1.014 | ✓ | accepted | Windowed-only cruder minimax via const-generic FAST: exp8 deg3->deg2 + ln8 deg2->deg1; benchmark path bit-for-bit |
 
-**Cumulative speed_ratio (product of accepted): ×92.713** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×101.595** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

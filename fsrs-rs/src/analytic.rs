@@ -37,28 +37,45 @@ fn clamp8(x: f32x8, lo: f32, hi: f32) -> f32x8 {
 }
 
 /// exp over 8 lanes: 2^n · poly(r), x = n·ln2 + r. Same algorithm as the scalar floor-bench.
+///
+/// `FAST` (compile-time const), exactly like ln8: `false` = degree-3 minimax (rel err 7.5e-5) — the
+/// accurate default, bit-for-bit with the pre-iter23 exp8, used by every path except the windowed
+/// training recurrence. `true` = degree-2 (rel err 1.7e-3, ONE fewer FMA), used ONLY by the windowed
+/// compute_parameters() forward (`step8_fwd::<true>` → curve8_fwd/stab8_fwd::<true>). The O(N²)
+/// benchmark/evaluate path keeps `::<false>` so its band stays bit-for-bit; the exp8 error only
+/// perturbs the TRAINING trajectory + best-epoch pick (the band metric is the frozen evaluate(),
+/// which uses neither poly), scored by the exact evaluate(). Precision-trade (3b), portable (c7).
 #[inline(always)]
-fn exp8(x: f32x8) -> f32x8 {
+fn exp8<const FAST: bool>(x: f32x8) -> f32x8 {
     let x = x.fast_max(f32x8::splat(-87.0)).fast_min(f32x8::splat(88.0));
     let n = (x * f32x8::splat(LOG2E)).round();
     let r = x - n * f32x8::splat(LN2);
     let c = |v: f32| f32x8::splat(v);
-    // degree-3 RELATIVE-minimax (Remez) of exp(r) over r in [-ln2/2, ln2/2]; max rel err
-    // 7.5e-5 (profiling/minimax_coeffs.py). 1 fewer FMA than the old degree-4. The exp8 error
-    // only perturbs the TRAINING trajectory (and the per-epoch best-model pick) — the band
-    // metric is the frozen evaluate(), which does NOT use exp8 — so the accuracy cost is just a
-    // tiny shift in the final params, scored by the exact scorer. Precision-trade (3b), portable (c7).
-    let p = c(0.999928073539)
-        + r * (c(1.00016418577) + r * (c(0.50496326418) + r * c(0.165668423429)));
+    let p = if FAST {
+        // degree-2 RELATIVE-minimax of exp(r) over [-ln2/2, ln2/2]; max rel err 1.7e-3.
+        c(1.00044314196) + r * (c(1.01486094962) + r * c(0.496258591073))
+    } else {
+        // degree-3 RELATIVE-minimax (Remez); max rel err 7.5e-5 (profiling/minimax_coeffs.py).
+        c(0.999928073539) + r * (c(1.00016418577) + r * (c(0.50496326418) + r * c(0.165668423429)))
+    };
     let bits: i32x8 = (n.round_int() + i32x8::splat(127)) << 23;
     let two_n: f32x8 = bytemuck::cast(bits);
     p * two_n
 }
 
-/// ln over 8 lanes: x = m·2^e, ln = e·ln2 + atanh-series in t=(m-1)/(m+1) through t^9 (~1e-6).
+/// ln over 8 lanes: x = m·2^e, ln = e·ln2 + minimax(atanh-series) in t=(m-1)/(m+1).
 /// All forward ln inputs are > 0 (stabilities ≥ S_MIN, difficulty ≥ 1, the b/qbase bases > 0).
+///
+/// `FAST` (compile-time const): `false` = degree-2-in-u minimax (abs err 4.9e-6) — the accurate
+/// default used by EVERY path except the windowed training recurrence, so it is bit-for-bit with the
+/// pre-iter23 ln8. `true` = degree-1-in-u (abs err 2.3e-4, ONE fewer FMA), used ONLY by the windowed
+/// compute_parameters() forward (`step8_fwd::<true>`). The O(N²) benchmark/evaluate path stays on
+/// `::<false>` so its (tight) band is untouched; only the roomier compute_parameters cp band — the
+/// user-facing path — sees this. And the band metric is the frozen evaluate(), which uses NEITHER
+/// poly, so `FAST` only nudges the training trajectory + best-epoch pick (scored by the exact
+/// evaluate()), exactly like the iter17/iter21 minimax cuts. Precision-trade (3b), portable (c7).
 #[inline(always)]
-fn ln8(x: f32x8) -> f32x8 {
+fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
     let bits: i32x8 = bytemuck::cast(x);
     let e: i32x8 = ((bits >> 23) & i32x8::splat(0xff)) - i32x8::splat(127);
     let mant_bits: i32x8 = (bits & i32x8::splat(0x007f_ffff)) | i32x8::splat(127 << 23);
@@ -67,9 +84,13 @@ fn ln8(x: f32x8) -> f32x8 {
     let t = (m - one) / (m + one);
     let t2 = t * t;
     let c = |v: f32| f32x8::splat(v);
-    // degree-2-in-u (u=t^2) minimax of atanh(t)/t over u in [0,1/9]; reconstructed abs ln err
-    // 4.9e-6 (profiling/minimax_coeffs.py). 2 fewer FMAs than the old t^9 atanh series.
-    let poly = c(2.0) * t * (c(1.0000073389) + t2 * (c(0.332179529507) + t2 * c(0.226577770996)));
+    let poly = if FAST {
+        // degree-1-in-u (u=t^2) minimax of atanh(t)/t over u in [0,1/9]; abs ln err 2.3e-4.
+        c(2.0) * t * (c(0.999650356749) + t2 * c(0.357486937559))
+    } else {
+        // degree-2-in-u minimax; reconstructed abs ln err 4.9e-6 (profiling/minimax_coeffs.py).
+        c(2.0) * t * (c(1.0000073389) + t2 * (c(0.332179529507) + t2 * c(0.226577770996)))
+    };
     let e_f: f32x8 = e.round_float();
     e_f * f32x8::splat(LN2) + poly
 }
@@ -579,7 +600,7 @@ struct Curve8 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn curve8_fwd(
+fn curve8_fwd<const FAST: bool>(
     w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, ln_w27: f32, ln_w28: f32,
     ln_s: f32x8, ln_sf: f32x8,
 ) -> Curve8 {
@@ -588,30 +609,30 @@ fn curve8_fwd(
     let t = t.fast_max(k(0.0));
     let a = t / sf;
     let bv = t / s;
-    let p35 = exp8(sp(35) * ln_sf);
+    let p35 = exp8::<FAST>(sp(35) * ln_sf);
     let m1 = sp(25) * p35;
     let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
     let q1 = k(ln_w27) / decay1;
-    let e1 = exp8(q1.fast_min(k(60.0)));
+    let e1 = exp8::<FAST>(q1.fast_min(k(60.0)));
     let factor1 = e1 - k(1.0);
     let b1 = a * factor1 + k(1.0);
-    let ln_b1 = ln8(b1);
-    let r1 = exp8(decay1 * ln_b1);
-    let ex34 = exp8((d - k(5.0)) * sp(34));
+    let ln_b1 = ln8::<FAST>(b1);
+    let r1 = exp8::<FAST>(decay1 * ln_b1);
+    let ex34 = exp8::<FAST>((d - k(5.0)) * sp(34));
     let m2 = sp(26) * ex34;
     let dm2 = clamp8(m2, 0.01, 0.95);
     let decay2 = k(0.0) - dm2;
     let inv2 = k(1.0) / decay2;
-    let p28 = exp8(inv2 * k(ln_w28));
+    let p28 = exp8::<FAST>(inv2 * k(ln_w28));
     let factor2 = p28 - k(1.0);
     let b2 = bv * factor2 + k(1.0);
-    let ln_b2 = ln8(b2);
-    let r2 = exp8(decay2 * ln_b2);
-    let p31 = exp8(k(-w[31]) * ln_sf);
+    let ln_b2 = ln8::<FAST>(b2);
+    let r2 = exp8::<FAST>(decay2 * ln_b2);
+    let p31 = exp8::<FAST>(k(-w[31]) * ln_sf);
     let weight1 = sp(29) * p31;
-    let s32 = exp8(sp(32) * ln_s);
-    let ex33 = exp8((d - k(5.0)) * sp(33));
+    let s32 = exp8::<FAST>(sp(32) * ln_s);
+    let ex33 = exp8::<FAST>((d - k(5.0)) * sp(33));
     let weight2 = sp(30) * s32 * ex33;
     let wsum = weight1 + weight2;
     let num = weight1 * r1 + weight2 * r2;
@@ -714,7 +735,7 @@ struct Stab8 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stab8_fwd(
+fn stab8_fwd<const FAST: bool>(
     w: &[f32], last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
     ln_ls: f32x8, ln_ld: f32x8,
 ) -> Stab8 {
@@ -723,15 +744,15 @@ fn stab8_fwd(
     let one = k(1.0);
     let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 7), one);
     let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 8), one);
-    let pp = exp8(k(-w[start + 4]) * ln_ld);
-    let ln_ls1 = ln8(last_s + one);
-    let qbase = exp8(sp(start + 5) * ln_ls1);
-    let rexp = exp8((one - r) * sp(start + 6));
+    let pp = exp8::<FAST>(k(-w[start + 4]) * ln_ld);
+    let ln_ls1 = ln8::<FAST>(last_s + one);
+    let qbase = exp8::<FAST>(sp(start + 5) * ln_ls1);
+    let rexp = exp8::<FAST>((one - r) * sp(start + 6));
     let nsf_fail = sp(start + 3) * pp * (qbase - one) * rexp;
     let pls = last_s.fast_min(nsf_fail);
     let bb = k(11.0) - last_d;
-    let cc = exp8(k(-w[start + 1]) * ln_ls);
-    let expr = exp8((one - r) * sp(start + 2));
+    let cc = exp8::<FAST>(k(-w[start + 1]) * ln_ls);
+    let expr = exp8::<FAST>((one - r) * sp(start + 2));
     let aa8 = k(aa);
     let sinc = aa8 * bb * cc * (expr - one) * hard * easy + one;
     let ls_sinc = last_s * sinc;
@@ -852,7 +873,7 @@ pub(crate) fn batch_loss_simd(
                     k(w[0]),
                     rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
                 );
-                let init_d = clamp8(k(w[4]) - exp8(k(w[5]) * (rc - one)) + one, D_MIN, D_MAX);
+                let init_d = clamp8(k(w[4]) - exp8::<false>(k(w[5]) * (rc - one)) + one, D_MIN, D_MAX);
                 s = clamp8(init_s, S_MIN, S_MAX);
                 d = init_d;
                 sf = clamp8(k(0.8) * init_s, S_MIN, S_MAX);
@@ -861,12 +882,12 @@ pub(crate) fn batch_loss_simd(
                 let s_c = clamp8(s, S_MIN, S_MAX);
                 let d_c = clamp8(d, D_MIN, D_MAX);
                 let sf_c = clamp8(sf, S_MIN, S_MAX);
-                let ln_s = ln8(s_c);
-                let ln_sf = ln8(sf_c);
-                let ln_d = ln8(d_c);
-                let rr = curve8_fwd(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf).out;
-                let ns = stab8_fwd(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d).out;
-                let nsf = stab8_fwd(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d).out;
+                let ln_s = ln8::<false>(s_c);
+                let ln_sf = ln8::<false>(sf_c);
+                let ln_d = ln8::<false>(d_c);
+                let rr = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf).out;
+                let ns = stab8_fwd::<false>(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d).out;
+                let nsf = stab8_fwd::<false>(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d).out;
                 let nd = next_d8_fwd(w, d_c, rating, wc.init).0;
                 // rating==0 (padding) passes the state through unchanged.
                 let m0 = rating.cmp_eq(k(0.0));
@@ -877,7 +898,7 @@ pub(crate) fn batch_loss_simd(
         }
         let dts = load8(delta_ts, c0);
         let r = clamp8(
-            curve8_fwd(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8(s), ln8(sf)).out,
+            curve8_fwd::<false>(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8::<false>(s), ln8::<false>(sf)).out,
             MIN_R,
             MAX_R,
         );
@@ -953,7 +974,7 @@ impl Step8 {
 /// One recurrence step over 8 cards. `first` (t==0) initialises state from the rating exactly like
 /// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
 /// then the rating==0 padding passthrough). Returns the new state and the backward cache.
-fn step8_fwd(
+fn step8_fwd<const FAST: bool>(
     w: &[f32], dt_raw: f32x8, rating: f32x8, state: (f32x8, f32x8, f32x8), first: bool, wc: &WConsts,
 ) -> ((f32x8, f32x8, f32x8), Step8) {
     let k = f32x8::splat;
@@ -965,7 +986,7 @@ fn step8_fwd(
             k(w[0]),
             rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
         );
-        let ex_w5 = exp8(k(w[5]) * (rc - one));
+        let ex_w5 = exp8::<FAST>(k(w[5]) * (rc - one));
         let id_in = k(w[4]) - ex_w5 + one;
         let init_d = clamp8(id_in, D_MIN, D_MAX);
         let out = (
@@ -979,13 +1000,13 @@ fn step8_fwd(
         let last_d = clamp8(d0, D_MIN, D_MAX);
         let last_sf = clamp8(sf0, S_MIN, S_MAX);
         let dt = dt_raw.fast_max(k(0.0));
-        let ln_last_s = ln8(last_s);
-        let ln_last_sf = ln8(last_sf);
-        let ln_last_d = ln8(last_d);
-        let curve = curve8_fwd(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf);
+        let ln_last_s = ln8::<FAST>(last_s);
+        let ln_last_sf = ln8::<FAST>(last_sf);
+        let ln_last_d = ln8::<FAST>(last_d);
+        let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf);
         let r = curve.out;
-        let slow = stab8_fwd(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
-        let fast = stab8_fwd(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
+        let slow = stab8_fwd::<FAST>(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
+        let fast = stab8_fwd::<FAST>(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
         let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, wc.init);
         // rating==0 (padding) passes the input state through unchanged.
         let m0 = rating.cmp_eq(k(0.0));
@@ -1091,7 +1112,7 @@ fn loss_and_grad_range_simd(
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { k(0.0) } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            let (ns, cache) = step8_fwd::<false>(w, dt, rating, (s, d, sf), t == 0, &wc);
             s = ns.0;
             d = ns.1;
             sf = ns.2;
@@ -1100,9 +1121,9 @@ fn loss_and_grad_range_simd(
         let dts = load8(delta_ts, c0);
         let lbl = load8(labels, c0);
         let wt = load8(weights, c0);
-        let ln_s = ln8(s);
-        let ln_sf = ln8(sf);
-        let fc = curve8_fwd(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+        let ln_s = ln8::<false>(s);
+        let ln_sf = ln8::<false>(sf);
+        let fc = curve8_fwd::<false>(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
         let r_raw = fc.out;
         let r = clamp8(r_raw, MIN_R, MAX_R);
         // BCE loss in f64 (per lane). Only used as the return value (training discards it).
@@ -1191,7 +1212,7 @@ pub(crate) fn card_loss_and_grad_simd(
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { z } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            let (ns, cache) = step8_fwd::<true>(w, dt, rating, (s, d, sf), t == 0, &wc);
             s = ns.0;
             d = ns.1;
             sf = ns.2;
@@ -1252,7 +1273,7 @@ pub(crate) fn card_loss_simd(
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { z } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            let (ns, cache) = step8_fwd::<true>(w, dt, rating, (s, d, sf), t == 0, &wc);
             s = ns.0;
             d = ns.1;
             sf = ns.2;
@@ -1266,7 +1287,9 @@ pub(crate) fn card_loss_simd(
                 let lbl = load8(labels, base);
                 let wt = load8(weights, base);
                 let arg = k(1.0) - (lbl - r).fast_max(r - lbl); // 1 - |label - r|  (label is 0 or 1)
-                loss += ((z - wt) * ln8(arg)).reduce_add() as f64;
+                // BCE loss ln stays accurate (::<false>): it is the best-epoch SELECTION criterion;
+                // only the forward recurrence (state) uses the cruder ln8::<true>.
+                loss += ((z - wt) * ln8::<false>(arg)).reduce_add() as f64;
             }
         }
     }
@@ -1421,7 +1444,7 @@ mod tests {
         let mut worst_exp = 0.0f64;
         let mut x = -87.0f32;
         while x <= 88.0 {
-            let v = exp8(f32x8::splat(x)).to_array()[0] as f64;
+            let v = exp8::<false>(f32x8::splat(x)).to_array()[0] as f64;
             let b = (x as f64).exp();
             worst_exp = worst_exp.max(((v - b) / b).abs());
             x += 0.013;
@@ -1430,7 +1453,7 @@ mod tests {
         let mut worst_ln = 0.0f64;
         let mut y = 1e-5f32;
         while y <= 4e4 {
-            let v = ln8(f32x8::splat(y)).to_array()[0] as f64;
+            let v = ln8::<false>(f32x8::splat(y)).to_array()[0] as f64;
             let b = (y as f64).ln();
             worst_ln = worst_ln.max((v - b).abs());
             y *= 1.05;
