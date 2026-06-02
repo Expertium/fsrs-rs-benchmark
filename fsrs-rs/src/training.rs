@@ -6,8 +6,7 @@ use burn::backend::Autodiff;
 use burn::backend::ndarray::NdArray;
 use burn::config::Config;
 use burn::data::dataloader::batcher::Batcher;
-use burn::data::dataloader::{DataLoaderIterator, Progress};
-use burn::data::dataset::Dataset;
+use burn::data::dataloader::Progress;
 use burn::lr_scheduler::LrScheduler;
 use burn::module::Param;
 use burn::nn::loss::Reduction;
@@ -939,113 +938,9 @@ impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
     }
 }
 
-pub(crate) struct FSRSDataset {
-    pub(crate) items: Vec<WeightedFSRSItem>,
-}
-
-impl Dataset<WeightedFSRSItem> for FSRSDataset {
-    fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    fn get(&self, index: usize) -> Option<WeightedFSRSItem> {
-        self.items.get(index).cloned()
-    }
-}
-
-impl From<Vec<WeightedFSRSItem>> for FSRSDataset {
-    fn from(items: Vec<WeightedFSRSItem>) -> Self {
-        Self {
-            items: sort_items_by_review_length(items),
-        }
-    }
-}
-
-// ========== Batch Shuffle ==========
-
-#[derive(Clone)]
-pub(crate) struct BatchTensorDataset<B: Backend> {
-    dataset: Vec<FSRSBatch<B>>,
-}
-
-impl<B: Backend> BatchTensorDataset<B> {
-    pub fn new(dataset: FSRSDataset, batch_size: usize) -> Self {
-        let device = B::Device::default();
-        let batcher = FSRSBatcher::<B>::new();
-        let dataset = dataset
-            .items
-            .chunks(batch_size)
-            .map(|items| batcher.batch(items.to_vec(), &device))
-            .collect();
-        Self { dataset }
-    }
-}
-
-impl<B: Backend> BatchTensorDataset<B> {
-    fn get(&self, index: usize) -> Option<FSRSBatch<B>> {
-        self.dataset.get(index).cloned()
-    }
-
-    fn len(&self) -> usize {
-        self.dataset.len()
-    }
-}
-
-pub(crate) struct ShuffleDataLoader<B: Backend> {
-    dataset: BatchTensorDataset<B>,
-    rng: Mutex<StdRng>,
-}
-
-impl<B: Backend> ShuffleDataLoader<B> {
-    pub fn new(dataset: BatchTensorDataset<B>, seed: u64) -> Self {
-        Self {
-            dataset,
-            rng: Mutex::new(StdRng::seed_from_u64(seed)),
-        }
-    }
-}
-
-pub(crate) struct ShuffleDataLoaderIterator<B: Backend> {
-    current_index: usize,
-    indices: Vec<usize>,
-    dataset: BatchTensorDataset<B>,
-}
-
-impl<B: Backend> ShuffleDataLoaderIterator<B> {
-    pub(crate) fn new(dataset: BatchTensorDataset<B>, indices: Vec<usize>) -> Self {
-        Self {
-            current_index: 0,
-            indices,
-            dataset,
-        }
-    }
-}
-
-impl<B: Backend> Iterator for ShuffleDataLoaderIterator<B> {
-    type Item = FSRSBatch<B>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(index) = self.indices.get(self.current_index) {
-            self.current_index += 1;
-            return self.dataset.get(*index);
-        }
-        None
-    }
-}
-
-impl<B: Backend> DataLoaderIterator<FSRSBatch<B>> for ShuffleDataLoaderIterator<B> {
-    fn progress(&self) -> Progress {
-        Progress::new(self.current_index, self.dataset.len())
-    }
-}
-
-impl<B: Backend> ShuffleDataLoader<B> {
-    pub(crate) fn iter(&self) -> ShuffleDataLoaderIterator<B> {
-        let mut indices: Vec<_> = (0..self.dataset.len()).collect();
-        indices.shuffle(&mut *self.rng.lock().unwrap());
-        ShuffleDataLoaderIterator::new(self.dataset.clone(), indices)
-    }
-}
+// The training/validation batches are built directly as host arrays by build_host_batches()
+// (below) — no burn-tensor dataset/dataloader layer. FSRSBatcher/FSRSBatch above are retained
+// only because the frozen evaluate() path (inference.rs) still uses them.
 
 // ========== Dataset Helper Functions ==========
 
@@ -1111,23 +1006,6 @@ impl<B: Backend> BCELoss<B> {
             Reduction::Sum => loss.sum().neg(),
             Reduction::Auto => (loss.sum() / weights.sum()).neg(),
         }
-    }
-}
-
-impl<B: AutodiffBackend> Model<B> {
-    /// Overwrite the w gradient entirely (used to inject the hand-written analytic gradient).
-    fn set_weight_gradient(&self, mut gradients: B::Gradients, new_grad: &[f32]) -> B::Gradients {
-        let grad_tensor = self.w.grad(&gradients).unwrap();
-        let device = grad_tensor.device();
-        let grad_len = grad_tensor.dims()[0];
-        let mut data = vec![0.0f32; grad_len];
-        for (dst, src) in data.iter_mut().zip(new_grad.iter()) {
-            *dst = *src;
-        }
-        let new_tensor = Tensor::from_floats(data.as_slice(), &device);
-        self.w.grad_remove(&mut gradients);
-        self.w.grad_replace(&mut gradients, new_tensor);
-        gradients
     }
 }
 
@@ -1425,6 +1303,42 @@ struct BatchHost {
     wts: Vec<f32>,
 }
 
+/// Build the per-batch host arrays DIRECTLY from the (weighted) items, replicating EXACTLY what
+/// `BatchTensorDataset::new(FSRSDataset::from(items), batch_size)` + per-batch `to_data().to_vec()`
+/// produced — but with NO burn tensors. Those tensors were pure overhead here: a full second copy
+/// of the data, built then immediately extracted into these host Vecs and dropped. Same sort (by
+/// review length), same chunking, same [seq, batch] row-major 0-padding, so it is BIT-FOR-BIT.
+fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<BatchHost> {
+    let items = sort_items_by_review_length(items);
+    items
+        .chunks(batch_size)
+        .map(|chunk| {
+            let bsz = chunk.len();
+            // pad_size = (max reviews per card in this chunk) - 1   (matches FSRSBatcher)
+            let seq = chunk.iter().map(|x| x.item.reviews.len()).max().unwrap() - 1;
+            let mut th = vec![0.0f32; seq * bsz];
+            let mut rh = vec![0.0f32; seq * bsz];
+            let mut dts = vec![0.0f32; bsz];
+            let mut lbl = vec![0.0f32; bsz];
+            let mut wts = vec![0.0f32; bsz];
+            for (c, wi) in chunk.iter().enumerate() {
+                let reviews = &wi.item.reviews;
+                // history() = every review except the last; row-major [seq, bsz] => index t*bsz + c.
+                // Entries past this card's history stay 0.0 (the pad).
+                for (t, r) in reviews.iter().take(reviews.len() - 1).enumerate() {
+                    th[t * bsz + c] = r.delta_t;
+                    rh[t * bsz + c] = r.rating as f32;
+                }
+                let current = reviews.last().unwrap();
+                dts[c] = current.delta_t;
+                lbl[c] = if current.rating == 1 { 0.0 } else { 1.0 };
+                wts[c] = wi.weight;
+            }
+            BatchHost { seq, bsz, real_batch_size: bsz, th, rh, dts, lbl, wts }
+        })
+        .collect()
+}
+
 fn train<B: AutodiffBackend>(
     train_set: Vec<WeightedFSRSItem>,
     test_set: Vec<WeightedFSRSItem>,
@@ -1436,36 +1350,23 @@ fn train<B: AutodiffBackend>(
 
     // Training data
     let total_size = train_set.len();
+    let test_size = test_set.len();
     let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
-    let train_dataset =
-        BatchTensorDataset::<B>::new(FSRSDataset::from(train_set), config.batch_size);
-    let n_train_batches = train_dataset.len();
-    // Pre-extract the TRAINING batches to host arrays ONCE (was a per-step copy ~11% of compute).
-    // The data is fixed; only the batch ORDER changes per epoch (the shuffle is replicated below).
-    let train_host: Vec<BatchHost> = (0..n_train_batches)
-        .map(|i| {
-            let b = train_dataset.get(i).unwrap();
-            BatchHost {
-                seq: b.t_historys.dims()[0],
-                bsz: b.t_historys.dims()[1],
-                real_batch_size: b.delta_ts.shape().dims[0],
-                th: b.t_historys.to_data().to_vec().unwrap(),
-                rh: b.r_historys.to_data().to_vec().unwrap(),
-                dts: b.delta_ts.to_data().to_vec().unwrap(),
-                lbl: b.labels.clone().float().to_data().to_vec().unwrap(),
-                wts: b.weights.to_data().to_vec().unwrap(),
-            }
-        })
-        .collect();
+    // Build the TRAINING batches as host arrays directly (no burn tensors — they were built then
+    // immediately extracted to host and dropped). The data is fixed; only the batch ORDER changes
+    // per epoch (the shuffle is replicated below).
+    let train_host: Vec<BatchHost> = build_host_batches(train_set, config.batch_size);
+    let n_train_batches = train_host.len();
     // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
     // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
     let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
 
-    let batch_dataset = BatchTensorDataset::<B::InnerBackend>::new(
-        FSRSDataset::from(test_set.clone()),
-        config.batch_size,
-    );
-    let dataloader_valid = ShuffleDataLoader::new(batch_dataset, config.seed);
+    // Validation batches, built directly too. The old ShuffleDataLoader shuffled the batch order
+    // ONCE (StdRng::seed_from_u64(seed)); replicate that with `valid_order` so each epoch sums the
+    // validation batches in byte-identical order (the analytic batch_loss is otherwise the same).
+    let valid_host: Vec<BatchHost> = build_host_batches(test_set, config.batch_size);
+    let mut valid_order: Vec<usize> = (0..valid_host.len()).collect();
+    valid_order.shuffle(&mut StdRng::seed_from_u64(config.seed));
 
     let mut lr_scheduler = CosineAnnealingLR::init(iterations as f64, config.learning_rate);
     let interrupter = TrainingInterrupter::new();
@@ -1486,25 +1387,9 @@ fn train<B: AutodiffBackend>(
 
     let mut best_loss = f64::INFINITY;
     let mut best_model = model.clone();
-    // Pre-extract the fixed validation batches to host arrays ONCE. The test set and its
-    // batching don't change across epochs, so each epoch can score them with the analytic
-    // forward (crate::analytic::batch_loss) instead of burn's tensor forward — which was
-    // ~half of compute_parameters() time. Same BCE math + same [1e-5,1-1e-5] clamp; only the
-    // FP summation order differs (judged by the 3b average-log-loss band). Order/batching of
-    // the val set doesn't change the summed loss (per-card terms are independent).
-    let valid_batches: Vec<BatchHost> = dataloader_valid
-        .iter()
-        .map(|batch| BatchHost {
-            seq: batch.t_historys.dims()[0],
-            bsz: batch.t_historys.dims()[1],
-            real_batch_size: batch.delta_ts.shape().dims[0],
-            th: batch.t_historys.to_data().to_vec().unwrap(),
-            rh: batch.r_historys.to_data().to_vec().unwrap(),
-            dts: batch.delta_ts.to_data().to_vec().unwrap(),
-            lbl: batch.labels.clone().float().to_data().to_vec().unwrap(),
-            wts: batch.weights.to_data().to_vec().unwrap(),
-        })
-        .collect();
+    // (Validation batches were pre-built above into valid_host + valid_order; each epoch scores
+    // them with the analytic forward crate::analytic::batch_loss — same BCE math + [1e-5,1-1e-5]
+    // clamp as burn's tensor forward, only the FP summation order differs, judged by the 3b band.)
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
     // t_bwd = analytic gradient, t_opt = dummy+step+clip. (Per-step extract is gone — the train
     // batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
@@ -1562,12 +1447,18 @@ fn train<B: AutodiffBackend>(
             }
             t_bwd += _tb.elapsed().as_secs_f64();
             let _to = std::time::Instant::now();
-            // Obtain a gradient container via a trivial dummy backward (a 36-element sum =>
-            // O(1) tape), then overwrite w's gradient with the analytic one. No recurrence
-            // autodiff is built, so the tape-record + tape-replay cost is gone.
-            let mut gradients = model.w.val().sum().backward();
-            gradients = model.set_weight_gradient(gradients, &total_grad_f32);
-            let grads = GradientsParams::from_grads(gradients, &model);
+            // Build the gradient container DIRECTLY from the analytic gradient — no autodiff at
+            // all. Previously a dummy `model.w.val().sum().backward()` created an empty grads
+            // container we then overwrote; even that trivial backward touched burn's Autodiff
+            // backend, whose global tensor ledger made the call cost scale with the number of
+            // live autodiff tensors (so it ballooned on large collections). The gradient VALUE
+            // reaching Adam is identical (total_grad_f32), so the SGD trajectory is bit-for-bit.
+            let w_id = model.w.id;
+            let inner_device = <B::InnerBackend as Backend>::Device::default();
+            let grad_tensor =
+                Tensor::<B::InnerBackend, 1>::from_floats(total_grad_f32.as_slice(), &inner_device);
+            let mut grads = GradientsParams::new();
+            grads.register::<B::InnerBackend, 1>(w_id, grad_tensor);
             model = optim.step(lr, model, grads);
             model.w = parameter_clipper(
                 model.w,
@@ -1594,7 +1485,8 @@ fn train<B: AutodiffBackend>(
         // w is fixed during validation, so extract it once per epoch (not per batch).
         let w_vec_valid = model.w.val().to_data().to_vec::<f32>().unwrap();
         let mut loss_valid = 0.0;
-        for vb in &valid_batches {
+        for &vi in &valid_order {
+            let vb = &valid_host[vi];
             let (l2_penalty_value, _) = l2_penalty(
                 &w_vec_valid,
                 &init_w_vec,
@@ -1615,7 +1507,7 @@ fn train<B: AutodiffBackend>(
                 break;
             }
         }
-        loss_valid /= test_set.len() as f64;
+        loss_valid /= test_size as f64;
         t_valid += _tv.elapsed().as_secs_f64();
         info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
         if loss_valid < best_loss {
