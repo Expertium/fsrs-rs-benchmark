@@ -8,9 +8,8 @@ use burn::config::Config;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::Progress;
 use burn::lr_scheduler::LrScheduler;
-use burn::module::Param;
 use burn::nn::loss::Reduction;
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::optim::AdamConfig;
 use burn::prelude::Backend;
 use burn::tensor::{Float, Int, Shape, Tensor, TensorData};
 use burn::tensor::backend::AutodiffBackend;
@@ -591,6 +590,14 @@ type B = NdArray<f32>;
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 
+// Adam hyperparameters — MUST equal the AdamConfig built in compute_parameters()/benchmark().
+// Constraint 4 freezes these, so this single copy can't drift from the config. Used by the
+// hand-rolled host Adam in train(), which replaced burn's tensor optimizer (and its per-step
+// host round-trips) with an element-wise replica of burn 0.17's AdaptiveMomentum.
+const ADAM_BETA1: f32 = 0.55;
+const ADAM_BETA2: f32 = 0.955555;
+const ADAM_EPS: f32 = 1e-8;
+
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
 
@@ -682,23 +689,7 @@ impl LrScheduler for CosineAnnealingLR {
     }
 }
 
-// ========== Parameter Clipper ==========
-
-pub(crate) fn parameter_clipper<B: Backend>(
-    parameters: Param<Tensor<B, 1>>,
-    enable_short_term: bool,
-) -> Param<Tensor<B, 1>> {
-    let (id, val) = parameters.consume();
-    let clipped = clip_parameters(&val.to_data().to_vec().unwrap());
-    // Dual-trace FSRS-7 has no separate short-term toggle (the old w[26] transition
-    // weight is gone); the fast trace is intrinsic. enable_short_term is kept in the
-    // signature for call-site compatibility but no longer zeros any parameter.
-    let _ = enable_short_term;
-    Param::initialized(
-        id,
-        Tensor::from_data(TensorData::new(clipped, val.shape()), &val.device()).require_grad(),
-    )
-}
+// ========== (parameter clipping is now inlined into train()'s host Adam via clip_parameters) ==========
 
 // ========== FSRSItem and FSRSReview ==========
 
@@ -1558,21 +1549,28 @@ fn train<B: AutodiffBackend>(
         None => Box::new(NoProgress {}),
     };
 
-    let mut model: Model<B> = parameters_to_model::<B>(initial_parameters, &B::Device::default());
     let schedule_penalty = schedule_penalty_fn();
     let l2_penalty = l2_penalty_fn();
-    let init_w = model.w.val();
-    let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
-    let mut optim = config.optimizer.init::<B, Model<B>>();
+    // Host-resident parameters + Adam state. The gradient is already analytic, so burn's optimizer
+    // was the LAST burn-tensor code in the per-step loop — each step round-tripped w through
+    // model.w.val().to_data().to_vec() (and again inside the clipper) plus a fresh GradientsParams.
+    // We keep w in a plain Vec<f32> and hand-roll Adam element-wise (see the loop below), so a step
+    // is now pure host arithmetic on 36 floats. parameters_to_model clips, so this start == the old
+    // model.w.val(); the returned Model is rebuilt once from best_w at the very end.
+    let mut w_host: Vec<f32> = clip_parameters(initial_parameters);
+    let init_w_vec = w_host.clone();
+    let mut adam_m = [0.0f32; 36]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1)
+    let mut adam_v = [0.0f32; 36]; // Adam 2nd moment (moment_2)
+    let mut adam_t = 0i32; // step count (AdaptiveMomentumState.time; becomes 1 on the first step)
 
     let mut best_loss = f64::INFINITY;
-    let mut best_model = model.clone();
+    let mut best_w = w_host.clone();
     // (Validation batches were pre-built above into valid_host + valid_order; each epoch scores
     // them with the analytic forward crate::analytic::batch_loss — same BCE math + [1e-5,1-1e-5]
     // clamp as burn's tensor forward, only the FP summation order differs, judged by the 3b band.)
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
-    // t_bwd = analytic gradient, t_opt = dummy+step+clip. (Per-step extract is gone — the train
-    // batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
+    // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
+    // train batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
     let (mut t_pen, mut t_bwd, mut t_opt, mut t_valid) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for epoch in 1..=config.num_epochs {
         // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
@@ -1587,7 +1585,7 @@ fn train<B: AutodiffBackend>(
             let progress = Progress::new(iteration, n_train_batches);
             let _tp = std::time::Instant::now();
             let l2_weight = L2_PENALTY_WEIGHT;
-            let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
+            let w_vec = w_host.clone();
             let (_l2_penalty_value, mut manual_grad) = l2_penalty(
                 &w_vec,
                 &init_w_vec,
@@ -1634,23 +1632,29 @@ fn train<B: AutodiffBackend>(
             }
             t_bwd += _tb.elapsed().as_secs_f64();
             let _to = std::time::Instant::now();
-            // Build the gradient container DIRECTLY from the analytic gradient — no autodiff at
-            // all. Previously a dummy `model.w.val().sum().backward()` created an empty grads
-            // container we then overwrote; even that trivial backward touched burn's Autodiff
-            // backend, whose global tensor ledger made the call cost scale with the number of
-            // live autodiff tensors (so it ballooned on large collections). The gradient VALUE
-            // reaching Adam is identical (total_grad_f32), so the SGD trajectory is bit-for-bit.
-            let w_id = model.w.id;
-            let inner_device = <B::InnerBackend as Backend>::Device::default();
-            let grad_tensor =
-                Tensor::<B::InnerBackend, 1>::from_floats(total_grad_f32.as_slice(), &inner_device);
-            let mut grads = GradientsParams::new();
-            grads.register::<B::InnerBackend, 1>(w_id, grad_tensor);
-            model = optim.step(lr, model, grads);
-            model.w = parameter_clipper(
-                model.w,
-                !config.model.freeze_short_term_stability,
-            );
+            // Hand-rolled Adam — replaces burn's tensor optimizer (the last burn code in the loop;
+            // it had round-tripped w through to_data().to_vec() + a fresh GradientsParams each step).
+            // Element-wise replica of burn 0.17's AdaptiveMomentum: m,v start at 0; time starts at 1;
+            // bias-correct by (1 - beta^t); epsilon OUTSIDE the sqrt; w -= lr * m_hat/(sqrt(v_hat)+eps).
+            // burn's first-step special case (m = g*factor) is just this formula with m=v=0, so the
+            // unified loop reproduces it. Same hyperparameters (ADAM_*) as the AdamConfig → the Adam
+            // math is identical; only the FP op order vs burn's ndarray kernels can differ (3b band).
+            adam_t += 1;
+            let bc1 = 1.0f32 - ADAM_BETA1.powi(adam_t);
+            let bc2 = 1.0f32 - ADAM_BETA2.powi(adam_t);
+            let f1 = 1.0f32 - ADAM_BETA1;
+            let f2 = 1.0f32 - ADAM_BETA2;
+            let lr_f32 = lr as f32;
+            for i in 0..36 {
+                let g = total_grad_f32[i];
+                adam_m[i] = adam_m[i] * ADAM_BETA1 + g * f1;
+                adam_v[i] = adam_v[i] * ADAM_BETA2 + g.powf(2.0) * f2;
+                let m_hat = adam_m[i] / bc1;
+                let v_hat = adam_v[i] / bc2;
+                w_host[i] -= lr_f32 * (m_hat / (v_hat.sqrt() + ADAM_EPS));
+            }
+            // The same clamp burn applied via parameter_clipper (clip_parameters), now in place.
+            w_host = clip_parameters(&w_host);
             t_opt += _to.elapsed().as_secs_f64();
             renderer.render_train(TrainingProgress {
                 progress,
@@ -1670,7 +1674,7 @@ fn train<B: AutodiffBackend>(
 
         let _tv = std::time::Instant::now();
         // w is fixed during validation, so extract it once per epoch (not per batch).
-        let w_vec_valid = model.w.val().to_data().to_vec::<f32>().unwrap();
+        let w_vec_valid = w_host.clone();
         let mut loss_valid = 0.0;
         for &vi in &valid_order {
             let vb = &train_host[vi];
@@ -1705,7 +1709,7 @@ fn train<B: AutodiffBackend>(
         info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
         if loss_valid < best_loss {
             best_loss = loss_valid;
-            best_model = model.clone();
+            best_w = w_host.clone();
         }
     }
     eprintln!(
@@ -1719,7 +1723,7 @@ fn train<B: AutodiffBackend>(
         return Err(FSRSError::Interrupted);
     }
 
-    Ok(best_model)
+    Ok(parameters_to_model::<B>(&best_w, &B::Device::default()))
 }
 
 struct NoProgress {}
