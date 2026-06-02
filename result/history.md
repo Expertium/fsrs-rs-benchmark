@@ -20,6 +20,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 13 | 577 | 538 | 1.075 | 5515 | 5522 | 1.001 | 1.003 | ✓ | accepted | share ln(last_s/last_sf/last_d) across curve + both stability traces; 3 fewer ln per timestep (bit-for-bit) |
 | 14 | 534 | 414 | 1.305 | 5522 | 5884 | 1.066 | 1.172 | ✓ | accepted | vectorize the validation forward with wide::f32x8 (8 cards/lane, exp8/ln8); bit-for-bit epoch selection |
 | 15 | 410 | 168 | 2.500 | 5884 | 6458 | 1.098 | 1.262 | ✓ | accepted | vectorize analytic gradient forward+backward with wide::f32x8 (8 cards/lane); pad batches to multiple of 8 |
+| 16 | 170 | 268 | 0.623 | 6458 | 6458 | 1.000 | 1.000 | ✓ | rejected | thread SIMD gradient across 2 cores (split card-groups) - REJECTED, vector units SMT-saturated |
 
 **Cumulative speed_ratio (product of accepted): ×18.176** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

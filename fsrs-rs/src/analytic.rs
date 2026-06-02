@@ -1119,6 +1119,12 @@ pub(crate) fn batch_loss_and_grad_simd(
 ) -> f64 {
     debug_assert!(batch % 8 == 0, "batch_loss_and_grad_simd needs batch padded to a multiple of 8");
     let n_groups = batch / 8;
+    // Single-threaded ON PURPOSE: iter16 tried splitting the groups across the worker's 2nd pinned
+    // CPU (mirroring iter3's scalar-grad threading) and REGRESSED to 0.62x. The f32x8 forward
+    // saturates the physical core's vector units with one thread, so the 2nd CPU (an SMT sibling
+    // sharing those units) adds no vector throughput — only spawn overhead. (iter3 helped because
+    // the SCALAR grad used scalar units SMT could overlap; vectorized work can't.) The idle 2nd core
+    // would need coarser-than-per-batch parallelism to pay off, which isn't worth the complexity.
     loss_and_grad_range_simd(
         w, t_hist, r_hist, seq_len, batch, delta_ts, labels, weights, gw, 0, n_groups,
     )
