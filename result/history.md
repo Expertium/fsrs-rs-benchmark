@@ -30,6 +30,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 23 | 33 | 30 | 1.096 | 7180 | 7219 | 1.005 | 1.014 | ✓ | accepted | Windowed-only cruder minimax via const-generic FAST: exp8 deg3->deg2 + ln8 deg2->deg1; benchmark path bit-for-bit |
 | 24 | 30 | 28 | 1.053 | 7219 | 7231 | 1.002 | 1.004 | ✓ | accepted | Fuse 3 exp-pairs/timestep (curve se, stab pr x2) + skip dead last-timestep state-update in validation forward |
 | 25 | 28 | 28 | 1.054 | 7231 | 7257 | 1.004 | 1.009 | ✓ | accepted | Gradient skip-last (curve-only at final timestep) + cached sort-key + merged longest-prefix scan; bit-for-bit |
+| 26 | 27 | 26 | 1.041 | 7257 | 7285 | 1.004 | 1.010 | ✓ | rejected | Per-group padding skip: each group runs only to its longest card, not the batch-wide seq_len |
 
 **Cumulative speed_ratio (product of accepted): ×112.724** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
