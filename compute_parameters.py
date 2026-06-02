@@ -173,15 +173,23 @@ def build_reviews(row: pd.Series, *, include_current: bool = False) -> List[FSRS
     return [FSRSReview(delta_t=t, rating=r) for t, r in zip(t_history, r_history)]
 
 
-def convert_to_items(df: pd.DataFrame) -> List[FSRSItem]:
-    """Convert a DataFrame to FSRSItems for fsrs-rs, ordered globally by review_th."""
-    pairs = []  # (review_th, FSRSItem)
-    for _, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
+def convert_to_items(df: pd.DataFrame) -> tuple[List[FSRSItem], List[int]]:
+    """Convert a DataFrame to FSRSItems for fsrs-rs, ordered globally by review_th.
+
+    Also returns each item's originating card id (parallel list, same order) so the optimizer can
+    group a card's expanding-window prefix-items into one mini-batch (the O(N) window path). The
+    items list and ordering are unchanged vs. before, so log loss / timing are unaffected by this.
+    """
+    pairs = []  # (review_th, card_id, FSRSItem)
+    for card_id, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
         for _, row in group.iterrows():
             item = FSRSItem(reviews=build_reviews(row, include_current=True))
-            pairs.append((row["review_th"], item))
+            pairs.append((row["review_th"], int(card_id), item))
+    # Sort by review_th only (the key); ties keep insertion order and never compare the items.
     pairs.sort(key=lambda pair: pair[0])
-    return [item for _, item in pairs]
+    items = [item for _, _, item in pairs]
+    card_ids = [cid for _, cid, _ in pairs]
+    return items, card_ids
 
 
 parser = create_parser()
@@ -204,7 +212,7 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
     """Train with compute_parameters() and score with evaluate(); train set == test set."""
     del device_id
     dataset = UserDataLoader(config).load_user_data(user_id)
-    items = convert_to_items(dataset)
+    items, card_ids = convert_to_items(dataset)
 
     backend = FSRS(parameters=[])
     # compute_parameters() is deterministic (seeded), so params are identical
@@ -212,7 +220,13 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
     times_ms = []
     params: List[float] = []
     for _ in range(TIMING_REPEATS):
-        params, secs = backend.compute_parameters(items)
+        try:
+            params, secs = backend.compute_parameters(items, card_ids)
+        except TypeError:
+            # Champion/baseline builds that predate the card_ids arg take items only. The
+            # TypeError is raised by PyO3 arg parsing BEFORE the Rust timer starts, so the
+            # fallback call's `secs` is still a clean compute_parameters() timing.
+            params, secs = backend.compute_parameters(items)
         times_ms.append(secs * 1000.0)
     params = [round(w, 4) for w in params]
 

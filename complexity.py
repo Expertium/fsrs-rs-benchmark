@@ -50,14 +50,14 @@ _REPO_ROOT = Path(__file__).resolve().parent
 # `profiling/` holds profiling-only tooling (constraint 10) that is never imported
 # by the timed compute_parameters() path, so it is excluded from the complexity score.
 _SKIP_DIRS = {"target", "__pycache__", ".git", "profiling"}
-# Read-only tooling — the results aggregator, the history plotter, and this
-# complexity scorer itself — is not part of the optimization's mutation surface,
-# so it is excluded from the score (per CLAUDE.md). benchmark.py is excluded too:
-# it is the correctness-reference harness, only ever run for the bit-for-bit check,
-# never on the optimization's timed path. Still COUNTED: compute_parameters.py and
-# its preprocessing (config/data_loader/utils/features/*, fsrs_rs_python/__init__),
-# where the "no moving Rust into untimed Python" rule applies.
-_SKIP_FILES = {"benchmark.py", "complexity.py", "evaluate.py", "plot_history.py"}
+# Read-only tooling — the results aggregator, the history plotter, the history logger, and
+# this complexity scorer itself — is not part of the optimization's mutation surface, so it is
+# excluded from the score (per CLAUDE.md). benchmark.py is excluded too: it is the
+# correctness-reference harness, only ever run for the bit-for-bit check, never on the
+# optimization's timed path. Still COUNTED: compute_parameters.py and its preprocessing
+# (config/data_loader/utils/features/*, fsrs_rs_python/__init__), where the "no moving Rust
+# into untimed Python" rule applies.
+_SKIP_FILES = {"benchmark.py", "complexity.py", "evaluate.py", "plot_history.py", "log_history.py"}
 
 
 def _collect_files(root: Path, suffix: str) -> list[Path]:

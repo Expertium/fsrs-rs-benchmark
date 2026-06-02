@@ -774,10 +774,13 @@ impl FSRSItem {
     }
 }
 
-pub fn filter_outlier(
+/// Compute the outlier-removed (rating, delta_t) buckets from the initialization subset, plus the
+/// `filtered_items` retained for parameter initialization. Split out of `filter_outlier` so the
+/// card-aware training path can reuse the exact same `removed_pairs` to retain items AND their
+/// card ids in lockstep. Behaviour is byte-identical to the original inlined logic.
+fn compute_outlier_removed_pairs(
     dataset_for_initialization: Vec<FSRSItem>,
-    mut trainset: Vec<FSRSItem>,
-) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+) -> (Vec<FSRSItem>, [HashSet<u32>; 5]) {
     let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
     let from_key = |key: u32| f32::from_bits(key);
     let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
@@ -793,7 +796,7 @@ pub fn filter_outlier(
     }
 
     let mut filtered_items = vec![];
-    let mut removed_pairs: [HashSet<_>; 5] = Default::default();
+    let mut removed_pairs: [HashSet<u32>; 5] = Default::default();
 
     for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
         let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
@@ -823,14 +826,26 @@ pub fn filter_outlier(
             }
         }
     }
-    trainset.retain(|item| {
-        if item.long_term_review_cnt() == 0 {
-            true
-        } else {
-            !removed_pairs[item.reviews[0].rating as usize]
-                .contains(&to_key(item.first_long_term_review().delta_t))
-        }
-    });
+    (filtered_items, removed_pairs)
+}
+
+/// The retain predicate shared by `filter_outlier` and the card-aware path: keep an item unless
+/// its (rating, first-long-term-delta_t) bucket was flagged as an outlier.
+fn item_survives_outlier(item: &FSRSItem, removed_pairs: &[HashSet<u32>; 5]) -> bool {
+    if item.long_term_review_cnt() == 0 {
+        true
+    } else {
+        let key = bucket_long_term_delta_t(item.first_long_term_review().delta_t).to_bits();
+        !removed_pairs[item.reviews[0].rating as usize].contains(&key)
+    }
+}
+
+pub fn filter_outlier(
+    dataset_for_initialization: Vec<FSRSItem>,
+    mut trainset: Vec<FSRSItem>,
+) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+    let (filtered_items, removed_pairs) = compute_outlier_removed_pairs(dataset_for_initialization);
+    trainset.retain(|item| item_survives_outlier(item, &removed_pairs));
     (filtered_items, trainset)
 }
 
@@ -840,6 +855,12 @@ pub fn filter_outlier(
 pub(crate) struct WeightedFSRSItem {
     pub weight: f32,
     pub item: FSRSItem,
+    /// Originating card id (>= 0) when the windowed (card-grouped) path is active, else -1.
+    /// Lets build_host_batches group all of a card's prefix-items into the SAME mini-batch so
+    /// the O(N) expanding-window forward (one pass per card, a loss at every timestep) can later
+    /// replace the O(N^2) per-prefix forward without changing which losses share an Adam step.
+    /// recency_weighted_fsrs_items (used by the frozen evaluate() path) leaves this -1.
+    pub card_id: i64,
 }
 
 #[derive(Clone)]
@@ -964,6 +985,9 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
             // C0 = 0.0666667, EXP = 11.25.
             weight: 0.0666667 + 0.9333333 * (idx as f32 / length).powf(11.25),
             item,
+            // -1 = "no card grouping" (the evaluate()/benchmark() paths). compute_parameters()
+            // overwrites this with the real card id after weighting (order is preserved).
+            card_id: -1,
         })
         .collect()
 }
@@ -977,6 +1001,35 @@ pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec
         (dataset_for_initialization, trainset) = filter_outlier(dataset_for_initialization, items);
     }
     (dataset_for_initialization, trainset)
+}
+
+/// Card-aware twin of `prepare_training_data`: applies the exact same outlier retain but to the
+/// `items` AND their parallel `card_ids` together (the retain is order-preserving), so each kept
+/// prefix-item keeps its originating card id for the windowed (card-grouped) training path.
+/// Returns `(init_set, trainset, trainset_card_ids)` with the trainset in the same chronological
+/// order as `prepare_training_data` produces.
+pub(crate) fn prepare_training_data_carded(
+    items: Vec<FSRSItem>,
+    card_ids: Vec<i64>,
+) -> (Vec<FSRSItem>, Vec<FSRSItem>, Vec<i64>) {
+    let dataset_for_initialization: Vec<FSRSItem> = items
+        .iter()
+        .filter(|item| item.long_term_review_cnt() == 1)
+        .cloned()
+        .collect();
+    if std::env::var("FSRS_NO_OUTLIER").is_ok() {
+        return (dataset_for_initialization, items, card_ids);
+    }
+    let (filtered_items, removed_pairs) = compute_outlier_removed_pairs(dataset_for_initialization);
+    let mut trainset = Vec::with_capacity(items.len());
+    let mut trainset_card_ids = Vec::with_capacity(items.len());
+    for (item, cid) in items.into_iter().zip(card_ids) {
+        if item_survives_outlier(&item, &removed_pairs) {
+            trainset.push(item);
+            trainset_card_ids.push(cid);
+        }
+    }
+    (filtered_items, trainset, trainset_card_ids)
 }
 
 // ========== BCE Loss ==========
@@ -1127,6 +1180,10 @@ pub struct ComputeParametersInput {
     pub enable_sched_penalties: bool,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
+    /// Optional per-item card ids, parallel to `train_set` (same order). When present, training
+    /// groups each card's expanding-window prefix-items into the same mini-batch (the O(N) window
+    /// path); when `None`, training is unchanged (each prefix-item batched independently).
+    pub card_ids: Option<Vec<i64>>,
 }
 
 impl Default for ComputeParametersInput {
@@ -1137,6 +1194,7 @@ impl Default for ComputeParametersInput {
             enable_short_term: true,
             enable_sched_penalties: false,
             num_relearning_steps: None,
+            card_ids: None,
         }
     }
 }
@@ -1169,6 +1227,7 @@ pub fn compute_parameters(
         enable_short_term,
         enable_sched_penalties,
         num_relearning_steps,
+        card_ids,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -1179,7 +1238,19 @@ pub fn compute_parameters(
     };
 
     let train_set = normalize_training_set(train_set);
-    let (_, train_set) = prepare_training_data(train_set);
+    // Carry card ids through the (order-preserving) outlier retain when they are supplied so the
+    // expanding-window prefix-items can be grouped per card downstream; otherwise behave exactly
+    // as before.
+    let (train_set, train_card_ids) = match card_ids {
+        Some(card_ids) => {
+            let (_, train_set, train_card_ids) = prepare_training_data_carded(train_set, card_ids);
+            (train_set, Some(train_card_ids))
+        }
+        None => {
+            let (_, train_set) = prepare_training_data(train_set);
+            (train_set, None)
+        }
+    };
     if train_set.len() < 8 {
         finish_progress();
         return Ok(DEFAULT_PARAMETERS.to_vec());
@@ -1205,6 +1276,14 @@ pub fn compute_parameters(
     )
     .with_enable_sched_penalties(enable_sched_penalties);
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
+    // Attach card ids (still aligned: recency weighting preserves order). The later max_seq_len
+    // retain is order-preserving too, so card_id rides along inside each WeightedFSRSItem.
+    if let Some(train_card_ids) = &train_card_ids {
+        debug_assert_eq!(train_card_ids.len(), weighted_train_set.len());
+        for (wi, &cid) in weighted_train_set.iter_mut().zip(train_card_ids.iter()) {
+            wi.card_id = cid;
+        }
+    }
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
 
     if let Some(progress) = &progress {
@@ -1298,50 +1377,150 @@ struct BatchHost {
     real_batch_size: usize,
     th: Vec<f32>,
     rh: Vec<f32>,
+    /// Plain path: `dts`/`lbl`/`wts` are [bsz] (one prediction per column, scored at the final
+    /// curve). Windowed path (`windowed == true`): `lbl`/`wts` are [seq, bsz] (a prediction at every
+    /// timestep t>=1 with wts>0) and `dts` is empty — the per-step delta_t is just `th[t]`.
     dts: Vec<f32>,
     lbl: Vec<f32>,
     wts: Vec<f32>,
+    /// The O(N) expanding-window layout: each column is a whole card, scored at every timestep.
+    windowed: bool,
 }
 
-/// Build the per-batch host arrays DIRECTLY from the (weighted) items, replicating EXACTLY what
-/// `BatchTensorDataset::new(FSRSDataset::from(items), batch_size)` + per-batch `to_data().to_vec()`
-/// produced — but with NO burn tensors. Those tensors were pure overhead here: a full second copy
-/// of the data, built then immediately extracted into these host Vecs and dropped. Same sort (by
-/// review length), same chunking, same [seq, batch] row-major 0-padding, so it is BIT-FOR-BIT.
+/// Build ONE batch's host arrays from a slice of weighted prefix-items (each item = one column,
+/// its loss at its last review). Same [seq, batch] row-major 0-padding as the old FSRSBatcher.
+fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
+    let real_bsz = chunk.len();
+    // Pad the card count up to a multiple of 8 so the f32x8 forward/gradient never has a ragged
+    // tail group. The pad columns stay all-zero with weight 0: their forward is finite and their
+    // loss/gradient contribution is exactly 0 (weight 0), so the result is unchanged.
+    // real_batch_size keeps the TRUE count (the penalty scaling uses it).
+    let bsz = real_bsz.div_ceil(8) * 8;
+    // pad_size = (max reviews per card in this chunk) - 1   (matches FSRSBatcher)
+    let seq = chunk.iter().map(|x| x.item.reviews.len()).max().unwrap() - 1;
+    let mut th = vec![0.0f32; seq * bsz];
+    let mut rh = vec![0.0f32; seq * bsz];
+    let mut dts = vec![0.0f32; bsz];
+    let mut lbl = vec![0.0f32; bsz];
+    let mut wts = vec![0.0f32; bsz];
+    for (c, wi) in chunk.iter().enumerate() {
+        let reviews = &wi.item.reviews;
+        // history() = every review except the last; row-major [seq, bsz] => index t*bsz + c.
+        // Entries past this card's history stay 0.0 (the pad).
+        for (t, r) in reviews.iter().take(reviews.len() - 1).enumerate() {
+            th[t * bsz + c] = r.delta_t;
+            rh[t * bsz + c] = r.rating as f32;
+        }
+        let current = reviews.last().unwrap();
+        dts[c] = current.delta_t;
+        lbl[c] = if current.rating == 1 { 0.0 } else { 1.0 };
+        wts[c] = wi.weight;
+    }
+    BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts, windowed: false }
+}
+
+/// Build ONE windowed batch's host arrays from a slice of weighted prefix-items spanning whole cards
+/// (the O(N) expanding-window layout). Re-groups the prefix-items by their originating card; each card
+/// becomes ONE column holding its FULL review sequence (taken from the card's longest surviving prefix
+/// — every shorter prefix is a head of it). A surviving prefix of length L predicts review L-1, so its
+/// recency weight is placed at wts[(L-1)*bsz + c] (label likewise); every other (t, c) stays weight 0
+/// (a filtered middle prefix, t==0, or padding). real_batch_size = the prediction count = chunk.len(),
+/// matching the per-prefix path so the penalty scaling is unchanged.
+fn build_batch_host_windowed(chunk: &[WeightedFSRSItem]) -> BatchHost {
+    let predictions = chunk.len();
+    // Group this batch's prefix-items by card.
+    let mut cards: HashMap<i64, Vec<&WeightedFSRSItem>> = HashMap::new();
+    for wi in chunk {
+        cards.entry(wi.card_id).or_default().push(wi);
+    }
+    // Deterministic column order (card_id is unique), matching group_cards_into_batches' ordering.
+    let mut card_list: Vec<(i64, Vec<&WeightedFSRSItem>)> = cards.into_iter().collect();
+    let full_len = |prefixes: &[&WeightedFSRSItem]| {
+        prefixes.iter().map(|wi| wi.item.reviews.len()).max().unwrap_or(0)
+    };
+    card_list.sort_by_key(|(cid, prefixes)| (full_len(prefixes), *cid));
+    let n_cards = card_list.len();
+    // Pad the card/column count up to a multiple of 8 (all-zero pad columns, weight 0).
+    let bsz = n_cards.div_ceil(8) * 8;
+    // seq = the longest full card length in the batch (= max reviews per surviving prefix).
+    let seq = card_list.iter().map(|(_, p)| full_len(p)).max().unwrap_or(0);
+    let mut th = vec![0.0f32; seq * bsz];
+    let mut rh = vec![0.0f32; seq * bsz];
+    let mut lbl = vec![0.0f32; seq * bsz];
+    let mut wts = vec![0.0f32; seq * bsz];
+    for (c, (_cid, prefixes)) in card_list.iter().enumerate() {
+        // The longest surviving prefix carries the card's full review list q[0..K'-1]; lay it in.
+        let longest = prefixes.iter().max_by_key(|wi| wi.item.reviews.len()).unwrap();
+        for (t, r) in longest.item.reviews.iter().enumerate() {
+            th[t * bsz + c] = r.delta_t;
+            rh[t * bsz + c] = r.rating as f32;
+        }
+        // Each surviving prefix of length L scores review L-1 at timestep t = L-1 (L >= 2 => t >= 1).
+        for wi in prefixes {
+            let t = wi.item.reviews.len() - 1;
+            let current = wi.item.reviews.last().unwrap();
+            wts[t * bsz + c] = wi.weight;
+            lbl[t * bsz + c] = if current.rating == 1 { 0.0 } else { 1.0 };
+        }
+    }
+    BatchHost {
+        seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl, wts, windowed: true,
+    }
+}
+
+/// Windowed path (card ids present): group every prefix-item by its originating card and pack
+/// WHOLE cards into batches of at most `batch_size` predictions (a card is never split). Cards are
+/// ordered by full sequence length (tie-broken by card id) so a batch's prefix-items stay
+/// length-similar — less SIMD padding — and the order is reproducible. This is the ONLY change vs
+/// the plain path: each Adam step now sees a whole card's predictions together, exactly as the
+/// upcoming O(N) single-pass-per-card forward will, so this faithfully previews that trajectory.
+fn group_cards_into_batches(
+    items: Vec<WeightedFSRSItem>,
+    batch_size: usize,
+) -> Vec<Vec<WeightedFSRSItem>> {
+    let mut cards: HashMap<i64, Vec<WeightedFSRSItem>> = HashMap::new();
+    for wi in items {
+        cards.entry(wi.card_id).or_default().push(wi);
+    }
+    let mut card_list: Vec<Vec<WeightedFSRSItem>> = cards.into_values().collect();
+    // Total order (card_id is unique per card), so independent of HashMap iteration order.
+    card_list.sort_by_key(|prefixes| {
+        let full_len = prefixes
+            .iter()
+            .map(|wi| wi.item.reviews.len())
+            .max()
+            .unwrap_or(0);
+        (full_len, prefixes[0].card_id)
+    });
+    let mut batches: Vec<Vec<WeightedFSRSItem>> = Vec::new();
+    let mut current: Vec<WeightedFSRSItem> = Vec::new();
+    for prefixes in card_list {
+        if !current.is_empty() && current.len() + prefixes.len() > batch_size {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.extend(prefixes);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Build the per-batch host arrays DIRECTLY from the (weighted) items — no burn tensors.
+/// Two batching modes:
+///  * Plain (card_id == -1, the benchmark()/evaluate() paths): sort by review length, chunk into
+///    `batch_size` groups — BIT-FOR-BIT identical to the old BatchTensorDataset path.
+///  * Windowed (card_id >= 0, the compute_parameters() path): group each card's prefix-items into
+///    one batch (see group_cards_into_batches) so the per-card predictions share an Adam step.
 fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<BatchHost> {
+    if items.first().is_some_and(|wi| wi.card_id >= 0) {
+        return group_cards_into_batches(items, batch_size)
+            .iter()
+            .map(|batch| build_batch_host_windowed(batch))
+            .collect();
+    }
     let items = sort_items_by_review_length(items);
-    items
-        .chunks(batch_size)
-        .map(|chunk| {
-            let real_bsz = chunk.len();
-            // Pad the card count up to a multiple of 8 so the f32x8 forward/gradient never has a
-            // ragged tail group. The pad columns stay all-zero with weight 0: their forward is
-            // finite and their loss/gradient contribution is exactly 0 (weight 0), so the result is
-            // unchanged. real_batch_size keeps the TRUE count (the penalty scaling uses it).
-            let bsz = real_bsz.div_ceil(8) * 8;
-            // pad_size = (max reviews per card in this chunk) - 1   (matches FSRSBatcher)
-            let seq = chunk.iter().map(|x| x.item.reviews.len()).max().unwrap() - 1;
-            let mut th = vec![0.0f32; seq * bsz];
-            let mut rh = vec![0.0f32; seq * bsz];
-            let mut dts = vec![0.0f32; bsz];
-            let mut lbl = vec![0.0f32; bsz];
-            let mut wts = vec![0.0f32; bsz];
-            for (c, wi) in chunk.iter().enumerate() {
-                let reviews = &wi.item.reviews;
-                // history() = every review except the last; row-major [seq, bsz] => index t*bsz + c.
-                // Entries past this card's history stay 0.0 (the pad).
-                for (t, r) in reviews.iter().take(reviews.len() - 1).enumerate() {
-                    th[t * bsz + c] = r.delta_t;
-                    rh[t * bsz + c] = r.rating as f32;
-                }
-                let current = reviews.last().unwrap();
-                dts[c] = current.delta_t;
-                lbl[c] = if current.rating == 1 { 0.0 } else { 1.0 };
-                wts[c] = wi.weight;
-            }
-            BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts }
-        })
-        .collect()
+    items.chunks(batch_size).map(build_batch_host).collect()
 }
 
 fn train<B: AutodiffBackend>(
@@ -1433,9 +1612,16 @@ fn train<B: AutodiffBackend>(
             // plus the manual L2/schedule penalty gradient.
             let _tb = std::time::Instant::now();
             let mut total_grad = [0.0f64; 36];
-            crate::analytic::batch_loss_and_grad_simd(
-                &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
-            );
+            if hb.windowed {
+                // O(N) expanding-window grad: one pass per card, a loss at every timestep.
+                crate::analytic::card_loss_and_grad_simd(
+                    &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, &mut total_grad,
+                );
+            } else {
+                crate::analytic::batch_loss_and_grad_simd(
+                    &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
+                );
+            }
             let mut total_grad_f32 = [0.0f32; 36];
             for i in 0..36 {
                 total_grad_f32[i] = total_grad[i] as f32 + manual_grad.get(i).copied().unwrap_or(0.0);
@@ -1503,9 +1689,15 @@ fn train<B: AutodiffBackend>(
             let (schedule_value, _) =
                 schedule_penalty(&w_vec_valid, vb.real_batch_size, config.enable_sched_penalties);
             let schedule_penalty = schedule_value / total_size as f64;
-            let bce = crate::analytic::batch_loss_simd(
-                &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.dts, &vb.lbl, &vb.wts,
-            );
+            let bce = if vb.windowed {
+                crate::analytic::card_loss_simd(
+                    &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.lbl, &vb.wts,
+                )
+            } else {
+                crate::analytic::batch_loss_simd(
+                    &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.dts, &vb.lbl, &vb.wts,
+                )
+            };
             loss_valid += bce + l2_penalty_value + schedule_penalty;
 
             if interrupter.should_stop() {

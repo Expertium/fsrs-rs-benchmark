@@ -18,13 +18,23 @@ impl FSRS {
     /// Returns `(optimized_parameters, elapsed_seconds)`. Only the Rust
     /// `compute_parameters()` call is timed, with a monotonic clock; the
     /// PyO3 input conversion above it is excluded and Python stays untimed.
-    pub fn compute_parameters(&self, train_set: Vec<FSRSItem>) -> (Vec<f32>, f64) {
+    ///
+    /// `card_ids` (optional, parallel to `train_set`) labels each prefix-item with its originating
+    /// card so training can group a card's expanding-window prefixes into one mini-batch (the O(N)
+    /// window path). It is plain metadata Python already has; the timed work is unchanged.
+    #[pyo3(signature = (train_set, card_ids=None))]
+    pub fn compute_parameters(
+        &self,
+        train_set: Vec<FSRSItem>,
+        card_ids: Option<Vec<i64>>,
+    ) -> (Vec<f32>, f64) {
         let input = ComputeParametersInput {
             train_set: train_set.iter().map(|x| x.0.clone()).collect(),
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: false,
             num_relearning_steps: None,
+            card_ids,
         };
         let start = std::time::Instant::now();
         let params = fsrs::compute_parameters(input).unwrap_or_default();
@@ -51,6 +61,7 @@ impl FSRS {
             enable_short_term: true,
             enable_sched_penalties: false,
             num_relearning_steps: None,
+            card_ids: None,
         })
     }
 

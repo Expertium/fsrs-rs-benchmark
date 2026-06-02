@@ -936,6 +936,19 @@ enum Step8 {
     },
 }
 
+impl Step8 {
+    /// The retrievability the curve predicted at this step (= the loss target R_t in the windowed
+    /// O(N) forward). The first review (t==0) makes no prediction, so it returns 0 (the windowed
+    /// kernels never score t==0; the minimum surviving prefix length is 2).
+    #[inline(always)]
+    fn curve_out(&self) -> f32x8 {
+        match self {
+            Step8::Full { curve, .. } => curve.out,
+            Step8::First { .. } => f32x8::splat(0.0),
+        }
+    }
+}
+
 /// One recurrence step over 8 cards. `first` (t==0) initialises state from the rating exactly like
 /// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
 /// then the rating==0 padding passthrough). Returns the new state and the backward cache.
@@ -990,9 +1003,13 @@ fn step8_fwd(
 }
 
 /// VJP of one step (f32x8 analogue of step_bwd). Given output-state adjoints, returns input-state
-/// adjoints and accumulates the weight gradient into `gw`.
+/// adjoints and accumulates the weight gradient into `gw`. `g_r_loss` is the adjoint of any loss
+/// scored directly off this step's curve.out (nonzero only in the windowed O(N) forward, where every
+/// step emits a prediction); it is added to the two stab r-adjoints before curve8_bwd, since curve.out
+/// feeds the loss AND both stability traces. The O(N^2) callers pass 0 (their loss is the separate
+/// final curve). The First variant ignores it (t==0 makes no prediction).
 fn step8_bwd(
-    w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), gw: &mut [f32x8; 36], wc: &WConsts,
+    w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), g_r_loss: f32x8, gw: &mut [f32x8; 36], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
     let one = k(1.0);
@@ -1036,8 +1053,10 @@ fn step8_bwd(
             let (g_lsf_b, g_ld_b, g_r_b) =
                 stab8_bwd(w, fast, *last_sf, *last_d, curve.out, *rating, 16, g_nsf2, gw);
             let g_ld_c = next_d8_bwd(*nd_out_pre, *nd_delta_d, *last_d, *rating, g_nd2, gw, wc.exp3w5);
-            let (g_ls_d, g_lsf_d, g_ld_d) =
-                curve8_bwd(w, curve, *dt, *last_s, *last_sf, *last_d, g_r_a + g_r_b, gw, wc.ln_w27, wc.ln_w28);
+            let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
+                w, curve, *dt, *last_s, *last_sf, *last_d, g_r_a + g_r_b + g_r_loss, gw, wc.ln_w27,
+                wc.ln_w28,
+            );
             let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
             let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
             let g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d + g_last_d_extra;
@@ -1100,7 +1119,9 @@ fn loss_and_grad_range_simd(
         let (mut g_s, mut g_sf, mut g_d) =
             curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, &mut gw_g, wc.ln_w27, wc.ln_w28);
         for t in (0..seq_len).rev() {
-            let (gs0, gd0, gsf0) = step8_bwd(w, &caches[t], (g_s, g_d, g_sf), &mut gw_g, &wc);
+            // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
+            let (gs0, gd0, gsf0) =
+                step8_bwd(w, &caches[t], (g_s, g_d, g_sf), f32x8::splat(0.0), &mut gw_g, &wc);
             g_s = gs0;
             g_d = gd0;
             g_sf = gsf0;
@@ -1131,6 +1152,121 @@ pub(crate) fn batch_loss_and_grad_simd(
     loss_and_grad_range_simd(
         w, t_hist, r_hist, seq_len, batch, delta_ts, labels, weights, gw, 0, n_groups,
     )
+}
+
+// ===================== SIMD windowed O(N) forward+backward (8 cards/lane) =====================
+// The O(N^2) -> O(N) expanding window. A card with K reviews became K-1 prefix-items (lengths 2..K),
+// each re-running the recurrence over its whole prefix => O(K^2) timestep-work. Here each CARD is a
+// single column whose recurrence runs ONCE over its full review sequence: at step t (t>=1) the curve
+// curve8_fwd(state_{t-1}, delta_t[t]) it computes for the stability update IS EXACTLY the prediction
+// R_t the length-(t+1) prefix used to score review t (same input state, same delta_t), so a loss is
+// read off every step for free. wts/lbl are row-major [seq, bsz]; wts[t][c]==0 marks "no prediction"
+// (t==0, an outlier-filtered prefix, or a padding column/timestep). The total loss and gradient equal
+// the per-prefix sums (the recurrence is deterministic), so this is math-identical to the O(N^2) path
+// up to FP reassociation — judged by the 3b average-log-loss band (build_host_batches groups the SAME
+// cards-as-units as the Phase-1 probe, so the trained params match it modulo FP).
+
+/// Windowed forward + reverse-mode backward for one card-grouped batch. Accumulates d(loss)/d(w) into
+/// `gw` (length 36); the loss VALUE is unused by training (only the gradient drives Adam), so the f64
+/// per-lane BCE is skipped here and 0.0 is returned — validation uses `card_loss_simd`. Batch padded
+/// to a multiple of 8.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn card_loss_and_grad_simd(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    labels: &[f32], weights: &[f32], gw: &mut [f64],
+) -> f64 {
+    debug_assert!(batch % 8 == 0, "card_loss_and_grad_simd needs batch padded to a multiple of 8");
+    let wc = wconsts(w);
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let z = k(0.0);
+    let n_groups = batch / 8;
+    let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
+    for g in 0..n_groups {
+        let c0 = g * 8;
+        caches.clear();
+        let (mut s, mut d, mut sf) = (z, z, z);
+        for t in 0..seq_len {
+            let base = t * batch + c0;
+            let rating = load8(r_hist, base);
+            let dt = if t == 0 { z } else { load8(t_hist, base) };
+            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            s = ns.0;
+            d = ns.1;
+            sf = ns.2;
+            caches.push(cache);
+        }
+        // Reverse pass. The final state (output of the last step) feeds no downstream loss, so its
+        // adjoint starts at 0; each step t>=1 injects its own per-timestep loss adjoint on curve.out.
+        let mut gw_g = [f32x8::splat(0.0); 36];
+        let (mut g_s, mut g_d, mut g_sf) = (z, z, z);
+        for t in (0..seq_len).rev() {
+            let g_r_loss = if t == 0 {
+                z // init step: no prediction (the minimum surviving prefix length is 2).
+            } else {
+                let base = t * batch + c0;
+                let wt = load8(weights, base);
+                let lbl = load8(labels, base);
+                let r_raw = caches[t].curve_out();
+                let r = clamp8(r_raw, MIN_R, MAX_R);
+                // d/dr of -wt*BCE, with the [MIN_R,MAX_R] clamp zeroing the adjoint outside the range.
+                // Padding / filtered steps have wt==0 -> g_r==0 (r is clamped, so lbl/r never NaNs).
+                let g_r = (z - wt) * (lbl / r - (one - lbl) / (one - r));
+                (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
+            };
+            let (gs0, gd0, gsf0) =
+                step8_bwd(w, &caches[t], (g_s, g_d, g_sf), g_r_loss, &mut gw_g, &wc);
+            g_s = gs0;
+            g_d = gd0;
+            g_sf = gsf0;
+        }
+        for i in 0..36 {
+            gw[i] += gw_g[i].reduce_add() as f64;
+        }
+    }
+    0.0
+}
+
+/// Windowed forward-only BCE loss (validation) — `card_loss_and_grad_simd`'s forward without the
+/// backward. Emits a per-lane f64 BCE at every t>=1 with wts>0 (matching `batch_loss_simd`'s f64
+/// accumulation). Batch padded to a multiple of 8.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn card_loss_simd(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    labels: &[f32], weights: &[f32],
+) -> f64 {
+    let wc = wconsts(w);
+    let k = f32x8::splat;
+    let z = k(0.0);
+    let mut loss = 0.0f64;
+    let n_groups = batch / 8;
+    for g in 0..n_groups {
+        let c0 = g * 8;
+        let (mut s, mut d, mut sf) = (z, z, z);
+        for t in 0..seq_len {
+            let base = t * batch + c0;
+            let rating = load8(r_hist, base);
+            let dt = if t == 0 { z } else { load8(t_hist, base) };
+            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            s = ns.0;
+            d = ns.1;
+            sf = ns.2;
+            if t >= 1 {
+                let r = clamp8(cache.curve_out(), MIN_R, MAX_R).to_array();
+                for (j, &rr) in r.iter().enumerate() {
+                    let idx = base + j;
+                    let wt = weights[idx] as f64;
+                    if wt != 0.0 {
+                        let rr = rr as f64;
+                        loss += -wt
+                            * (labels[idx] as f64 * rr.ln()
+                                + (1.0 - labels[idx] as f64) * (1.0 - rr).ln());
+                    }
+                }
+            }
+        }
+    }
+    loss
 }
 
 /// Forward + reverse-mode backward over cards `[start, end)`; accumulates d(loss)/d(w)
@@ -1207,6 +1343,64 @@ pub(crate) fn batch_loss_and_grad(
         }
         loss_a + loss_b
     })
+}
+
+/// Scalar O(N) windowed forward+backward — the trusted oracle for `card_loss_and_grad_simd`. Same
+/// algorithm in scalar f64, reusing the UNMODIFIED scalar `step_fwd`/`step_bwd`: each step's loss
+/// adjoint flows back through a SEPARATE `curve_bwd` call rather than a `g_r_loss` param. That is
+/// equivalent because `curve_bwd` is linear in its output adjoint, so `curve_bwd(g_r_loss)` plus
+/// `step_bwd`'s internal `curve_bwd(g_r_a+g_r_b)` sum to the same total (gw and state adjoints) as
+/// the SIMD kernel's single `curve8_bwd(g_r_a+g_r_b+g_r_loss)`. labels/weights are [seq, batch].
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn loss_and_grad_range_window(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    labels: &[f32], weights: &[f32], gw: &mut [f64], start: usize, end: usize,
+) -> f64 {
+    let wc = wconsts(w);
+    let mut loss = 0.0f64;
+    let mut caches: Vec<StepCache> = Vec::with_capacity(seq_len);
+    for c in start..end {
+        caches.clear();
+        let mut state = (0.0f32, 0.0f32, 0.0f32);
+        for t in 0..seq_len {
+            let dt = if t == 0 { 0.0 } else { t_hist[t * batch + c] };
+            let (ns, cache) = step_fwd(w, dt, r_hist[t * batch + c], state, t == 0, &wc);
+            state = ns;
+            caches.push(cache);
+        }
+        for t in 1..seq_len {
+            let wt = weights[t * batch + c] as f64;
+            if wt != 0.0 {
+                let r = clamp(caches[t].curve.out, MIN_R, MAX_R) as f64;
+                let lbl = labels[t * batch + c] as f64;
+                loss += -wt * (lbl * r.ln() + (1.0 - lbl) * (1.0 - r).ln());
+            }
+        }
+        // Reverse: state-update adjoint via step_bwd, per-step loss adjoint via a separate curve_bwd.
+        let mut g_state = (0.0f64, 0.0f64, 0.0f64); // (g_s, g_d, g_sf), matching step_bwd's order.
+        for t in (0..seq_len).rev() {
+            let (gs_step, gd_step, gsf_step) = step_bwd(w, &caches[t], g_state, gw, &wc);
+            let (gs_loss, gd_loss, gsf_loss) = if t >= 1 {
+                let wt = weights[t * batch + c] as f64;
+                let cur = &caches[t].curve;
+                let r_raw = cur.out;
+                let r = clamp(r_raw, MIN_R, MAX_R) as f64;
+                let lbl = labels[t * batch + c] as f64;
+                let g_r = -wt * (lbl / r - (1.0 - lbl) / (1.0 - r));
+                let g_rraw = if r_raw > MIN_R && r_raw < MAX_R { g_r } else { 0.0 };
+                let cc = &caches[t];
+                // curve_bwd returns (g_s, g_sf, g_d); reorder to (g_s, g_d, g_sf).
+                let (g_s, g_sf, g_d) =
+                    curve_bwd(w, cur, cc.dt, cc.last_s, cc.last_sf, cc.last_d, g_rraw, gw);
+                (g_s, g_d, g_sf)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            g_state = (gs_step + gs_loss, gd_step + gd_loss, gsf_step + gsf_loss);
+        }
+    }
+    loss
 }
 
 #[cfg(test)]
@@ -1295,6 +1489,112 @@ mod tests {
         }
         let rel = (num / den.max(1e-12)).sqrt();
         assert!(rel < 2e-3, "simd grad vs scalar grad rel-L2 {rel:e}\nscalar={gs:?}\nsimd={gv:?}");
+    }
+
+    #[test]
+    fn window_grad_equals_sum_of_prefix_grads() {
+        // THE math identity behind the O(N) window: the windowed gradient for one card must equal
+        // the SUM of the O(N^2) per-prefix gradients over that card's expanding-window prefix-items.
+        // Both are scalar f64, so they agree to f64 reassociation tolerance.
+        let w: Vec<f32> = crate::DEFAULT_PARAMETERS.to_vec();
+        let kk = 6usize; // one card, reviews q[0..5]
+        let dts_q = [0.0f32, 3.0, 8.0, 1.0, 20.0, 5.0]; // q[0].delta_t unused (inits state)
+        let rat_q = [3.0f32, 2.0, 4.0, 1.0, 3.0, 3.0];
+        let weight_at = |t: usize| 0.3 + 0.11 * t as f32; // distinct per-prediction recency weights
+
+        // windowed: single column, full sequence, a loss at every step t>=1.
+        let (seq_w, batch_w) = (kk, 1usize);
+        let mut th_w = vec![0.0f32; seq_w * batch_w];
+        let mut rh_w = vec![0.0f32; seq_w * batch_w];
+        let mut lbl_w = vec![0.0f32; seq_w * batch_w];
+        let mut wts_w = vec![0.0f32; seq_w * batch_w];
+        for t in 0..kk {
+            th_w[t] = dts_q[t];
+            rh_w[t] = rat_q[t];
+            if t >= 1 {
+                wts_w[t] = weight_at(t);
+                lbl_w[t] = if rat_q[t] > 1.0 { 1.0 } else { 0.0 };
+            }
+        }
+        let mut g_win = [0.0f64; 36];
+        let loss_win =
+            loss_and_grad_range_window(&w, &th_w, &rh_w, seq_w, batch_w, &lbl_w, &wts_w, &mut g_win, 0, 1);
+
+        // per-prefix: one column per prefix length L=2..=kk (history q[0..L-2], predict q[L-1]).
+        let (seq_p, batch_p) = (kk - 1, kk - 1);
+        let mut th_p = vec![0.0f32; seq_p * batch_p];
+        let mut rh_p = vec![0.0f32; seq_p * batch_p];
+        let mut dts_p = vec![0.0f32; batch_p];
+        let mut lbl_p = vec![0.0f32; batch_p];
+        let mut wts_p = vec![0.0f32; batch_p];
+        for c in 0..batch_p {
+            let l = c + 2;
+            for t in 0..(l - 1) {
+                th_p[t * batch_p + c] = dts_q[t];
+                rh_p[t * batch_p + c] = rat_q[t];
+            }
+            dts_p[c] = dts_q[l - 1];
+            lbl_p[c] = if rat_q[l - 1] > 1.0 { 1.0 } else { 0.0 };
+            wts_p[c] = weight_at(l - 1);
+        }
+        let mut g_pre = [0.0f64; 36];
+        let loss_pre =
+            loss_and_grad_range(&w, &th_p, &rh_p, seq_p, batch_p, &dts_p, &lbl_p, &wts_p, &mut g_pre, 0, batch_p);
+
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..36 {
+            num += (g_win[i] - g_pre[i]).powi(2);
+            den += g_pre[i].powi(2);
+        }
+        let rel = (num / den.max(1e-12)).sqrt();
+        assert!(rel < 1e-9, "windowed grad vs sum-of-prefix grad rel-L2 {rel:e}\nwin={g_win:?}\npre={g_pre:?}");
+        assert!((loss_win - loss_pre).abs() < 1e-9, "windowed loss {loss_win} vs prefix-sum loss {loss_pre}");
+    }
+
+    #[test]
+    fn simd_window_grad_matches_scalar_window() {
+        // The f32x8 windowed kernel vs the scalar windowed oracle (same algorithm). They differ only
+        // by exp8/ln8 (~1e-6) and f32-vs-f64 accumulation, so a small rel-L2 confirms the SIMD
+        // backward is faithful. batch%8==0; mixed card lengths + a deliberately-filtered middle
+        // prefix (wts==0 at t==2 for some cards) so the state still updates but emits no loss/grad.
+        let w: Vec<f32> = crate::DEFAULT_PARAMETERS.to_vec();
+        let (batch, seq) = (8usize, 7usize);
+        let mut th = vec![0.0f32; seq * batch];
+        let mut rh = vec![0.0f32; seq * batch];
+        let mut lbl = vec![0.0f32; seq * batch];
+        let mut wts = vec![0.0f32; seq * batch];
+        for c in 0..batch {
+            let klen = 2 + (c % (seq - 1)); // full card length 2..=seq
+            for t in 0..klen {
+                th[t * batch + c] = (1 + (t + c) % 19) as f32;
+                rh[t * batch + c] = (1 + ((t + 2 * c) % 4)) as f32; // 1..4
+            }
+            for t in 1..klen {
+                if t == 2 && c % 3 == 0 {
+                    continue; // a filtered middle prefix: state updates, no prediction
+                }
+                wts[t * batch + c] = 0.4 + 0.07 * ((t + c) % 5) as f32;
+                lbl[t * batch + c] = if rh[t * batch + c] > 1.0 { 1.0 } else { 0.0 };
+            }
+        }
+        let mut gs = [0.0f64; 36];
+        let loss_scalar =
+            loss_and_grad_range_window(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gs, 0, batch);
+        let mut gv = [0.0f64; 36];
+        card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gv);
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..36 {
+            num += (gs[i] - gv[i]).powi(2);
+            den += gs[i].powi(2);
+        }
+        let rel = (num / den.max(1e-12)).sqrt();
+        assert!(rel < 2e-3, "simd window grad vs scalar window grad rel-L2 {rel:e}\nscalar={gs:?}\nsimd={gv:?}");
+        // The validation forward (card_loss_simd) must match the scalar oracle's loss too.
+        let loss_simd = card_loss_simd(&w, &th, &rh, seq, batch, &lbl, &wts);
+        let lrel = ((loss_scalar - loss_simd) / loss_scalar.abs().max(1e-9)).abs();
+        assert!(lrel < 1e-4, "card_loss_simd {loss_simd} vs scalar window {loss_scalar} rel {lrel:e}");
     }
 
     fn fd_grad(
