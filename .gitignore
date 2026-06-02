@@ -9,3 +9,6 @@ __pycache__/
 
 # Profiling-only measurement snapshots (transient; durable record is result/history.*)
 profiling/measure/
+
+# Scratch file for multi-line commit messages (git commit -F); never part of the repo
+_commit_msg.txt
