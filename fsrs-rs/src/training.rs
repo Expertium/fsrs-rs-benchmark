@@ -1313,7 +1313,12 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
     items
         .chunks(batch_size)
         .map(|chunk| {
-            let bsz = chunk.len();
+            let real_bsz = chunk.len();
+            // Pad the card count up to a multiple of 8 so the f32x8 forward/gradient never has a
+            // ragged tail group. The pad columns stay all-zero with weight 0: their forward is
+            // finite and their loss/gradient contribution is exactly 0 (weight 0), so the result is
+            // unchanged. real_batch_size keeps the TRUE count (the penalty scaling uses it).
+            let bsz = real_bsz.div_ceil(8) * 8;
             // pad_size = (max reviews per card in this chunk) - 1   (matches FSRSBatcher)
             let seq = chunk.iter().map(|x| x.item.reviews.len()).max().unwrap() - 1;
             let mut th = vec![0.0f32; seq * bsz];
@@ -1334,7 +1339,7 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
                 lbl[c] = if current.rating == 1 { 0.0 } else { 1.0 };
                 wts[c] = wi.weight;
             }
-            BatchHost { seq, bsz, real_batch_size: bsz, th, rh, dts, lbl, wts }
+            BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts }
         })
         .collect()
 }
@@ -1428,7 +1433,7 @@ fn train<B: AutodiffBackend>(
             // plus the manual L2/schedule penalty gradient.
             let _tb = std::time::Instant::now();
             let mut total_grad = [0.0f64; 36];
-            crate::analytic::batch_loss_and_grad(
+            crate::analytic::batch_loss_and_grad_simd(
                 &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
             );
             let mut total_grad_f32 = [0.0f32; 36];

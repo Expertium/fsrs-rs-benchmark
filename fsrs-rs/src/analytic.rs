@@ -9,7 +9,7 @@
 //! Result is not bit-for-bit vs autodiff (different FP order) but is judged by the
 //! ±0.0010 average-log-loss band.
 
-use wide::{CmpEq, CmpGt, f32x8, i32x8};
+use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x8, i32x8};
 
 const S_MIN: f32 = 0.0001;
 const S_MAX: f32 = 36500.0;
@@ -538,66 +538,288 @@ fn load8(s: &[f32], i: usize) -> f32x8 {
     f32x8::from([s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5], s[i + 6], s[i + 7]])
 }
 
-/// Retrievability for 8 cards (forward-only; mirrors curve_fwd's `out`).
+// f32x8 forgetting curve forward, storing the intermediates its backward needs (the f32x8
+// analogue of CurveCache). `out` is bit-identical to the old forward-only curve_out8 — it just
+// also stashes the products + cached lns so curve8_bwd never recomputes a transcendental.
+struct Curve8 {
+    out: f32x8,
+    a: f32x8,
+    bv: f32x8,
+    m1: f32x8,
+    decay1: f32x8,
+    factor1: f32x8,
+    b1: f32x8,
+    r1: f32x8,
+    q1: f32x8,
+    e1: f32x8,
+    p35: f32x8,
+    m2: f32x8,
+    decay2: f32x8,
+    factor2: f32x8,
+    b2: f32x8,
+    r2: f32x8,
+    inv2: f32x8,
+    p28: f32x8,
+    ex34: f32x8,
+    weight1: f32x8,
+    weight2: f32x8,
+    wsum: f32x8,
+    ret: f32x8,
+    p31: f32x8,
+    s32: f32x8,
+    ex33: f32x8,
+    ln_sf: f32x8,
+    ln_b1: f32x8,
+    ln_b2: f32x8,
+    ln_s: f32x8,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn curve_out8(
+fn curve8_fwd(
     w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, ln_w27: f32, ln_w28: f32,
     ln_s: f32x8, ln_sf: f32x8,
-) -> f32x8 {
+) -> Curve8 {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let t = t.fast_max(k(0.0));
     let a = t / sf;
     let bv = t / s;
     let p35 = exp8(sp(35) * ln_sf);
-    let dm1 = clamp8(sp(25) * p35, 0.01, 0.95);
+    let m1 = sp(25) * p35;
+    let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
-    let e1 = exp8((k(ln_w27) / decay1).fast_min(k(60.0)));
-    let b1 = a * (e1 - k(1.0)) + k(1.0);
-    let r1 = exp8(decay1 * ln8(b1));
-    let dm2 = clamp8(sp(26) * exp8((d - k(5.0)) * sp(34)), 0.01, 0.95);
+    let q1 = k(ln_w27) / decay1;
+    let e1 = exp8(q1.fast_min(k(60.0)));
+    let factor1 = e1 - k(1.0);
+    let b1 = a * factor1 + k(1.0);
+    let ln_b1 = ln8(b1);
+    let r1 = exp8(decay1 * ln_b1);
+    let ex34 = exp8((d - k(5.0)) * sp(34));
+    let m2 = sp(26) * ex34;
+    let dm2 = clamp8(m2, 0.01, 0.95);
     let decay2 = k(0.0) - dm2;
     let inv2 = k(1.0) / decay2;
     let p28 = exp8(inv2 * k(ln_w28));
-    let b2 = bv * (p28 - k(1.0)) + k(1.0);
-    let r2 = exp8(decay2 * ln8(b2));
-    let weight1 = sp(29) * exp8(k(-w[31]) * ln_sf);
-    let weight2 = sp(30) * exp8(sp(32) * ln_s) * exp8((d - k(5.0)) * sp(33));
+    let factor2 = p28 - k(1.0);
+    let b2 = bv * factor2 + k(1.0);
+    let ln_b2 = ln8(b2);
+    let r2 = exp8(decay2 * ln_b2);
+    let p31 = exp8(k(-w[31]) * ln_sf);
+    let weight1 = sp(29) * p31;
+    let s32 = exp8(sp(32) * ln_s);
+    let ex33 = exp8((d - k(5.0)) * sp(33));
+    let weight2 = sp(30) * s32 * ex33;
     let wsum = weight1 + weight2;
     let num = weight1 * r1 + weight2 * r2;
-    (num / wsum) * k(1.0 - 2e-5) + k(1e-5)
+    let ret = num / wsum;
+    let out = ret * k(1.0 - 2e-5) + k(1e-5);
+    Curve8 {
+        out, a, bv, m1, decay1, factor1, b1, r1, q1, e1, p35, m2, decay2, factor2, b2, r2,
+        inv2, p28, ex34, weight1, weight2, wsum, ret, p31, s32, ex33, ln_sf, ln_b1, ln_b2, ln_s,
+    }
 }
 
-/// Next stability for 8 cards (forward-only; mirrors stab_fwd's `out`).
+/// VJP of curve8_fwd (the f32x8 analogue of curve_bwd; every scalar `if` is a lane blend, every
+/// gw[] += is an f32x8 accumulate). Returns (g_s, g_sf, g_d); accumulates into the f32x8 gw bank.
 #[allow(clippy::too_many_arguments)]
-fn stab_out8(
+fn curve8_bwd(
+    w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8,
+    gw: &mut [f32x8; 36], ln_w27: f32, ln_w28: f32,
+) -> (f32x8, f32x8, f32x8) {
+    let sp = |i: usize| f32x8::splat(w[i]);
+    let k = f32x8::splat;
+    let z = k(0.0);
+    let t = t.fast_max(z);
+    let g_ret = g_out * k(1.0 - 2e-5);
+    let g_num = g_ret / c.wsum;
+    let g_wsum = (z - g_ret) * c.ret / c.wsum;
+    let g_weight1 = g_num * c.r1 + g_wsum;
+    let g_weight2 = g_num * c.r2 + g_wsum;
+    let g_r1 = g_num * c.weight1;
+    let g_r2 = g_num * c.weight2;
+    // weight2 = w30 * s32 * ex33
+    gw[30] += g_weight2 * c.s32 * c.ex33;
+    let g_s32 = g_weight2 * sp(30) * c.ex33;
+    let g_ex33 = g_weight2 * sp(30) * c.s32;
+    let mut g_d = g_ex33 * c.ex33 * sp(33);
+    gw[33] += g_ex33 * c.ex33 * (d - k(5.0));
+    let mut g_s = g_s32 * sp(32) * (c.s32 / s); // d(s^w32)/ds = w32*s32/s
+    gw[32] += g_s32 * c.s32 * c.ln_s;
+    // weight1 = w29 * p31 ; p31 = sf^(-w31)
+    gw[29] += g_weight1 * c.p31;
+    let g_p31 = g_weight1 * sp(29);
+    let mut g_sf = g_p31 * k(-w[31]) * (c.p31 / sf);
+    gw[31] += g_p31 * (z - c.p31 * c.ln_sf);
+    // r2 = b2^decay2
+    let g_b2 = g_r2 * c.decay2 * (c.r2 / c.b2);
+    let mut g_decay2 = g_r2 * c.r2 * c.ln_b2;
+    let g_bv = g_b2 * c.factor2;
+    let g_factor2 = g_b2 * c.bv;
+    let g_p28 = g_factor2;
+    gw[28] += g_p28 * c.inv2 * (c.p28 / sp(28));
+    let g_inv2 = g_p28 * c.p28 * k(ln_w28);
+    g_decay2 += g_inv2 * (z - k(1.0) / (c.decay2 * c.decay2));
+    let g_dm2 = z - g_decay2;
+    let g_m2 = (c.m2.cmp_gt(k(0.01)) & c.m2.cmp_lt(k(0.95))).blend(g_dm2, z);
+    gw[26] += g_m2 * c.ex34;
+    let g_ex34 = g_m2 * sp(26);
+    g_d += g_ex34 * c.ex34 * sp(34);
+    gw[34] += g_ex34 * c.ex34 * (d - k(5.0));
+    g_s += g_bv * (z - t / (s * s)); // bv = t/s
+    // r1 = b1^decay1
+    let g_b1 = g_r1 * c.decay1 * (c.r1 / c.b1);
+    let mut g_decay1 = g_r1 * c.r1 * c.ln_b1;
+    let g_a = g_b1 * c.factor1;
+    let g_factor1 = g_b1 * c.a;
+    let g_e1 = g_factor1;
+    let g_q1c = g_e1 * c.e1;
+    let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_q1c, z);
+    // q1 = ln_w27 / decay1
+    let g_lw27 = g_q1 / c.decay1;
+    g_decay1 += g_q1 * (z - k(ln_w27) / (c.decay1 * c.decay1));
+    gw[27] += g_lw27 / sp(27);
+    let g_dm1 = z - g_decay1;
+    let g_m1 = (c.m1.cmp_gt(k(0.01)) & c.m1.cmp_lt(k(0.95))).blend(g_dm1, z);
+    gw[25] += g_m1 * c.p35;
+    let g_p35 = g_m1 * sp(25);
+    g_sf += g_p35 * sp(35) * (c.p35 / sf);
+    gw[35] += g_p35 * c.p35 * c.ln_sf;
+    g_sf += g_a * (z - t / (sf * sf)); // a = t/sf
+    (g_s, g_sf, g_d)
+}
+
+// f32x8 stability-after-review forward + the intermediates its backward needs (analogue of StabCache).
+struct Stab8 {
+    out: f32x8,
+    nsf_fail: f32x8,
+    pls: f32x8,
+    sinc: f32x8,
+    ls_sinc: f32x8,
+    aa: f32x8,
+    bb: f32x8,
+    cc: f32x8,
+    expr: f32x8,
+    pp: f32x8,
+    qbase: f32x8,
+    rexp: f32x8,
+    hard: f32x8,
+    easy: f32x8,
+    ln_ls: f32x8,
+    ln_ld: f32x8,
+    ln_ls1: f32x8,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stab8_fwd(
     w: &[f32], last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
     ln_ls: f32x8, ln_ld: f32x8,
-) -> f32x8 {
+) -> Stab8 {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let one = k(1.0);
     let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 7), one);
     let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 8), one);
     let pp = exp8(k(-w[start + 4]) * ln_ld);
-    let qbase = exp8(sp(start + 5) * ln8(last_s + one));
+    let ln_ls1 = ln8(last_s + one);
+    let qbase = exp8(sp(start + 5) * ln_ls1);
     let rexp = exp8((one - r) * sp(start + 6));
     let nsf_fail = sp(start + 3) * pp * (qbase - one) * rexp;
     let pls = last_s.fast_min(nsf_fail);
     let bb = k(11.0) - last_d;
     let cc = exp8(k(-w[start + 1]) * ln_ls);
     let expr = exp8((one - r) * sp(start + 2));
-    let sinc = k(aa) * bb * cc * (expr - one) * hard * easy + one;
-    let nss = pls.fast_max(last_s * sinc);
-    rating.cmp_gt(one).blend(nss, pls)
+    let aa8 = k(aa);
+    let sinc = aa8 * bb * cc * (expr - one) * hard * easy + one;
+    let ls_sinc = last_s * sinc;
+    let nss = pls.fast_max(ls_sinc);
+    let out = rating.cmp_gt(one).blend(nss, pls);
+    Stab8 {
+        out, nsf_fail, pls, sinc, ls_sinc, aa: aa8, bb, cc, expr, pp, qbase, rexp, hard, easy,
+        ln_ls, ln_ld, ln_ls1,
+    }
 }
 
-/// Next difficulty for 8 cards (forward-only; mirrors next_d_fwd's clamped output).
-fn next_d8(w: &[f32], last_d: f32x8, rating: f32x8, init: f32) -> f32x8 {
+/// VJP of stab8_fwd (f32x8 analogue of stab_bwd). Returns (g_last_s, g_last_d, g_r).
+#[allow(clippy::too_many_arguments)]
+fn stab8_bwd(
+    w: &[f32], c: &Stab8, last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize,
+    g_out: f32x8, gw: &mut [f32x8; 36],
+) -> (f32x8, f32x8, f32x8) {
+    let sp = |i: usize| f32x8::splat(w[i]);
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let z = k(0.0);
+    let gt1 = rating.cmp_gt(one);
+    let g_nss = gt1.blend(g_out, z);
+    let g_pls_direct = gt1.blend(z, g_out);
+    // nss = max(pls, ls_sinc)  (ties to pls, matching the scalar >= / > split)
+    let g_pls_from_nss = c.pls.cmp_ge(c.ls_sinc).blend(g_nss, z);
+    let g_ls_sinc = c.ls_sinc.cmp_gt(c.pls).blend(g_nss, z);
+    let mut g_last_s = g_ls_sinc * c.sinc;
+    let g_sinc = g_ls_sinc * last_s;
+    let g_pls = g_pls_direct + g_pls_from_nss;
+    // pls = min(last_s, nsf_fail)
+    g_last_s += last_s.cmp_le(c.nsf_fail).blend(g_pls, z);
+    let g_nsf_fail = c.nsf_fail.cmp_lt(last_s).blend(g_pls, z);
+    // sinc = aa*bb*cc*(expr-1)*hard*easy + 1
+    let em1 = c.expr - one;
+    let g_prod = g_sinc;
+    let prod = c.aa * c.bb * c.cc * em1 * c.hard * c.easy;
+    gw[start] += g_prod * prod; // aa = exp(w[start]-1.5); dprod/dw[start] = prod
+    let g_bb = g_prod * (c.aa * c.cc * em1 * c.hard * c.easy);
+    let g_cc = g_prod * (c.aa * c.bb * em1 * c.hard * c.easy);
+    let g_em1 = g_prod * (c.aa * c.bb * c.cc * c.hard * c.easy);
+    gw[start + 7] += rating.cmp_eq(k(2.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.easy), z);
+    gw[start + 8] += rating.cmp_eq(k(4.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.hard), z);
+    let mut g_last_d = g_bb * (z - one); // bb = 11 - last_d
+    g_last_s += g_cc * k(-w[start + 1]) * (c.cc / last_s);
+    gw[start + 1] += g_cc * (z - c.cc * c.ln_ls);
+    // expr = exp((1-r)*w[start+2])
+    let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
+    gw[start + 2] += g_em1 * c.expr * (one - r);
+    // nsf_fail = w[start+3] * pp * (qbase-1) * rexp
+    let q = c.qbase - one;
+    gw[start + 3] += g_nsf_fail * (c.pp * q * c.rexp);
+    let g_pp = g_nsf_fail * sp(start + 3) * q * c.rexp;
+    let g_q = g_nsf_fail * sp(start + 3) * c.pp * c.rexp;
+    let g_rexp = g_nsf_fail * sp(start + 3) * c.pp * q;
+    // pp = last_d^(-w[start+4])
+    g_last_d += g_pp * k(-w[start + 4]) * (c.pp / last_d);
+    gw[start + 4] += g_pp * (z - c.pp * c.ln_ld);
+    // qbase = (last_s+1)^w[start+5]
+    g_last_s += g_q * sp(start + 5) * (c.qbase / (last_s + one));
+    gw[start + 5] += g_q * c.qbase * c.ln_ls1;
+    // rexp = exp((1-r)*w[start+6])
+    g_r += g_rexp * c.rexp * k(-w[start + 6]);
+    gw[start + 6] += g_rexp * c.rexp * (one - r);
+    (g_last_s, g_last_d, g_r)
+}
+
+/// f32x8 next-difficulty forward; returns (clamped out, pre-clamp out, delta_d) for the backward.
+fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, init: f32) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
     let delta_d = k(-w[6]) * (rating - k(3.0));
     let new_d = last_d + (k(10.0) - last_d) * delta_d / k(9.0);
-    clamp8(k(0.01) * k(init) + k(0.99) * new_d, D_MIN, D_MAX)
+    let out_pre = k(0.01) * k(init) + k(0.99) * new_d;
+    (clamp8(out_pre, D_MIN, D_MAX), out_pre, delta_d)
+}
+
+/// VJP of next_d8_fwd. Returns g_last_d; accumulates gw[4], gw[5], gw[6].
+fn next_d8_bwd(
+    out_pre: f32x8, delta_d: f32x8, last_d: f32x8, rating: f32x8, g_out: f32x8,
+    gw: &mut [f32x8; 36], exp3w5: f64,
+) -> f32x8 {
+    let k = f32x8::splat;
+    let z = k(0.0);
+    let g_out_pre = (out_pre.cmp_gt(k(D_MIN)) & out_pre.cmp_lt(k(D_MAX))).blend(g_out, z);
+    let g_init = g_out_pre * k(0.01);
+    let g_new_d = g_out_pre * k(0.99);
+    gw[4] += g_init;
+    gw[5] += g_init * k(-(exp3w5 as f32) * 3.0); // init = w4 - exp(3 w5) + 1
+    let g_last_d = g_new_d * (k(1.0) - delta_d / k(9.0));
+    let g_delta_d = g_new_d * (k(10.0) - last_d) / k(9.0);
+    gw[6] += g_delta_d * (z - (rating - k(3.0))); // delta_d = -w6*(rating-3)
+    g_last_d
 }
 
 /// Vectorized forward-only BCE loss (validation). Processes the batch 8 cards at a time; the
@@ -638,10 +860,10 @@ pub(crate) fn batch_loss_simd(
                 let ln_s = ln8(s_c);
                 let ln_sf = ln8(sf_c);
                 let ln_d = ln8(d_c);
-                let rr = curve_out8(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
-                let ns = stab_out8(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d);
-                let nsf = stab_out8(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d);
-                let nd = next_d8(w, d_c, rating, wc.init);
+                let rr = curve8_fwd(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf).out;
+                let ns = stab8_fwd(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d).out;
+                let nsf = stab8_fwd(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d).out;
+                let nd = next_d8_fwd(w, d_c, rating, wc.init).0;
                 // rating==0 (padding) passes the state through unchanged.
                 let m0 = rating.cmp_eq(k(0.0));
                 s = clamp8(m0.blend(s_c, ns), S_MIN, S_MAX);
@@ -651,7 +873,7 @@ pub(crate) fn batch_loss_simd(
         }
         let dts = load8(delta_ts, c0);
         let r = clamp8(
-            curve_out8(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8(s), ln8(sf)),
+            curve8_fwd(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8(s), ln8(sf)).out,
             MIN_R,
             MAX_R,
         );
@@ -679,6 +901,227 @@ pub(crate) fn batch_loss_simd(
             * (labels[c] as f64 * (r as f64).ln() + (1.0 - labels[c] as f64) * (1.0 - r as f64).ln());
     }
     loss
+}
+
+// ===================== SIMD recurrence step (8 cards/lane) with cache =====================
+// Per-timestep cache for the vectorized backward. The first review (t==0) only needs the init
+// override's data (the curve/stab/next_d it computes are dead, overridden), so it gets a small
+// `First` variant; every later step stores the full forward intermediates (`Full`).
+enum Step8 {
+    First {
+        rc: f32x8,
+        init_s: f32x8,
+        ex_w5: f32x8,
+        id_in: f32x8,
+    },
+    Full {
+        s0: f32x8,
+        d0: f32x8,
+        sf0: f32x8,
+        last_s: f32x8,
+        last_sf: f32x8,
+        last_d: f32x8,
+        rating: f32x8,
+        dt: f32x8,
+        curve: Curve8,
+        slow: Stab8,
+        fast: Stab8,
+        nd_out_pre: f32x8,
+        nd_delta_d: f32x8,
+        ns3: f32x8,
+        nsf3: f32x8,
+    },
+}
+
+/// One recurrence step over 8 cards. `first` (t==0) initialises state from the rating exactly like
+/// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
+/// then the rating==0 padding passthrough). Returns the new state and the backward cache.
+fn step8_fwd(
+    w: &[f32], dt_raw: f32x8, rating: f32x8, state: (f32x8, f32x8, f32x8), first: bool, wc: &WConsts,
+) -> ((f32x8, f32x8, f32x8), Step8) {
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let (s0, d0, sf0) = state;
+    if first {
+        let rc = clamp8(rating, 1.0, 4.0);
+        let init_s = rc.cmp_eq(one).blend(
+            k(w[0]),
+            rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
+        );
+        let ex_w5 = exp8(k(w[5]) * (rc - one));
+        let id_in = k(w[4]) - ex_w5 + one;
+        let init_d = clamp8(id_in, D_MIN, D_MAX);
+        let out = (
+            clamp8(init_s, S_MIN, S_MAX),
+            init_d,
+            clamp8(k(0.8) * init_s, S_MIN, S_MAX),
+        );
+        (out, Step8::First { rc, init_s, ex_w5, id_in })
+    } else {
+        let last_s = clamp8(s0, S_MIN, S_MAX);
+        let last_d = clamp8(d0, D_MIN, D_MAX);
+        let last_sf = clamp8(sf0, S_MIN, S_MAX);
+        let dt = dt_raw.fast_max(k(0.0));
+        let ln_last_s = ln8(last_s);
+        let ln_last_sf = ln8(last_sf);
+        let ln_last_d = ln8(last_d);
+        let curve = curve8_fwd(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf);
+        let r = curve.out;
+        let slow = stab8_fwd(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
+        let fast = stab8_fwd(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
+        let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, wc.init);
+        // rating==0 (padding) passes the input state through unchanged.
+        let m0 = rating.cmp_eq(k(0.0));
+        let ns3 = m0.blend(last_s, slow.out);
+        let nsf3 = m0.blend(last_sf, fast.out);
+        let nd3 = m0.blend(last_d, nd);
+        let out = (clamp8(ns3, S_MIN, S_MAX), nd3, clamp8(nsf3, S_MIN, S_MAX));
+        (
+            out,
+            Step8::Full {
+                s0, d0, sf0, last_s, last_sf, last_d, rating, dt, curve, slow, fast,
+                nd_out_pre, nd_delta_d, ns3, nsf3,
+            },
+        )
+    }
+}
+
+/// VJP of one step (f32x8 analogue of step_bwd). Given output-state adjoints, returns input-state
+/// adjoints and accumulates the weight gradient into `gw`.
+fn step8_bwd(
+    w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), gw: &mut [f32x8; 36], wc: &WConsts,
+) -> (f32x8, f32x8, f32x8) {
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let z = k(0.0);
+    let (g_ns_out, g_nd_out, g_nsf_out) = g_out;
+    match c {
+        // t==0 init override: the only weight grads are gw[rc-1] (init stability, scattered by the
+        // per-lane rating via 4 masked adds) and gw[4]/gw[5] (init difficulty). Input adjoints are 0
+        // (state before the first review is constant 0).
+        Step8::First { rc, init_s, ex_w5, id_in } => {
+            let g_ns3 = (init_s.cmp_gt(k(S_MIN)) & init_s.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
+            let nsf3 = k(0.8) * *init_s;
+            let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
+            let g_init_s = g_ns3 + g_nsf3 * k(0.8);
+            gw[0] += rc.cmp_eq(k(1.0)).blend(g_init_s, z);
+            gw[1] += rc.cmp_eq(k(2.0)).blend(g_init_s, z);
+            gw[2] += rc.cmp_eq(k(3.0)).blend(g_init_s, z);
+            gw[3] += rc.cmp_eq(k(4.0)).blend(g_init_s, z);
+            let idmask = id_in.cmp_gt(k(D_MIN)) & id_in.cmp_lt(k(D_MAX));
+            gw[4] += idmask.blend(g_nd_out, z);
+            gw[5] += idmask.blend(g_nd_out * (z - *ex_w5 * (*rc - one)), z);
+            (z, z, z)
+        }
+        Step8::Full {
+            s0, d0, sf0, last_s, last_sf, last_d, rating, dt, curve, slow, fast, nd_out_pre,
+            nd_delta_d, ns3, nsf3,
+        } => {
+            let g_ns3 = (ns3.cmp_gt(k(S_MIN)) & ns3.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
+            let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
+            let g_nd3 = g_nd_out;
+            // rating==0 padding: output state == input state, so the adjoint flows straight through.
+            let m0 = rating.cmp_eq(z);
+            let g_ns2 = m0.blend(z, g_ns3);
+            let g_nsf2 = m0.blend(z, g_nsf3);
+            let g_nd2 = m0.blend(z, g_nd3);
+            let g_last_s_extra = m0.blend(g_ns3, z);
+            let g_last_sf_extra = m0.blend(g_nsf3, z);
+            let g_last_d_extra = m0.blend(g_nd3, z);
+            let (g_ls_a, g_ld_a, g_r_a) =
+                stab8_bwd(w, slow, *last_s, *last_d, curve.out, *rating, 7, g_ns2, gw);
+            let (g_lsf_b, g_ld_b, g_r_b) =
+                stab8_bwd(w, fast, *last_sf, *last_d, curve.out, *rating, 16, g_nsf2, gw);
+            let g_ld_c = next_d8_bwd(*nd_out_pre, *nd_delta_d, *last_d, *rating, g_nd2, gw, wc.exp3w5);
+            let (g_ls_d, g_lsf_d, g_ld_d) =
+                curve8_bwd(w, curve, *dt, *last_s, *last_sf, *last_d, g_r_a + g_r_b, gw, wc.ln_w27, wc.ln_w28);
+            let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
+            let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
+            let g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d + g_last_d_extra;
+            let g_s0 = (s0.cmp_gt(k(S_MIN)) & s0.cmp_lt(k(S_MAX))).blend(g_last_s, z);
+            let g_d0 = (d0.cmp_gt(k(D_MIN)) & d0.cmp_lt(k(D_MAX))).blend(g_last_d, z);
+            let g_sf0 = (sf0.cmp_gt(k(S_MIN)) & sf0.cmp_lt(k(S_MAX))).blend(g_last_sf, z);
+            (g_s0, g_d0, g_sf0)
+        }
+    }
+}
+
+/// Vectorized forward + reverse-mode backward over card groups `[g_start, g_end)` (8 cards/lane).
+/// Per-group weight gradients accumulate in an f32x8 bank, then horizontal-sum into the f64 `gw`
+/// once per group — so cross-card/cross-group accumulation stays f64 while the per-card VJP is f32.
+/// Requires the batch to be padded to a multiple of 8 (build_host_batches does this).
+#[allow(clippy::too_many_arguments)]
+fn loss_and_grad_range_simd(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    delta_ts: &[f32], labels: &[f32], weights: &[f32], gw: &mut [f64], g_start: usize, g_end: usize,
+) -> f64 {
+    let wc = wconsts(w);
+    let k = f32x8::splat;
+    let one = k(1.0);
+    let mut loss = 0.0f64;
+    let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
+    for g in g_start..g_end {
+        let c0 = g * 8;
+        caches.clear();
+        let (mut s, mut d, mut sf) = (k(0.0), k(0.0), k(0.0));
+        for t in 0..seq_len {
+            let base = t * batch + c0;
+            let rating = load8(r_hist, base);
+            let dt = if t == 0 { k(0.0) } else { load8(t_hist, base) };
+            let (ns, cache) = step8_fwd(w, dt, rating, (s, d, sf), t == 0, &wc);
+            s = ns.0;
+            d = ns.1;
+            sf = ns.2;
+            caches.push(cache);
+        }
+        let dts = load8(delta_ts, c0);
+        let lbl = load8(labels, c0);
+        let wt = load8(weights, c0);
+        let ln_s = ln8(s);
+        let ln_sf = ln8(sf);
+        let fc = curve8_fwd(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+        let r_raw = fc.out;
+        let r = clamp8(r_raw, MIN_R, MAX_R);
+        // BCE loss in f64 (per lane). Only used as the return value (training discards it).
+        let r_arr = r.to_array();
+        for (j, &rr) in r_arr.iter().enumerate() {
+            let c = c0 + j;
+            let rr = rr as f64;
+            loss += -(weights[c] as f64)
+                * (labels[c] as f64 * rr.ln() + (1.0 - labels[c] as f64) * (1.0 - rr).ln());
+        }
+        // d loss / d r, then the [MIN_R, MAX_R] clamp, in f32x8.
+        let g_r = (k(0.0) - wt) * (lbl / r - (one - lbl) / (one - r));
+        let g_rraw = (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, k(0.0));
+        let mut gw_g = [f32x8::splat(0.0); 36];
+        let (mut g_s, mut g_sf, mut g_d) =
+            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, &mut gw_g, wc.ln_w27, wc.ln_w28);
+        for t in (0..seq_len).rev() {
+            let (gs0, gd0, gsf0) = step8_bwd(w, &caches[t], (g_s, g_d, g_sf), &mut gw_g, &wc);
+            g_s = gs0;
+            g_d = gd0;
+            g_sf = gsf0;
+        }
+        for i in 0..36 {
+            gw[i] += gw_g[i].reduce_add() as f64;
+        }
+    }
+    loss
+}
+
+/// Vectorized forward+backward BCE loss for one batch (8 cards/lane). Returns the summed loss and
+/// accumulates d(loss)/d(w) into `gw` (length 36). The batch must be padded to a multiple of 8.
+/// This is the precision-trading (3b band) f32x8 replacement for the scalar batch_loss_and_grad.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn batch_loss_and_grad_simd(
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    delta_ts: &[f32], labels: &[f32], weights: &[f32], gw: &mut [f64],
+) -> f64 {
+    debug_assert!(batch % 8 == 0, "batch_loss_and_grad_simd needs batch padded to a multiple of 8");
+    let n_groups = batch / 8;
+    loss_and_grad_range_simd(
+        w, t_hist, r_hist, seq_len, batch, delta_ts, labels, weights, gw, 0, n_groups,
+    )
 }
 
 /// Forward + reverse-mode backward over cards `[start, end)`; accumulates d(loss)/d(w)
@@ -806,6 +1249,39 @@ mod tests {
         let b = batch_loss_simd(&w, &th, &rh, seq, batch, &dts, &lbl, &wts);
         let rel = ((a - b) / a.abs().max(1e-9)).abs();
         assert!(rel < 1e-4, "simd batch_loss {b} vs scalar {a}, rel {rel:e}");
+    }
+
+    #[test]
+    fn simd_grad_matches_scalar_grad() {
+        // Vectorized analytic grad vs the scalar analytic grad (the trusted oracle). They differ
+        // only by exp8/ln8 (~1e-6) and f32-vs-f64 accumulation, so a small relative-L2 over the
+        // whole 36-vector confirms the f32x8 backward is a faithful translation. batch%8==0.
+        let w: Vec<f32> = crate::DEFAULT_PARAMETERS.to_vec();
+        let (batch, seq) = (16usize, 6usize);
+        let mut th = vec![0.0f32; seq * batch];
+        let mut rh = vec![0.0f32; seq * batch];
+        for c in 0..batch {
+            let len = 2 + (c % (seq - 1)); // 2..=seq real reviews, rest padded (rating 0)
+            for t in 0..len {
+                th[t * batch + c] = (1 + (t + c) % 20) as f32;
+                rh[t * batch + c] = (1 + ((t + 2 * c) % 4)) as f32; // 1..4, first review always real
+            }
+        }
+        let dts: Vec<f32> = (0..batch).map(|c| (1 + c % 30) as f32).collect();
+        let lbl: Vec<f32> = (0..batch).map(|c| (c % 2) as f32).collect();
+        let wts: Vec<f32> = (0..batch).map(|c| 0.4 + 0.13 * (c % 5) as f32).collect();
+        let mut gs = [0.0f64; 36];
+        batch_loss_and_grad(&w, &th, &rh, seq, batch, &dts, &lbl, &wts, &mut gs);
+        let mut gv = [0.0f64; 36];
+        batch_loss_and_grad_simd(&w, &th, &rh, seq, batch, &dts, &lbl, &wts, &mut gv);
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..36 {
+            num += (gs[i] - gv[i]).powi(2);
+            den += gs[i].powi(2);
+        }
+        let rel = (num / den.max(1e-12)).sqrt();
+        assert!(rel < 2e-3, "simd grad vs scalar grad rel-L2 {rel:e}\nscalar={gs:?}\nsimd={gv:?}");
     }
 
     fn fd_grad(

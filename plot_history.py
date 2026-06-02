@@ -196,7 +196,7 @@ def main() -> None:
                 wrap_summary(r.get("summary", ""), args.summary_wrap),
                 (it, y),
                 textcoords="offset points",
-                xytext=(8, 3),
+                xytext=(0, 6),
                 rotation=args.rotation,
                 rotation_mode="anchor",
                 ha="left",
