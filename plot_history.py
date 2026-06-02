@@ -10,7 +10,9 @@ Reads ``result/history.jsonl`` and draws TWO stacked views vs iteration
    real "progress" curve, and it is drift-immune: every ``speed_ratio`` is a
    within-session *paired* ratio, so cross-session machine drift cancels.
    Rejected variants are drawn where they would have landed
-   (current cumulative x their ``speed_ratio``).
+   (current cumulative x their ``speed_ratio``). Only the TOP-N biggest wins
+   (highest per-iteration ``speed_ratio``) are labelled with their summary, so the
+   panel stays readable as the campaign grows (``--label-top``, default 5).
 2. Median per-user time (ms) — intuitive, but MACHINE-SPECIFIC and measured per
    session, so it is NOT the accept/reject metric. Informational only.
 
@@ -139,6 +141,12 @@ def main() -> None:
         help="hide the champion summary labels on the speedup panel",
     )
     ap.add_argument(
+        "--label-top",
+        type=int,
+        default=5,
+        help="label only the N biggest wins (highest speed_ratio) on the speedup panel (default 5)",
+    )
+    ap.add_argument(
         "--summary-wrap",
         type=int,
         default=12,
@@ -188,12 +196,20 @@ def main() -> None:
     _frontier(ax_sp, cx, cy, xmax)
 
     if not args.no_summaries:
+        # Only label the TOP-N biggest wins (highest per-iteration speed_ratio among the accepted
+        # champions). Annotating every champion cluttered the panel as the campaign grew; the
+        # baseline (iter 0, no change) and rejects are never labelled. Each label is prefixed with
+        # its iteration and per-iteration speedup so the big wins are self-evident.
+        labellable = [(it, y, r) for it, y, r in champ_pts if r["iteration"] != 0]
+        biggest = sorted(labellable, key=lambda p: float(p[2].get("speed_ratio") or 1.0), reverse=True)
+        top_iters = {p[0] for p in biggest[: max(0, args.label_top)]}
         for it, y, r in champ_pts:
-            if r["iteration"] == 0:
-                continue  # baseline has no change to describe
-
+            if r["iteration"] == 0 or it not in top_iters:
+                continue
+            sr = float(r.get("speed_ratio") or 1.0)
+            label = wrap_summary(f"#{it} ×{sr:.2f}  " + r.get("summary", ""), args.summary_wrap)
             ax_sp.annotate(
-                wrap_summary(r.get("summary", ""), args.summary_wrap),
+                label,
                 (it, y),
                 textcoords="offset points",
                 xytext=(0, 6),

@@ -1296,7 +1296,6 @@ pub fn compute_parameters(
         progress.lock().unwrap().splits = vec![progress_state];
     }
     let model = train::<Autodiff<B>>(
-        weighted_train_set.clone(),
         weighted_train_set,
         &initialized_parameters,
         &config,
@@ -1356,7 +1355,6 @@ pub fn benchmark(
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
     let model = train::<Autodiff<B>>(
-        weighted_train_set.clone(),
         weighted_train_set,
         &initialized_parameters,
         &config,
@@ -1525,31 +1523,31 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
 
 fn train<B: AutodiffBackend>(
     train_set: Vec<WeightedFSRSItem>,
-    test_set: Vec<WeightedFSRSItem>,
     initial_parameters: &[f32],
     config: &TrainingConfig,
     progress: Option<ProgressCollector>,
 ) -> Result<Model<B>> {
     B::seed(config.seed);
 
-    // Training data
+    // Training data. In this codebase the train set == the test set (both compute_parameters() and
+    // benchmark() train and validate on the same weighted items), so the host batches are built ONCE
+    // and reused for BOTH the gradient pass and the per-epoch validation. This drops a redundant O(N)
+    // clone of the dataset plus a second full build_host_batches() — a sizeable share of the per-user
+    // setup floor, which grew to ~a third of the largest users' time after the O(N) window. Bit-for-
+    // bit: the gradient and validation only ever READ these immutable batches; only their index
+    // orders differ (per-epoch reshuffle vs. the fixed valid_order below).
     let total_size = train_set.len();
-    let test_size = test_set.len();
+    let test_size = total_size;
     let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
-    // Build the TRAINING batches as host arrays directly (no burn tensors — they were built then
-    // immediately extracted to host and dropped). The data is fixed; only the batch ORDER changes
-    // per epoch (the shuffle is replicated below).
     let train_host: Vec<BatchHost> = build_host_batches(train_set, config.batch_size);
     let n_train_batches = train_host.len();
     // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
     // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
     let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
 
-    // Validation batches, built directly too. The old ShuffleDataLoader shuffled the batch order
-    // ONCE (StdRng::seed_from_u64(seed)); replicate that with `valid_order` so each epoch sums the
-    // validation batches in byte-identical order (the analytic batch_loss is otherwise the same).
-    let valid_host: Vec<BatchHost> = build_host_batches(test_set, config.batch_size);
-    let mut valid_order: Vec<usize> = (0..valid_host.len()).collect();
+    // Validation scores the SAME batches; the old ShuffleDataLoader shuffled their order ONCE
+    // (StdRng::seed_from_u64(seed)), replicated with `valid_order` for byte-identical summation.
+    let mut valid_order: Vec<usize> = (0..n_train_batches).collect();
     valid_order.shuffle(&mut StdRng::seed_from_u64(config.seed));
 
     let mut lr_scheduler = CosineAnnealingLR::init(iterations as f64, config.learning_rate);
@@ -1677,7 +1675,7 @@ fn train<B: AutodiffBackend>(
         let w_vec_valid = model.w.val().to_data().to_vec::<f32>().unwrap();
         let mut loss_valid = 0.0;
         for &vi in &valid_order {
-            let vb = &valid_host[vi];
+            let vb = &train_host[vi];
             let (l2_penalty_value, _) = l2_penalty(
                 &w_vec_valid,
                 &init_w_vec,

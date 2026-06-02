@@ -94,8 +94,17 @@ uv run plot_history.py
 
 The [plot at the top of this README](#fsrs-rs-speed-autoresearch) shows two stacked panels:
 
-1. **Cumulative speedup** — the running product of the accepted iterations' median `speed_ratio`. This is the accept metric (the median of per-user speed ratios) compounded, so it's what "progress" means here, and it's drift-immune.
+1. **Cumulative speedup** — the running product of the accepted iterations' median `speed_ratio`. This is the accept metric (the median of per-user speed ratios) compounded, so it's what "progress" means here, and it's drift-immune. Only the **top-5 biggest wins** are labelled with their summary, to keep the panel readable.
 2. **Median per-user time (ms)** — intuitive, but **machine-specific and measured per session, so it is *not* the metric used to accept or reject candidates** (each candidate is judged by its median per-user speed ratio, re-measured against the champion in the same session). Treat the time curve as informational context only.
+
+### Why the cumulative number is slightly optimistic (winner's curse)
+
+The top-panel cumulative speedup is a **product of measured ratios**, and that product is **biased a little high** — it overstates the true speedup. Two effects compound:
+
+1. **Selection bias (the "winner's curse").** A candidate is kept only if its *measured* median speedup clears the bar (≥ 1.05). But each measurement carries ~1% noise, so the bar acts as a filter that preferentially admits iterations whose noise happened to land *favorably*. A change whose true speedup is 1.045 but measured 1.055 gets accepted and recorded at 1.055; the symmetric unlucky case (true 1.055, measured 1.045) gets rejected and never counted. So the accepted ratios skew high — you're looking at the winners, and winners are lucky on average.
+2. **Noise compounds multiplicatively.** Each `speed_ratio` is a ratio of two noisy timings (~1% each). The cumulative line multiplies ~15 of these together, so the small upward biases multiply too, and the gap grows as the campaign gets longer.
+
+**The honest fix is to re-anchor.** Every ~10–20 iterations we measure the *current champion directly against the original iter-0 baseline*, back-to-back in one session. That single ratio is **unbiased** — there's no accept/reject filter applied to it, so no selection creeps in — and it's drift-immune (same session). The distance between the product line and that anchor point is exactly the accumulated inflation. (For example: at iter 18 the product line read ×65.5, but the direct iter-0 anchor was ×62.0 — about 5–6% optimistic. The anchor is the number to trust; the final report re-validates the champion on 1000 users.)
 
 ## Repo tour
 

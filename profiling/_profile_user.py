@@ -27,11 +27,12 @@ sys.argv = ["compute_parameters.py", "--algo", "FSRS-rs", "--short", "--secs",
 import compute_parameters as cp  # noqa: E402
 
 dataset = cp.UserDataLoader(cp.config).load_user_data(USER)
-items = cp.convert_to_items(dataset)
+items, card_ids = cp.convert_to_items(dataset)
 print(f"user {USER}: {len(items)} items; calling compute_parameters() x{REPS}", flush=True)
 
 backend = cp.FSRS(parameters=[])
 for i in range(REPS):
     t = time.monotonic()
-    params, secs = backend.compute_parameters(items)
+    # Pass card_ids so we profile the windowed (O(N)) champion path, not the plain fallback.
+    params, secs = backend.compute_parameters(items, card_ids)
     print(f"  rep {i}: rust={secs*1000:.0f}ms wall={(time.monotonic()-t)*1000:.0f}ms", flush=True)
