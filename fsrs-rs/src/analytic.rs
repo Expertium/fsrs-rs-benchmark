@@ -87,12 +87,13 @@ struct CurveCache {
     ln_w28: f32,
 }
 
-fn curve_fwd(w: &[f32], t: f32, s: f32, sf: f32, d: f32, ln_w27: f32, ln_w28: f32) -> CurveCache {
+fn curve_fwd(
+    w: &[f32], t: f32, s: f32, sf: f32, d: f32, ln_w27: f32, ln_w28: f32, ln_s: f32, ln_sf: f32,
+) -> CurveCache {
     let t = t.max(0.0);
     let a = t / sf;
     let bv = t / s;
-    let ln_sf = sf.ln();
-    let p35 = (w[35] * ln_sf).exp(); // sf^w35
+    let p35 = (w[35] * ln_sf).exp(); // sf^w35 (ln_sf shared from step_fwd; iter13)
     let m1 = w[25] * p35;
     let dm1 = clamp(m1, 0.01, 0.95);
     let decay1 = -dm1;
@@ -114,8 +115,7 @@ fn curve_fwd(w: &[f32], t: f32, s: f32, sf: f32, d: f32, ln_w27: f32, ln_w28: f3
     let r2 = (decay2 * ln_b2).exp(); // b2^decay2
     let p31 = ((-w[31]) * ln_sf).exp(); // sf^-w31 (reuse ln_sf)
     let weight1 = w[29] * p31;
-    let ln_s = s.ln();
-    let s32 = (w[32] * ln_s).exp(); // s^w32
+    let s32 = (w[32] * ln_s).exp(); // s^w32 (ln_s shared from step_fwd; iter13)
     let ex33 = ((d - 5.0) * w[33]).exp();
     let weight2 = w[30] * s32 * ex33;
     let wsum = weight1 + weight2;
@@ -228,19 +228,20 @@ struct StabCache {
     ln_ls1: f32, // ln(last_s+1) for qbase = (last_s+1)^w[start+5]
 }
 
-fn stab_fwd(w: &[f32], last_s: f32, last_d: f32, r: f32, rating: f32, start: usize, aa: f32) -> StabCache {
+fn stab_fwd(
+    w: &[f32], last_s: f32, last_d: f32, r: f32, rating: f32, start: usize, aa: f32,
+    ln_ls: f32, ln_ld: f32,
+) -> StabCache {
     let hard = if rating == 2.0 { w[start + 7] } else { 1.0 };
     let easy = if rating == 4.0 { w[start + 8] } else { 1.0 };
-    let ln_ld = last_d.ln();
-    let pp = ((-w[start + 4]) * ln_ld).exp(); // last_d^-w[start+4]
+    let pp = ((-w[start + 4]) * ln_ld).exp(); // last_d^-w[start+4] (ln_ld shared; iter13)
     let ln_ls1 = (last_s + 1.0).ln();
     let qbase = (w[start + 5] * ln_ls1).exp(); // (last_s+1)^w[start+5]
     let rexp = ((1.0 - r) * w[start + 6]).exp();
     let nsf_fail = w[start + 3] * pp * (qbase - 1.0) * rexp;
     let pls = last_s.min(nsf_fail);
     let bb = 11.0 - last_d; // aa = exp(w[start]-1.5) hoisted (loop-invariant)
-    let ln_ls = last_s.ln();
-    let cc = ((-w[start + 1]) * ln_ls).exp(); // last_s^-w[start+1]
+    let cc = ((-w[start + 1]) * ln_ls).exp(); // last_s^-w[start+1] (ln_ls shared; iter13)
     let expr = ((1.0 - r) * w[start + 2]).exp();
     let sinc = aa * bb * cc * (expr - 1.0) * hard * easy + 1.0;
     let ls_sinc = last_s * sinc;
@@ -363,10 +364,18 @@ fn step_fwd(w: &[f32], delta_t: f32, rating: f32, state: (f32, f32, f32), nth0: 
     let last_d = clamp(d0, D_MIN, D_MAX);
     let last_sf = clamp(sf0, S_MIN, S_MAX);
     let dt = delta_t.max(0.0);
-    let curve = curve_fwd(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28);
+    // Compute the per-state lns ONCE and share them across the curve + both stability traces:
+    // curve needs ln(last_s)+ln(last_sf); slow stab ln(last_s)+ln(last_d); fast stab
+    // ln(last_sf)+ln(last_d) — so 3 ln/timestep instead of 6. Bit-for-bit (same values). iter13.
+    let ln_last_s = last_s.ln();
+    let ln_last_sf = last_sf.ln();
+    let ln_last_d = last_d.ln();
+    let curve = curve_fwd(
+        w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf,
+    );
     let r = curve.out;
-    let slow = stab_fwd(w, last_s, last_d, r, rating, 7, wc.aa7);
-    let fast = stab_fwd(w, last_sf, last_d, r, rating, 16, wc.aa16);
+    let slow = stab_fwd(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
+    let fast = stab_fwd(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
     let (nd1, nd_out_pre, nd_delta_d) = next_d_fwd(w, last_d, rating, wc.init);
     let (mut ns, mut nsf, mut nd) = (slow.out, fast.out, nd1);
     if nth0 && s0 == 0.0 {
@@ -460,7 +469,11 @@ pub(crate) fn batch_loss(
             state = step_fwd(w, t_hist[t * batch + c], r_hist[t * batch + c], state, t == 0, &wc).0;
         }
         let (s, d, sf) = state;
-        let r = clamp(curve_fwd(w, delta_ts[c], s, sf, d, wc.ln_w27, wc.ln_w28).out, MIN_R, MAX_R);
+        let r = clamp(
+            curve_fwd(w, delta_ts[c], s, sf, d, wc.ln_w27, wc.ln_w28, s.ln(), sf.ln()).out,
+            MIN_R,
+            MAX_R,
+        );
         loss += -(weights[c] as f64)
             * (labels[c] as f64 * (r as f64).ln() + (1.0 - labels[c] as f64) * (1.0 - r as f64).ln());
     }
@@ -486,7 +499,7 @@ fn loss_and_grad_range(
             caches.push(cache);
         }
         let (s, d, sf) = state;
-        let fc = curve_fwd(w, delta_ts[c], s, sf, d, wc.ln_w27, wc.ln_w28);
+        let fc = curve_fwd(w, delta_ts[c], s, sf, d, wc.ln_w27, wc.ln_w28, s.ln(), sf.ln());
         let r_raw = fc.out;
         let r = clamp(r_raw, MIN_R, MAX_R);
         let (lbl, wt) = (labels[c] as f64, weights[c] as f64);

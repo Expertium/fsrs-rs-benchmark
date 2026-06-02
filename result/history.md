@@ -17,6 +17,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 10 | 792 | 738 | 1.074 | 5628 | 5651 | 1.004 | 1.010 | ✓ | accepted | hoist loop-invariant weight constants (ln w27/w28, aa, exp 3w5) out of per-timestep loop |
 | 11 | 746 | 716 | 1.039 | 5651 | 5633 | 0.997 | 0.992 | ✓ | rejected | drop dead train/valid tensor datasets + remove dummy autodiff backward (bit-for-bit, -complexity) |
 | 12 | 738 | 580 | 1.292 | 5651 | 5515 | 0.976 | 0.941 | ✓ | accepted | build train/valid host batches directly (skip burn-tensor floor); remove dummy backward + dead dataloader code |
+| 13 | 577 | 538 | 1.075 | 5515 | 5522 | 1.001 | 1.003 | ✓ | accepted | share ln(last_s/last_sf/last_d) across curve + both stability traces; 3 fewer ln per timestep (bit-for-bit) |
 
-**Cumulative speed_ratio (product of accepted): ×5.182** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×5.570** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
