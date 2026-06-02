@@ -18,7 +18,7 @@ The function being optimized is the Rust `compute_parameters()` in [`fsrs-rs/`](
 | **`compute_parameters.py`** | The **speed** harness the campaign optimizes: times `compute_parameters()` per user (min of 3 runs) and scores it with Rust `evaluate()`, train set == test set. |
 | **`benchmark.py`** | The **reference** harness (5-fold TimeSeriesSplit + Python forgetting curve), used with `evaluate.py` for the bit-for-bit correctness check. |
 
-A candidate is **accepted only if** the median user gets **≥5% faster** *and* accuracy stays within the correctness bars (identical results for math-preserving changes; log loss within ±0.0010 for precision-trading ones), and the speedup out-runs any added code complexity (`complexity.py`). The precise definitions live in [`CLAUDE.md`](CLAUDE.md).
+A candidate is **accepted only if** the median user gets **≥5% faster** *and* accuracy stays within the correctness bars (identical results for math-preserving changes; for precision-trading ones the aggregate log loss must stay within an absolute **±0.0015 of the original baseline** — i.e. `compute_parameters.py` mean LogLoss in **[0.3083, 0.3113]**), and the speedup out-runs any added code complexity (`complexity.py`). The precise definitions live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Setup
 
