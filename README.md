@@ -1,6 +1,6 @@
 # fsrs-rs-speed-autoresearch
 
-An **autoresearch loop** that makes [FSRS-rs](https://github.com/open-spaced-repetition/fsrs-rs) parameter optimization **faster** — so real Anki users spend less time waiting on the optimizer — **without making it less accurate**. An AI agent (Claude) proposes a change, measures it under a strict protocol, and keeps it only if it clears both the speed and the correctness bars. Inspired by AlphaEvolve and [Andrej Karpathy's "autoresearch" repo](https://github.com/karpathy/autoresearch). Also check out [my other autoresearch repo](https://github.com/Expertium/fsrs-autoresearch).
+An **autoresearch loop** that made [FSRS-rs](https://github.com/open-spaced-repetition/fsrs-rs) parameter optimization **>100x faster** — so real Anki users spend less time staring at the optimizer's progress bar and more time doing reviews — **while only making it mildly less accurate**. An AI agent (Claude) proposes a change, measures it under a strict protocol, and keeps it only if it clears both the speed and the correctness bars. Inspired by AlphaEvolve and [Andrej Karpathy's "autoresearch" repo](https://github.com/karpathy/autoresearch). Also check out [my other autoresearch repo](https://github.com/Expertium/fsrs-autoresearch).
 
 [![Campaign progress: cumulative median speedup (top) and median per-user optimizer time (bottom) vs iteration](result/history_plot.png)](result/history_plot.png)
 
