@@ -106,6 +106,20 @@ The top-panel cumulative speedup is a **product of measured ratios**, and that p
 
 **The honest fix is to re-anchor.** Every ~10–20 iterations we measure the *current champion directly against the original iter-0 baseline*, back-to-back in one session. That single ratio is **unbiased** — there's no accept/reject filter applied to it, so no selection creeps in — and it's drift-immune (same session). The distance between the product line and that anchor point is exactly the accumulated inflation. (For example: at iter 18 the product line read ×65.5, but the direct iter-0 anchor was ×62.0 — about 5–6% optimistic. The anchor is the number to trust; the final report re-validates the champion on 1000 users.)
 
+### Final validation — 1000 users
+
+The campaign tunes on 50 users, so the last step re-runs the **frozen champion against the original iter-0 baseline on 1000 users** (a 20× larger, representative sample — `--max-user-id 1000`, 60.4M review-items) to confirm the speedup is real and generalizes, not a 50-user artifact:
+
+| build | median ms/user | median reviews/s | median speedup vs iter-0 |
+| --- | --- | --- | --- |
+| iter-0 baseline | 3659 | 7.4k | 1× |
+| **champion** (portable) | **34.0** | **763k** | **×103.8** |
+| champion + AVX2 *(bonus)* | 18.0 | 1.45M | ×198.3 |
+
+The portable champion lands at **×103.8** on 1000 users — essentially identical to the 50-user direct anchor (≈×104.5), so the speedup holds across the full review-count distribution. Throughput goes from ~7k to ~763k reviews/s. (Accuracy scales gracefully too: the champion's mean log loss is +0.0016 vs iter-0 on this set, about one band-width — the accumulated precision trades don't blow up at scale.) Per-user records: `result/{iter0-1000u-baseline,champ-1000u,avx2-1000u}.jsonl`.
+
+The **AVX2 row is a CPU-specific bonus, not part of the official (portable) result.** Rebuilding with `RUSTFLAGS="-C target-cpu=native"` turns each 8-wide SIMD op from 2×128-bit (SSE2 baseline) into one native 256-bit (AVX2) instruction — ~1.9× more on top, so a typical x86 desktop/laptop (≈2015+) sees ~×198, while phones (ARM/NEON, 128-bit) and the portable build get the full ~×104. It can't count officially because AVX2 is x86-only (constraint 7 requires portability, incl. smartphones); shipping it to users would need runtime CPU dispatch (e.g. the [`multiversion`](https://crates.io/crates/multiversion) crate), since a `target-cpu=native` binary is built for one machine and can't be distributed.
+
 ## Repo tour
 
 `compute_parameters.py` (speed harness) · `benchmark.py` (reference) · `fsrs-rs/src/{model,training,inference}.rs` (the Rust FSRS crate — the optimization target) · `fsrs_rs_python/` (PyO3 binding) · `features/` (review preprocessing) · `complexity.py` (the complexity score) · `profiling/` (profiling tools). The full annotated map is the *Code layout* section of [`CLAUDE.md`](CLAUDE.md).
