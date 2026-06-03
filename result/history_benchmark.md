@@ -6,5 +6,6 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 |---|---|---|---|---|---|---|---|---|---|---|
 | 0 | 278 | 278 | 1.000 | 7278 | 7278 | 1.000 | 1.000 | ✓ | accepted | baseline: benchmark() O(N^2) per-prefix path, inherits Phase-1 shared kernels |
 | 1 | 278 | 227 | 1.160 | 7278 | 7296 | 1.002 | 1.006 | ✓ | accepted | skip dead BCE loss + per-group padding skip in O(N^2) kernels; bit-for-bit |
+| 2 | 233 | 221 | 1.060 | 7296 | 7299 | 1.000 | 1.001 | ✓ | accepted | clone-free count-based outlier filter + branchless validation BCE; +6% bit-for-bit output |
 
-**Cumulative speed_ratio (product of accepted): ×1.160** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×1.230** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.

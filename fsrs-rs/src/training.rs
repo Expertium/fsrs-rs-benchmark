@@ -765,59 +765,61 @@ impl FSRSItem {
     }
 }
 
-/// Compute the outlier-removed (rating, delta_t) buckets from the initialization subset, plus the
-/// `filtered_items` retained for parameter initialization. Split out of `filter_outlier` so the
-/// card-aware training path can reuse the exact same `removed_pairs` to retain items AND their
-/// card ids in lockstep. Behaviour is byte-identical to the original inlined logic.
-fn compute_outlier_removed_pairs(
-    dataset_for_initialization: Vec<FSRSItem>,
-) -> (Vec<FSRSItem>, [HashSet<u32>; 5]) {
+/// Compute the outlier-removed (rating, delta_t) buckets from the initialization subset. The old
+/// `filtered_items` init set is DEAD (every caller of prepare_training_data{,_carded} discards it),
+/// and the threshold logic only ever reads each bucket's SIZE — so we take the init candidates by
+/// REFERENCE and tally per-(rating, delta_t-bucket) COUNTS, cloning nothing and storing no items
+/// (the old code cloned the init items into the caller AND moved them into a Vec<FSRSItem> per
+/// bucket). Split out so the card-aware path reuses the exact same `removed_pairs`; the bucket sizes,
+/// sort order and threshold decisions are identical, so `removed_pairs` is byte-identical.
+fn compute_outlier_removed_pairs<'a>(
+    dataset_for_initialization: impl Iterator<Item = &'a FSRSItem>,
+) -> [HashSet<u32>; 5] {
     let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
     let from_key = |key: u32| f32::from_bits(key);
-    let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
+    let mut groups = HashMap::<u32, HashMap<u32, usize>>::new();
 
-    for item in dataset_for_initialization.into_iter() {
+    for item in dataset_for_initialization {
         let first_review = item.reviews.first().unwrap();
         let first_long_term_review = item.first_long_term_review();
-        let rating_group = groups.entry(first_review.rating).or_default();
-        let delta_t_group = rating_group
+        *groups
+            .entry(first_review.rating)
+            .or_default()
             .entry(to_key(first_long_term_review.delta_t))
-            .or_default();
-        delta_t_group.push(item);
+            .or_default() += 1;
     }
 
-    let mut filtered_items = vec![];
     let mut removed_pairs: [HashSet<u32>; 5] = Default::default();
 
     for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
         let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
 
-        sub_groups.sort_by(|(delta_t_a, subv_a), (delta_t_b, subv_b)| {
-            subv_b
-                .len()
-                .cmp(&subv_a.len())
+        // sort by bucket COUNT desc, then delta_t desc (count == the old sub_group.len()).
+        sub_groups.sort_by(|(delta_t_a, cnt_a), (delta_t_b, cnt_b)| {
+            cnt_b
+                .cmp(cnt_a)
                 .then(from_key(*delta_t_b).total_cmp(&from_key(*delta_t_a)))
         });
 
-        let total = sub_groups.iter().map(|(_, vec)| vec.len()).sum::<usize>();
+        let total = sub_groups.iter().map(|(_, cnt)| *cnt).sum::<usize>();
         let mut has_been_removed = 0;
 
-        for (delta_t, sub_group) in sub_groups.iter().rev() {
-            if has_been_removed + sub_group.len() >= 20.max(total / 20) {
-                if sub_group.len() >= 6
-                    && from_key(*delta_t) <= if rating != 4 { 100.0 } else { 365.0 }
-                {
-                    filtered_items.extend_from_slice(sub_group);
-                } else {
-                    removed_pairs[rating as usize].insert(*delta_t);
-                }
-            } else {
-                has_been_removed += sub_group.len();
+        // Each bucket is either KEPT in the (vestigial) init set or its (rating, delta_t) pair is
+        // flagged as an outlier in `removed_pairs`. Identical control flow to the original, on counts.
+        for (delta_t, cnt) in sub_groups.iter().rev() {
+            let over_threshold = has_been_removed + *cnt >= 20.max(total / 20);
+            let kept_in_init_set = over_threshold
+                && *cnt >= 6
+                && from_key(*delta_t) <= if rating != 4 { 100.0 } else { 365.0 };
+            if !kept_in_init_set {
                 removed_pairs[rating as usize].insert(*delta_t);
+            }
+            if !over_threshold {
+                has_been_removed += *cnt;
             }
         }
     }
-    (filtered_items, removed_pairs)
+    removed_pairs
 }
 
 /// The retain predicate shared by `filter_outlier` and the card-aware path: keep an item unless
@@ -835,9 +837,10 @@ pub fn filter_outlier(
     dataset_for_initialization: Vec<FSRSItem>,
     mut trainset: Vec<FSRSItem>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    let (filtered_items, removed_pairs) = compute_outlier_removed_pairs(dataset_for_initialization);
+    let removed_pairs = compute_outlier_removed_pairs(dataset_for_initialization.iter());
     trainset.retain(|item| item_survives_outlier(item, &removed_pairs));
-    (filtered_items, trainset)
+    // The filtered init set is vestigial (every caller discards it); return empty.
+    (Vec::new(), trainset)
 }
 
 // ========== Dataset Types ==========
@@ -984,14 +987,25 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
 }
 
 pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    let (mut dataset_for_initialization, mut trainset) = items
-        .clone()
-        .into_iter()
-        .partition(|item| item.long_term_review_cnt() == 1);
-    if std::env::var("FSRS_NO_OUTLIER").is_err() {
-        (dataset_for_initialization, trainset) = filter_outlier(dataset_for_initialization, items);
+    // The init set is vestigial (every caller discards it) and the outlier filter only needs the init
+    // candidates' (rating, delta_t) keys — so don't clone the items at all: tally removed_pairs from a
+    // borrowing filter, then keep the items that survive. (The old code did items.clone() then
+    // partitioned/filter_outlier'd; this is byte-identical on the trainset.) The no-outlier branch
+    // preserves the old partition's trainset = items with != 1 long-term review.
+    if std::env::var("FSRS_NO_OUTLIER").is_ok() {
+        let trainset = items
+            .into_iter()
+            .filter(|item| item.long_term_review_cnt() != 1)
+            .collect();
+        return (Vec::new(), trainset);
     }
-    (dataset_for_initialization, trainset)
+    let removed_pairs =
+        compute_outlier_removed_pairs(items.iter().filter(|item| item.long_term_review_cnt() == 1));
+    let trainset = items
+        .into_iter()
+        .filter(|item| item_survives_outlier(item, &removed_pairs))
+        .collect();
+    (Vec::new(), trainset)
 }
 
 /// Card-aware twin of `prepare_training_data`: applies the exact same outlier retain but to the
@@ -1003,15 +1017,13 @@ pub(crate) fn prepare_training_data_carded(
     items: Vec<FSRSItem>,
     card_ids: Vec<i64>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>, Vec<i64>) {
-    let dataset_for_initialization: Vec<FSRSItem> = items
-        .iter()
-        .filter(|item| item.long_term_review_cnt() == 1)
-        .cloned()
-        .collect();
+    // Init set vestigial (the caller discards it); the outlier filter needs only the init candidates'
+    // keys -> no clone. No-outlier branch preserves the old behaviour: trainset = ALL items + card_ids.
     if std::env::var("FSRS_NO_OUTLIER").is_ok() {
-        return (dataset_for_initialization, items, card_ids);
+        return (Vec::new(), items, card_ids);
     }
-    let (filtered_items, removed_pairs) = compute_outlier_removed_pairs(dataset_for_initialization);
+    let removed_pairs =
+        compute_outlier_removed_pairs(items.iter().filter(|item| item.long_term_review_cnt() == 1));
     let mut trainset = Vec::with_capacity(items.len());
     let mut trainset_card_ids = Vec::with_capacity(items.len());
     for (item, cid) in items.into_iter().zip(card_ids) {
@@ -1020,7 +1032,7 @@ pub(crate) fn prepare_training_data_carded(
             trainset_card_ids.push(cid);
         }
     }
-    (filtered_items, trainset, trainset_card_ids)
+    (Vec::new(), trainset, trainset_card_ids)
 }
 
 // ========== BCE Loss ==========

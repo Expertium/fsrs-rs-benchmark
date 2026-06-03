@@ -907,13 +907,15 @@ pub(crate) fn batch_loss_simd(
             MIN_R,
             MAX_R,
         );
-        let r_arr = r.to_array();
-        for (j, &rr) in r_arr.iter().enumerate() {
-            let c = c0 + j;
-            let rr = rr as f64;
-            loss += -(weights[c] as f64)
-                * (labels[c] as f64 * rr.ln() + (1.0 - labels[c] as f64) * (1.0 - rr).ln());
-        }
+        // Branchless BCE for 0/1 labels (Andrew): -ln(1 - |label - r|) = -ln(r) for label 1,
+        // -ln(1-r) for label 0 — math-identical for hard labels. Computes the whole 8-lane BCE as
+        // ONE vectorized ln8 (vs r.to_array() + 8 scalar f64 lns), summed in f64 via reduce_add.
+        // Inexact (f32 minimax ln8 vs f64 libm ln), but this loss only feeds best-epoch argmin and the
+        // error ≪ the epoch-to-epoch gaps, so best_w (hence params/benchmark loss) is unchanged.
+        let lbl = load8(labels, c0);
+        let wt = load8(weights, c0);
+        let arg = one - (lbl - r).fast_max(r - lbl); // 1 - |label - r|  (r already clamped into (0,1))
+        loss += ((k(0.0) - wt) * ln8::<false>(arg)).reduce_add() as f64;
     }
     // Remainder (< 8 cards) via the scalar path.
     for c in (n_groups * 8)..batch {
