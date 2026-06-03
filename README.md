@@ -120,6 +120,20 @@ The portable champion lands at **×103.8** on 1000 users — essentially identic
 
 The **AVX2 row is a CPU-specific bonus, not part of the official (portable) result.** Rebuilding with `RUSTFLAGS="-C target-cpu=native"` turns each 8-wide SIMD op from 2×128-bit (SSE2 baseline) into one native 256-bit (AVX2) instruction — ~1.9× more on top, so a typical x86 desktop/laptop (≈2015+) sees ~×198, while phones (ARM/NEON, 128-bit) and the portable build get the full ~×104. It can't count officially because AVX2 is x86-only (constraint 7 requires portability, incl. smartphones); shipping it to users would need runtime CPU dispatch (e.g. the [`multiversion`](https://crates.io/crates/multiversion) crate), since a `target-cpu=native` binary is built for one machine and can't be distributed.
 
+### How much of the ×104 was "free" vs. a precision trade?
+
+The correctness bars allow two kinds of accepted change (see [`CLAUDE.md`](CLAUDE.md) constraint 3): **bit-for-bit** ones that leave every trained weight (and the log loss) *byte-identical*, and **precision/reassociation trades** that reorder float accumulation or approximate a transcendental, nudging the log loss but staying inside the accuracy band. Splitting the 20 accepted Phase-1 iterations by which checks they recorded (`0/50 params, ΔLogLoss = 0` vs. a drift) and multiplying out each group's `speed_ratio`s:
+
+| kind of change | cumulative factor | share of the ×112.7 product |
+| --- | --- | --- |
+| **bit-for-bit** (exactly accuracy-preserving) | **×3.25** | ~3% |
+| **precision / reassociation trades** | **×34.6** | ~97% |
+| total (product of all accepted) | ×112.7 | — |
+
+So almost all of the speedup **required trading a little floating-point precision**. The three giants are all precision trades: replacing the autodiff tape with a hand-written analytic gradient (**×2.17**), SIMD-vectorizing that gradient with `f32×8` (**×2.50**), and the O(N) expanding window (**×3.12**) — each reorders the order floats are summed in, so none can be bit-for-bit. The "free" ×3.25 is the exact restructuring: building the host batches directly and once, hoisting loop-invariant work, sharing repeated `ln`s, a hand-rolled Adam, skipping a dead final-timestep update.
+
+Two caveats. (1) This is an exact *decomposition* of the logged product (3.25 × 34.6 = 112.7), **not** a forecast — the ratios are path-dependent (each measured against the then-current champion), so a bit-for-bit-*only* campaign would likely land somewhat **below** ×3.25, because some "free" wins were amplified by the precision wins that came before them. (2) Two of the bit-for-bit entries (SIMD/analytic *validation*) are really precision changes that came out byte-identical only because validation merely picks the best epoch and the approximation never flipped that pick; counting only *strictly* math-unchanged work drops the free factor to ~×2.25.
+
 ### The reference harness (`benchmark()`) got ~32× faster too
 
 `benchmark()` (the 5-fold cross-validation reference harness, [`benchmark.py`](benchmark.py)) was never *directly* optimized during the ×104 campaign — it was the correctness anchor. But it shares the training loop with `compute_parameters()`, so it inherited the shared-kernel wins for free, and a follow-up campaign then tuned its own code path. Timing both the original iter-0 binary and the current champion the same way (50 users, min-of-3, summed over the 5 folds):
