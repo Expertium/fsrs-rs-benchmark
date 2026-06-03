@@ -17,6 +17,14 @@ hand every iteration is error-prone — the spots that bite are the derived numb
     # integrity check: md cumulative == product of accepted jsonl speed_ratios, 1 row per iter
     python log_history.py verify
 
+Pass `--benchmark` to operate on the Phase-2 benchmark() history instead
+(`result/history_benchmark.jsonl` + `.md`) — same format, separate files:
+
+    python log_history.py add --benchmark <<'JSON'
+    { … }
+    JSON
+    python log_history.py verify --benchmark
+
 `add` auto-fills the fields you can derive, so you only pass what you measured:
   * `timestamp`           — now() if absent
   * `complexity_before`   — the last ACCEPTED entry's `complexity_after` if absent
@@ -38,16 +46,40 @@ from datetime import datetime
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent
+
+# Phase 1 (the default): optimize compute_parameters(). Phase 2 (--benchmark): optimize
+# benchmark(). Same per-entry format and same derived-field logic; only the target files and the
+# md header preamble differ. main() swaps these module globals when --benchmark is passed.
 _JSONL = _REPO / "result" / "history.jsonl"
 _MD = _REPO / "result" / "history.md"
 
-_MD_HEADER = """# FSRS-rs speed autoresearch — iteration history
+_TABLE_HEADER = (
+    "| iter | time_before (ms) | time_after (ms) | speed_ratio | cplx_before | cplx_after |"
+    " cplx_ratio | cplx^2.5 | checks | status | summary |\n"
+    "|---|---|---|---|---|---|---|---|---|---|---|\n"
+)
 
-Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **speed_ratio ≥ complexity_ratio^2.5** (constraint 13). speed_ratio is the *median of per-user ratios*, measured back-to-back vs the then-current champion. Times are machine/session-specific (informational).
+_MD_HEADER = (
+    "# FSRS-rs speed autoresearch — iteration history\n\n"
+    "Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **speed_ratio ≥"
+    " complexity_ratio^2.5** (constraint 13). speed_ratio is the *median of per-user ratios*,"
+    " measured back-to-back vs the then-current champion. Times are machine/session-specific"
+    " (informational).\n\n" + _TABLE_HEADER
+)
 
-| iter | time_before (ms) | time_after (ms) | speed_ratio | cplx_before | cplx_after | cplx_ratio | cplx^2.5 | checks | status | summary |
-|---|---|---|---|---|---|---|---|---|---|---|
-"""
+# Phase-2 header: optimizing benchmark() (benchmark.py's O(N^2) per-prefix path). Only BIT-FOR-BIT
+# changes are viable there — its mean log loss sits ~5e-5 under the band ceiling, so any inexact
+# change busts it. time_before/after = the per-user MIN-of-3 Rust benchmark() time SUMMED over the
+# 5 TimeSeriesSplit folds (profiling/measure_benchmark.py), median across users.
+_MD_HEADER_BENCH = (
+    "# FSRS-rs speed autoresearch — benchmark() iteration history (Phase 2)\n\n"
+    "Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **speed_ratio ≥"
+    " complexity_ratio^2.5** (constraint 13). Phase 2 optimizes benchmark() (benchmark.py's O(N^2)"
+    " per-prefix anchor path); only **BIT-FOR-BIT** changes are viable (its mean log loss is ~5e-5"
+    " under the band ceiling). speed_ratio is the *median of per-user ratios* of the"
+    " summed-over-folds Rust benchmark() time, measured back-to-back vs the then-current champion."
+    " Times are machine/session-specific (informational).\n\n" + _TABLE_HEADER
+)
 
 # The fields a markdown row never derives — `add` requires these on stdin.
 _REQUIRED = ("iteration", "time_before", "time_after", "speed_ratio",
@@ -187,10 +219,17 @@ def cmd_verify() -> int:
 
 
 def main() -> int:
-    if len(sys.argv) < 2 or sys.argv[1] not in {"add", "verify"}:
+    argv = [a for a in sys.argv[1:] if a != "--benchmark"]
+    benchmark = "--benchmark" in sys.argv[1:]
+    if not argv or argv[0] not in {"add", "verify"}:
         print(__doc__)
         return 2
-    return cmd_add() if sys.argv[1] == "add" else cmd_verify()
+    if benchmark:
+        global _JSONL, _MD, _MD_HEADER
+        _JSONL = _REPO / "result" / "history_benchmark.jsonl"
+        _MD = _REPO / "result" / "history_benchmark.md"
+        _MD_HEADER = _MD_HEADER_BENCH
+    return cmd_add() if argv[0] == "add" else cmd_verify()
 
 
 if __name__ == "__main__":

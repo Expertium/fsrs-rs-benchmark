@@ -65,6 +65,26 @@ impl FSRS {
         })
     }
 
+    /// Like `benchmark`, but also returns the elapsed seconds of the Rust
+    /// `fsrs::benchmark()` call (monotonic clock; the PyO3 item conversion above the
+    /// timer is excluded, mirroring `compute_parameters`'s timing). Profiling-only: the
+    /// Phase-2 measurement harness (`profiling/measure_benchmark.py`) uses this to time
+    /// benchmark()'s Rust region; benchmark.py itself still calls the untimed `benchmark`.
+    pub fn benchmark_timed(&self, train_set: Vec<FSRSItem>) -> (Vec<f32>, f64) {
+        let input = ComputeParametersInput {
+            train_set: train_set.iter().map(|x| x.0.clone()).collect(),
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: false,
+            num_relearning_steps: None,
+            card_ids: None,
+        };
+        let start = std::time::Instant::now();
+        let params = fsrs::benchmark(input);
+        let elapsed = start.elapsed().as_secs_f64();
+        (params, elapsed)
+    }
+
     #[pyo3(signature = (items, starting_states=None))]
     pub fn memory_state_batch(
         &self,

@@ -860,8 +860,15 @@ pub(crate) fn batch_loss_simd(
     let n_groups = batch / 8;
     for g in 0..n_groups {
         let c0 = g * 8;
+        // Per-group active length: trailing all-padding timesteps (rating 0) pass the state through
+        // unchanged, so the final state — and thus the scored curve below — is bit-for-bit identical
+        // when we stop at `sl`. (iter26's per-group skip; see loss_and_grad_range_simd.)
+        let mut sl = seq_len;
+        while sl > 1 && load8(r_hist, (sl - 1) * batch + c0).reduce_add() == 0.0 {
+            sl -= 1;
+        }
         let (mut s, mut d, mut sf) = (k(0.0), k(0.0), k(0.0));
-        for t in 0..seq_len {
+        for t in 0..sl {
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             if t == 0 {
@@ -1092,6 +1099,11 @@ fn step8_bwd(
 /// Per-group weight gradients accumulate in an f32x8 bank, then horizontal-sum into the f64 `gw`
 /// once per group — so cross-card/cross-group accumulation stays f64 while the per-card VJP is f32.
 /// Requires the batch to be padded to a multiple of 8 (build_host_batches does this).
+///
+/// The loss VALUE is unused by training (only the gradient drives Adam — the training caller
+/// discards the return, and validation uses `batch_loss_simd`), so the per-lane f64 BCE is skipped
+/// here and 0.0 is returned. This is bit-for-bit on the gradient: `gw` is built only from `g_r`
+/// (computed from `r`), never from the loss accumulator. (Mirrors `card_loss_and_grad_simd`.)
 #[allow(clippy::too_many_arguments)]
 fn loss_and_grad_range_simd(
     w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
@@ -1100,13 +1112,22 @@ fn loss_and_grad_range_simd(
     let wc = wconsts(w);
     let k = f32x8::splat;
     let one = k(1.0);
-    let mut loss = 0.0f64;
     let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
     for g in g_start..g_end {
         let c0 = g * 8;
         caches.clear();
+        // Per-group active length: this chunk runs to the batch-wide seq_len (= its longest card),
+        // but a group of 8 length-similar cards is usually shorter. Trailing timesteps where all 8
+        // lanes are padding (rating 0) are pure state passthrough (the rating==0 blend keeps state
+        // and adds 0 to the gradient), so the final state — and thus the scored curve below and the
+        // whole backward — are bit-for-bit identical when we stop at `sl`. (iter26's per-group skip,
+        // here on the O(N^2) path.) ratings are >=1 for real reviews, so reduce_add==0 <=> all pad.
+        let mut sl = seq_len;
+        while sl > 1 && load8(r_hist, (sl - 1) * batch + c0).reduce_add() == 0.0 {
+            sl -= 1;
+        }
         let (mut s, mut d, mut sf) = (k(0.0), k(0.0), k(0.0));
-        for t in 0..seq_len {
+        for t in 0..sl {
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { k(0.0) } else { load8(t_hist, base) };
@@ -1124,21 +1145,14 @@ fn loss_and_grad_range_simd(
         let fc = curve8_fwd::<false>(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
         let r_raw = fc.out;
         let r = clamp8(r_raw, MIN_R, MAX_R);
-        // BCE loss in f64 (per lane). Only used as the return value (training discards it).
-        let r_arr = r.to_array();
-        for (j, &rr) in r_arr.iter().enumerate() {
-            let c = c0 + j;
-            let rr = rr as f64;
-            loss += -(weights[c] as f64)
-                * (labels[c] as f64 * rr.ln() + (1.0 - labels[c] as f64) * (1.0 - rr).ln());
-        }
+        // (loss VALUE skipped — see the fn doc; training discards it, validation uses batch_loss_simd.)
         // d loss / d r, then the [MIN_R, MAX_R] clamp, in f32x8.
         let g_r = (k(0.0) - wt) * (lbl / r - (one - lbl) / (one - r));
         let g_rraw = (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, k(0.0));
         let mut gw_g = [f32x8::splat(0.0); 36];
         let (mut g_s, mut g_sf, mut g_d) =
             curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, &mut gw_g, wc.ln_w27, wc.ln_w28);
-        for t in (0..seq_len).rev() {
+        for t in (0..sl).rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
             let (gs0, gd0, gsf0) =
                 step8_bwd(w, &caches[t], (g_s, g_d, g_sf), f32x8::splat(0.0), &mut gw_g, &wc);
@@ -1150,12 +1164,13 @@ fn loss_and_grad_range_simd(
             gw[i] += gw_g[i].reduce_add() as f64;
         }
     }
-    loss
+    0.0
 }
 
-/// Vectorized forward+backward BCE loss for one batch (8 cards/lane). Returns the summed loss and
-/// accumulates d(loss)/d(w) into `gw` (length 36). The batch must be padded to a multiple of 8.
-/// This is the precision-trading (3b band) f32x8 replacement for the scalar batch_loss_and_grad.
+/// Vectorized forward+backward BCE gradient for one batch (8 cards/lane). Accumulates d(loss)/d(w)
+/// into `gw` (length 36) and returns 0.0 — the loss VALUE is unused by training (see
+/// loss_and_grad_range_simd; validation uses batch_loss_simd). The batch must be padded to a
+/// multiple of 8. This is the precision-trading (3b band) f32x8 replacement for batch_loss_and_grad.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn batch_loss_and_grad_simd(
     w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,

@@ -27,6 +27,9 @@ median per-user time, ms).
     python plot_history.py                       # -> result/history_plot.png
     python plot_history.py --no-summaries
     python plot_history.py --history alt.jsonl --out alt.png
+    python plot_history.py --benchmark           # Phase-2 benchmark() history
+                                                 #   result/history_benchmark.jsonl
+                                                 #   -> result/history_benchmark_plot.png
 """
 from __future__ import annotations
 
@@ -45,6 +48,9 @@ import matplotlib.ticker as ticker
 REPO = Path(__file__).resolve().parent
 HISTORY = REPO / "result" / "history.jsonl"
 DEFAULT_OUT = REPO / "result" / "history_plot.png"
+# Phase-2 (benchmark()) history file pair, selected by --benchmark.
+HISTORY_BENCH = REPO / "result" / "history_benchmark.jsonl"
+DEFAULT_OUT_BENCH = REPO / "result" / "history_benchmark_plot.png"
 
 # The best-so-far frontier is the set of accepted records (the iter-0 baseline
 # is "accepted" too). "champion" is not a status value.
@@ -136,6 +142,12 @@ def main() -> None:
     ap.add_argument("--history", type=Path, default=HISTORY)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="plot the Phase-2 benchmark() history (result/history_benchmark.jsonl -> "
+        "result/history_benchmark_plot.png) unless --history/--out are given explicitly",
+    )
+    ap.add_argument(
         "--no-summaries",
         action="store_true",
         help="hide the champion summary labels on the speedup panel",
@@ -159,6 +171,13 @@ def main() -> None:
         help="summary label angle, degrees (default 40)",
     )
     args = ap.parse_args()
+    # --benchmark selects the Phase-2 file pair, but only for whichever of --history/--out the
+    # user left at its default (so an explicit override always wins).
+    if args.benchmark:
+        if args.history == HISTORY:
+            args.history = HISTORY_BENCH
+        if args.out == DEFAULT_OUT:
+            args.out = DEFAULT_OUT_BENCH
 
     rows = load(args.history)
     champs = [r for r in rows if r.get("status") in CHAMPION]
@@ -224,8 +243,9 @@ def main() -> None:
             )
 
     ax_sp.set_ylabel("Cumulative speedup vs baseline (×)\nhigher=better", fontsize=14)
+    _phase = "benchmark() " if args.benchmark else ""
     ax_sp.set_title(
-        f"FSRS-rs speed autoresearch — {len(champs) - 1} accepted speedups, "
+        f"FSRS-rs speed autoresearch — {_phase}{len(champs) - 1} accepted speedups, "
         f"{len(rejects)} rejected (cumulative ×{cy[-1]:.1f})",
         fontsize=17,
     )
