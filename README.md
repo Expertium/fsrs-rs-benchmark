@@ -120,6 +120,17 @@ The portable champion lands at **×103.8** on 1000 users — essentially identic
 
 The **AVX2 row is a CPU-specific bonus, not part of the official (portable) result.** Rebuilding with `RUSTFLAGS="-C target-cpu=native"` turns each 8-wide SIMD op from 2×128-bit (SSE2 baseline) into one native 256-bit (AVX2) instruction — ~1.9× more on top, so a typical x86 desktop/laptop (≈2015+) sees ~×198, while phones (ARM/NEON, 128-bit) and the portable build get the full ~×104. It can't count officially because AVX2 is x86-only (constraint 7 requires portability, incl. smartphones); shipping it to users would need runtime CPU dispatch (e.g. the [`multiversion`](https://crates.io/crates/multiversion) crate), since a `target-cpu=native` binary is built for one machine and can't be distributed.
 
+### The reference harness (`benchmark()`) got ~32× faster too
+
+`benchmark()` (the 5-fold cross-validation reference harness, [`benchmark.py`](benchmark.py)) was never *directly* optimized during the ×104 campaign — it was the correctness anchor. But it shares the training loop with `compute_parameters()`, so it inherited the shared-kernel wins for free, and a follow-up campaign then tuned its own code path. Timing both the original iter-0 binary and the current champion the same way (50 users, min-of-3, summed over the 5 folds):
+
+| build | median ms/user | median train-rows/s | median speedup vs iter-0 |
+| --- | --- | --- | --- |
+| iter-0 baseline | 8337 | 6.1k | 1× |
+| **champion** | **239** | **216k** | **×32.5** |
+
+That **×32.5** (per-user range 27–58×) decomposes as **×26.4 inherited for free** from `compute_parameters()`'s shared kernels (analytic gradient, f32×8 SIMD, minimax transcendentals, hand-rolled Adam, build-once host batches) **× 1.23** from the dedicated `benchmark()` campaign. It's smaller than the ×104 above because `benchmark()` deliberately keeps the **O(N²) per-prefix** path as its bit-for-bit anchor — it never adopts the O(N) expanding window (compute_parameters' single biggest win, ×3.12). The arithmetic lines up: **32.5 × 3.12 ≈ 101 ≈ ×104**, i.e. `benchmark()` is exactly "compute_parameters minus the one optimization it doesn't share."
+
 ## Repo tour
 
 `compute_parameters.py` (speed harness) · `benchmark.py` (reference) · `fsrs-rs/src/{model,training,inference}.rs` (the Rust FSRS crate — the optimization target) · `fsrs_rs_python/` (PyO3 binding) · `features/` (review preprocessing) · `complexity.py` (the complexity score) · `profiling/` (profiling tools). The full annotated map is the *Code layout* section of [`CLAUDE.md`](CLAUDE.md).
