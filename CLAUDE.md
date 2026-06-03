@@ -71,28 +71,30 @@ Whenever you catch yourself going "wait — wrong path / wrong command / that's 
 ## Code layout
 
 ```
-compute_parameters.py   # ★ timing harness you optimize: Rust compute_parameters() + Rust evaluate(), train==test, min-of-3
-benchmark.py            # reference harness (5-fold TimeSeriesSplit + Python curve) for the 3a bit-for-bit check
+compute_parameters.py   # ★ PHASE-1 speed harness (champion FROZEN): times Rust compute_parameters(), scores with Rust evaluate(), train==test, min-of-3
+benchmark.py            # ★ PHASE-2 target + reference harness: 5-fold TimeSeriesSplit + Python forgetting curve; also the 3a bit-for-bit anchor (timed via profiling/measure_benchmark.py)
 evaluate.py             # Python forgetting-curve scorer used by benchmark.py (read-only; skipped by complexity.py)
 config.py               # CLI args + Config (seed=42, max_seq_len, --data path, --processes)
 data_loader.py          # per-user revlog loading from ../anki-revlogs-10k/revlogs/user_id=*
-utils.py                # sort_jsonl(), catch_exceptions(), shared helpers
-complexity.py           # constraint-13 score over .py/.rs (skips target/ __pycache__/ profiling/ + benchmark/evaluate/plot_history/complexity)
-plot_history.py         # plots the speed history (read-only tooling; skipped by complexity.py)
-features/               # preprocessing: emits N-1 expanding-window prefix-items/card (card_id-tagged so Rust folds them into ONE O(N) pass — iter18)
+utils.py                # sort_jsonl(), catch_exceptions(), evaluate(), shared helpers
+complexity.py           # constraint-13 score over .py/.rs (skips target/ __pycache__/ profiling/ + benchmark/evaluate/plot_history/log_history/complexity)
+log_history.py          # appends one iteration to result/history{,_benchmark}.{jsonl,md} (--benchmark = Phase 2); read-only tooling, skipped by complexity.py
+plot_history.py         # plots the history -> result/history{,_benchmark}_plot.png (--benchmark = Phase 2); read-only tooling, skipped by complexity.py
+features/               # preprocessing: emits N-1 expanding-window prefix-items/card (card_id-tagged so Rust folds them into ONE O(N) pass — iter18); + __init__.py
   base.py               #   builds t_history/r_history; caps each card at 2× max_seq_len reviews
   fsrs_engineer.py      #   FSRS (t_history, rating) feature engineering
   create_features.py    #   feature-builder dispatch
-fsrs-rs/src/            # the Rust FSRS crate (path dep of the binding) = the main mutation surface (3a/6)
-  analytic.rs           #   ★ HOT PATH: hand-written SIMD f32x8 forward+gradient — card_*_simd = O(N) windowed per-card recurrence (iter18); batch_*_simd = O(N²) per-prefix (benchmark ref)
-  training.rs           #   ★ Rust compute_parameters(), train loop, Adam, epochs/batching, card grouping, Dual35 penalty gradient
+fsrs-rs/src/            # the Rust FSRS crate (path dep of the binding) = the main mutation surface (3a/6); Cargo.toml alongside
+  analytic.rs           #   ★ HOT PATH: hand-written SIMD f32x8 forward+gradient — card_*_simd = O(N) windowed per-card recurrence (compute_parameters); batch_loss_*simd/loss_and_grad_range_simd = O(N²) per-prefix (benchmark / Phase-2 target)
+  training.rs           #   ★ Rust compute_parameters() AND benchmark(); train loop, Adam, epochs/batching, card grouping + outlier filter (count-based), Dual35 penalty gradient
   model.rs              #   burn-tensor forgetting curve + per-timestep recurrence forward()/update_state() (now only the frozen evaluate()/inference path)
   inference.rs          #   evaluate() = the scorer; do NOT modify (constraint 11 anchor)
   lib.rs, error.rs      #   crate exports, DEFAULT_PARAMETERS, error types
-fsrs_rs_python/         # PyO3 binding -> built (maturin) into the installed fsrs_rs_python extension
-  src/lib.rs            #   Python entry points; times the Rust compute_parameters() with a monotonic clock
-result/                 # per-user .jsonl; compute_parameters-*.jsonl = champion record, FSRS-rs-*.jsonl = benchmark output
-profiling/              # profiling-only tools, skipped by complexity.py (see "Where the time goes")
+fsrs_rs_python/         # PyO3 binding -> built (maturin) into the installed fsrs_rs_python extension; Cargo.toml alongside
+  src/lib.rs            #   Python entry points; compute_parameters() + benchmark_timed() time their Rust region with a monotonic clock (PyO3 conversion excluded)
+  __init__.py           #   loads the first fsrs_rs_python.*.pyd hit (release > release/deps > debug); copies .dll->.pyd only when the .pyd is ABSENT — the .pyd-swap recipe relies on this
+result/                 # per-user .jsonl (compute_parameters-* = champion record; FSRS-rs-* = benchmark output; {iter0,champ,avx2}-Nu = 1000-user validation; *(old) = kept baselines) + campaign history: history{,_benchmark}.{jsonl,md} + *_plot.png
+profiling/              # profiling-only tools (skipped by complexity.py): measure.py (compute_parameters .pyd-swap timing) + measure_benchmark.py (Phase-2 benchmark() timing) + profile_structure/_profile_user/profile_ram/minimax_coeffs + bench_*.rs microbenches; see "Where the time goes"
 evaluation/  raw/       # benchmark.py detailed-eval / --raw prediction dumps
 ```
 Build artifacts (`*/target/`, `__pycache__/`) and the external dataset (`../anki-revlogs-10k/`) are omitted.
