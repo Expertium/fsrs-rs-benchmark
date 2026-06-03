@@ -124,13 +124,15 @@ The **AVX2 row is a CPU-specific bonus, not part of the official (portable) resu
 
 The correctness bars allow two kinds of accepted change (see [`CLAUDE.md`](CLAUDE.md) constraint 3): **bit-for-bit** ones that leave every trained weight (and the log loss) *byte-identical*, and **precision/reassociation trades** that reorder float accumulation or approximate a transcendental, nudging the log loss but staying inside the accuracy band. Splitting the 20 accepted Phase-1 iterations by which checks they recorded (`0/50 params, ΔLogLoss = 0` vs. a drift) and multiplying out each group's `speed_ratio`s:
 
-| kind of change | cumulative factor | share of the ×112.7 product |
+| kind of change | cumulative factor | share of the speedup (log) |
 | --- | --- | --- |
-| **bit-for-bit** (exactly accuracy-preserving) | **×3.25** | ~3% |
-| **precision / reassociation trades** | **×34.6** | ~97% |
-| total (product of all accepted) | ×112.7 | — |
+| **bit-for-bit** (exactly accuracy-preserving) | **×3.25** | ~25% |
+| **precision / reassociation trades** | **×34.6** | ~75% |
+| total (product of all accepted) | ×112.7 | 100% |
 
-So almost all of the speedup **required trading a little floating-point precision**. The three giants are all precision trades: replacing the autodiff tape with a hand-written analytic gradient (**×2.17**), SIMD-vectorizing that gradient with `f32×8` (**×2.50**), and the O(N) expanding window (**×3.12**) — each reorders the order floats are summed in, so none can be bit-for-bit. The "free" ×3.25 is the exact restructuring: building the host batches directly and once, hoisting loop-invariant work, sharing repeated `ln`s, a hand-rolled Adam, skipping a dead final-timestep update.
+The shares are of the **log** speedup — the only split that adds up to 100%, because speedups compound *multiplicatively* (×3.25 × ×34.6 = ×112.7, and log 3.25 + log 34.6 = log 112.7). A linear "share of ×112.7" wouldn't sum to 100% (the ×3.25 bit-for-bit factor is only ~3% of ×112.7 on its own, but you can't linearly attribute a product).
+
+So the bulk of the speedup came from **trading a little floating-point precision** — the precision factor (×34.6) is more than 10× the bit-for-bit one (×3.25). The three giants are all precision trades: replacing the autodiff tape with a hand-written analytic gradient (**×2.17**), SIMD-vectorizing that gradient with `f32×8` (**×2.50**), and the O(N) expanding window (**×3.12**) — each reorders the order floats are summed in, so none can be bit-for-bit. The "free" ×3.25 is the exact restructuring: building the host batches directly and once, hoisting loop-invariant work, sharing repeated `ln`s, a hand-rolled Adam, skipping a dead final-timestep update.
 
 Two caveats. (1) This is an exact *decomposition* of the logged product (3.25 × 34.6 = 112.7), **not** a forecast — the ratios are path-dependent (each measured against the then-current champion), so a bit-for-bit-*only* campaign would likely land somewhat **below** ×3.25, because some "free" wins were amplified by the precision wins that came before them. (2) Two of the bit-for-bit entries (SIMD/analytic *validation*) are really precision changes that came out byte-identical only because validation merely picks the best epoch and the approximation never flipped that pick; counting only *strictly* math-unchanged work drops the free factor to ~×2.25.
 
