@@ -208,8 +208,15 @@ def _worker_config(data_path: str, max_user_id: int) -> Config:
     return _CONFIG
 
 
-def process(user_id: int, data_path: str, max_user_id: int) -> Optional[dict]:
-    """Time the sum of per-fold benchmark() Rust calls for one user, min-of-3."""
+def process(user_id: int, data_path: str, max_user_id: int,
+            python_timer: bool = False) -> Optional[dict]:
+    """Time the sum of per-fold benchmark() Rust calls for one user, min-of-3.
+
+    Default uses the Rust-region timer (benchmark_timed). `python_timer=True` instead wraps the
+    plain benchmark() call in a Python perf_counter (includes the small PyO3 item conversion) — the
+    ONLY way to time the ancient iter-0 binary, which predates benchmark_timed. For a fair iter-0 vs
+    champion comparison, time BOTH with python_timer (the conversion is ~constant, so it cancels)."""
+    import time
     try:
         config = _worker_config(data_path, max_user_id)
         dataset = UserDataLoader(config).load_user_data(user_id)
@@ -224,7 +231,12 @@ def process(user_id: int, data_path: str, max_user_id: int) -> Optional[dict]:
             total_secs = 0.0
             for items in folds:
                 try:
-                    p, secs = backend.benchmark_timed(items)
+                    if python_timer:
+                        t0 = time.perf_counter()
+                        p = backend.benchmark(items)
+                        secs = time.perf_counter() - t0
+                    else:
+                        p, secs = backend.benchmark_timed(items)
                 except Exception:
                     p, secs = default_w, 0.0  # inadequate-data fold: benchmark.py uses defaults
                 total_secs += secs
@@ -246,7 +258,8 @@ def process(user_id: int, data_path: str, max_user_id: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # run / compare
 # ---------------------------------------------------------------------------
-def cmd_run(label: str, max_user_id: int, processes: int, data_path: str) -> int:
+def cmd_run(label: str, max_user_id: int, processes: int, data_path: str,
+            python_timer: bool = False) -> int:
     _SNAP_DIR.mkdir(parents=True, exist_ok=True)
     # Discover user ids from the revlogs partition dir (same source benchmark.py uses).
     revlogs = _Path(data_path) / "revlogs"
@@ -270,7 +283,7 @@ def cmd_run(label: str, max_user_id: int, processes: int, data_path: str) -> int
     with ProcessPoolExecutor(
         max_workers=processes, initializer=_init_worker, initargs=(counter, lock)
     ) as ex:
-        futs = [ex.submit(process, uid, data_path, max_user_id) for uid in user_ids]
+        futs = [ex.submit(process, uid, data_path, max_user_id, python_timer) for uid in user_ids]
         for fut in (pbar := tqdm(as_completed(futs), total=len(futs), smoothing=0.03)):
             rec = fut.result()
             if rec is None:
@@ -351,12 +364,15 @@ def main() -> int:
     pr.add_argument("--max-user-id", type=int, default=50)
     pr.add_argument("--processes", type=int, default=10)
     pr.add_argument("--data", default="../anki-revlogs-10k")
+    pr.add_argument("--python-timer", action="store_true",
+                    help="time plain benchmark() via Python perf_counter (works on the ancient iter-0 "
+                         "binary, which has no benchmark_timed); use on BOTH sides for a fair ratio")
     pc = sub.add_parser("compare")
     pc.add_argument("champ")
     pc.add_argument("cand")
     args = ap.parse_args()
     if args.cmd == "run":
-        return cmd_run(args.label, args.max_user_id, args.processes, args.data)
+        return cmd_run(args.label, args.max_user_id, args.processes, args.data, args.python_timer)
     if args.cmd == "compare":
         return cmd_compare(args.champ, args.cand)
     return 2
