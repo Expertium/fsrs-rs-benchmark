@@ -1,0 +1,14 @@
+{"epochs": 8, "mean_logloss": 0.311, "rough_median_ms": 42.0}
+{"epochs": 9, "mean_logloss": 0.310875, "rough_median_ms": 45.5}
+{"epochs": 10, "mean_logloss": 0.310411, "rough_median_ms": 52.8}
+{"epochs": 11, "mean_logloss": 0.310066, "rough_median_ms": 54.4}
+{"epochs": 12, "mean_logloss": 0.310244, "rough_median_ms": 59.4}
+{"epochs": 13, "mean_logloss": 0.310569, "rough_median_ms": 65.4}
+{"epochs": 14, "mean_logloss": 0.310254, "rough_median_ms": 66.5}
+{"epochs": 15, "mean_logloss": 0.310218, "rough_median_ms": 71.7}
+{"epochs": 16, "mean_logloss": 0.309937, "rough_median_ms": 76.6}
+{"epochs": 18, "mean_logloss": 0.310245, "rough_median_ms": 91.3}
+{"epochs": 19, "mean_logloss": 0.309982, "rough_median_ms": 86.3}
+{"epochs": 20, "mean_logloss": 0.309774, "rough_median_ms": 92.6}
+{"epochs": 21, "mean_logloss": 0.30987, "rough_median_ms": 91.5}
+{"epochs": 23, "mean_logloss": 0.309713, "rough_median_ms": 96.9}

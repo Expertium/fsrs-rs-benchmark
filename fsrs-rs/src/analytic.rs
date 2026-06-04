@@ -38,13 +38,11 @@ fn clamp8(x: f32x8, lo: f32, hi: f32) -> f32x8 {
 
 /// exp over 8 lanes: 2^n · poly(r), x = n·ln2 + r. Same algorithm as the scalar floor-bench.
 ///
-/// `FAST` (compile-time const), exactly like ln8: `false` = degree-3 minimax (rel err 7.5e-5) — the
-/// accurate default, bit-for-bit with the pre-iter23 exp8, used by every path except the windowed
-/// training recurrence. `true` = degree-2 (rel err 1.7e-3, ONE fewer FMA), used ONLY by the windowed
-/// compute_parameters() forward (`step8_fwd::<true>` → curve8_fwd/stab8_fwd::<true>). The O(N²)
-/// benchmark/evaluate path keeps `::<false>` so its band stays bit-for-bit; the exp8 error only
-/// perturbs the TRAINING trajectory + best-epoch pick (the band metric is the frozen evaluate(),
-/// which uses neither poly), scored by the exact evaluate(). Precision-trade (3b), portable (c7).
+/// `FAST` (compile-time const): `false` = degree-3 minimax (rel err 7.5e-5) — the accurate version,
+/// now used by EVERY path (including the windowed compute_parameters() recurrence). `true` = degree-2
+/// (rel err 1.7e-3, ONE fewer FMA) — this was iter23's cruder windowed-only trade, but it was
+/// REVERTED 2026-06-04 on cost/benefit (it saved ~6.5% median speed but cost ~0.00025 cp log loss),
+/// so the `true` branch is currently UNUSED (retained for a possible future precision A/B). Portable (c7).
 #[inline(always)]
 fn exp8<const FAST: bool>(x: f32x8) -> f32x8 {
     let x = x.fast_max(f32x8::splat(-87.0)).fast_min(f32x8::splat(88.0));
@@ -67,13 +65,9 @@ fn exp8<const FAST: bool>(x: f32x8) -> f32x8 {
 /// All forward ln inputs are > 0 (stabilities ≥ S_MIN, difficulty ≥ 1, the b/qbase bases > 0).
 ///
 /// `FAST` (compile-time const): `false` = degree-2-in-u minimax (abs err 4.9e-6) — the accurate
-/// default used by EVERY path except the windowed training recurrence, so it is bit-for-bit with the
-/// pre-iter23 ln8. `true` = degree-1-in-u (abs err 2.3e-4, ONE fewer FMA), used ONLY by the windowed
-/// compute_parameters() forward (`step8_fwd::<true>`). The O(N²) benchmark/evaluate path stays on
-/// `::<false>` so its (tight) band is untouched; only the roomier compute_parameters cp band — the
-/// user-facing path — sees this. And the band metric is the frozen evaluate(), which uses NEITHER
-/// poly, so `FAST` only nudges the training trajectory + best-epoch pick (scored by the exact
-/// evaluate()), exactly like the iter17/iter21 minimax cuts. Precision-trade (3b), portable (c7).
+/// version, now used by EVERY path (including the windowed compute_parameters() recurrence). `true` =
+/// degree-1-in-u (abs err 2.3e-4, ONE fewer FMA) — iter23's cruder windowed-only trade, REVERTED
+/// 2026-06-04 on cost/benefit, so the `true` branch is currently UNUSED. Portable (c7).
 #[inline(always)]
 fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
     let bits: i32x8 = bytemuck::cast(x);
@@ -1244,7 +1238,7 @@ pub(crate) fn card_loss_and_grad_simd(
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { z } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd::<true>(w, dt, rating, (s, d, sf), t == 0, &wc);
+            let (ns, cache) = step8_fwd::<false>(w, dt, rating, (s, d, sf), t == 0, &wc);
             s = ns.0;
             d = ns.1;
             sf = ns.2;
@@ -1256,8 +1250,8 @@ pub(crate) fn card_loss_and_grad_simd(
         let dt_last = load8(t_hist, lbase).fast_max(z);
         let (ls, lsf, ld) =
             (clamp8(s, S_MIN, S_MAX), clamp8(sf, S_MIN, S_MAX), clamp8(d, D_MIN, D_MAX));
-        let fc_last = curve8_fwd::<true>(
-            w, dt_last, ls, lsf, ld, wc.ln_w27, wc.ln_w28, ln8::<true>(ls), ln8::<true>(lsf),
+        let fc_last = curve8_fwd::<false>(
+            w, dt_last, ls, lsf, ld, wc.ln_w27, wc.ln_w28, ln8::<false>(ls), ln8::<false>(lsf),
         );
         // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
         // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
@@ -1317,15 +1311,15 @@ pub(crate) fn card_loss_simd(
                 let (ls, lsf, ld) =
                     (clamp8(s, S_MIN, S_MAX), clamp8(sf, S_MIN, S_MAX), clamp8(d, D_MIN, D_MAX));
                 clamp8(
-                    curve8_fwd::<true>(
+                    curve8_fwd::<false>(
                         w, dt.fast_max(z), ls, lsf, ld, wc.ln_w27, wc.ln_w28,
-                        ln8::<true>(ls), ln8::<true>(lsf),
+                        ln8::<false>(ls), ln8::<false>(lsf),
                     )
                     .out,
                     MIN_R, MAX_R,
                 )
             } else {
-                let (ns, cache) = step8_fwd::<true>(w, dt, rating, (s, d, sf), t == 0, &wc);
+                let (ns, cache) = step8_fwd::<false>(w, dt, rating, (s, d, sf), t == 0, &wc);
                 s = ns.0;
                 d = ns.1;
                 sf = ns.2;
@@ -1334,8 +1328,8 @@ pub(crate) fn card_loss_simd(
             if t >= 1 {
                 // Per-prediction BCE via the unified identity  -ln(1 - |label - r|)  (= -ln(r) for
                 // label 1, -ln(1-r) for label 0). Branchless, so the whole 8-lane BCE is ONE vectorized
-                // ln8. Padding/filtered lanes have weight 0. The BCE ln stays accurate (::<false>) — it
-                // is the best-epoch SELECTION criterion; only the forward recurrence uses ln8::<true>.
+                // ln8. Padding/filtered lanes have weight 0. The BCE ln uses the accurate ::<false>,
+                // as does the forward recurrence now (iter23's cruder windowed minimax was reverted).
                 let lbl = load8(labels, base);
                 let wt = load8(weights, base);
                 let arg = k(1.0) - (lbl - r).fast_max(r - lbl); // 1 - |label - r|
@@ -1635,10 +1629,10 @@ mod tests {
     #[test]
     fn simd_window_grad_matches_scalar_window() {
         // The f32x8 windowed kernel vs the scalar windowed oracle (same algorithm). The windowed path
-        // runs the CRUDER minimax (exp8::<true> deg-2, rel err 1.7e-3; ln8::<true> deg-1, abs 2.3e-4 —
-        // the band-gated compute_parameters() precision trades, iter23), and the s32·ex33 / pp·rexp
-        // exp-fusions (iter24); the scalar oracle uses exact libm and the un-fused form. So the
-        // SIMD-vs-libm gradient rel-L2 sits ~5e-3, DOMINATED by that minimax (not a backward bug).
+        // now runs the ACCURATE minimax (exp8 deg-3, rel err 7.5e-5; ln8 deg-2, abs 4.9e-6 — iter23's
+        // cruder windowed trade was reverted 2026-06-04) plus the s32·ex33 / pp·rexp exp-fusions
+        // (iter24); the scalar oracle uses exact libm and the un-fused form. So the SIMD-vs-libm
+        // gradient rel-L2 sits a few e-3, DOMINATED by f32-vs-f64 + the fusion (not a backward bug).
         // Backward CORRECTNESS is anchored by grad_matches_fd (finite-diff) + window_grad_equals_
         // sum_of_prefix_grads (the regrouping identity); this oracle is only a gross-bug guard, so its
         // tolerance reflects the windowed minimax. batch%8==0; mixed card lengths + a deliberately-

@@ -1187,6 +1187,10 @@ pub struct ComputeParametersInput {
     /// groups each card's expanding-window prefix-items into the same mini-batch (the O(N) window
     /// path); when `None`, training is unchanged (each prefix-item batched independently).
     pub card_ids: Option<Vec<i64>>,
+    /// DIAGNOSTIC-ONLY epoch override (default `None` = 8, the shipped count per constraint 4). Set
+    /// by the profiling epoch-buyback sweep (`profiling/epoch_sweep.py`) to measure accuracy-vs-epochs;
+    /// the shipped Python path never sets it, so production training stays at 8 epochs.
+    pub num_epochs: Option<usize>,
 }
 
 impl Default for ComputeParametersInput {
@@ -1198,6 +1202,7 @@ impl Default for ComputeParametersInput {
             enable_sched_penalties: false,
             num_relearning_steps: None,
             card_ids: None,
+            num_epochs: None,
         }
     }
 }
@@ -1231,6 +1236,7 @@ pub fn compute_parameters(
         enable_sched_penalties,
         num_relearning_steps,
         card_ids,
+        num_epochs,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -1264,7 +1270,7 @@ pub fn compute_parameters(
         finish_progress();
         return Ok(initialized_parameters);
     }
-    let config = TrainingConfig::new(
+    let mut config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: None,
@@ -1278,6 +1284,11 @@ pub fn compute_parameters(
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
+    // DIAGNOSTIC epoch override for the buyback sweep; default (None) keeps the shipped 8 epochs.
+    // Bumping it also extends the cosine-annealing schedule over the larger iteration count below.
+    if let Some(ne) = num_epochs {
+        config.num_epochs = ne;
+    }
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     // Attach card ids (still aligned: recency weighting preserves order). The later max_seq_len
     // retain is order-preserving too, so card_id rides along inside each WeightedFSRSItem.

@@ -22,11 +22,12 @@ impl FSRS {
     /// `card_ids` (optional, parallel to `train_set`) labels each prefix-item with its originating
     /// card so training can group a card's expanding-window prefixes into one mini-batch (the O(N)
     /// window path). It is plain metadata Python already has; the timed work is unchanged.
-    #[pyo3(signature = (train_set, card_ids=None))]
+    #[pyo3(signature = (train_set, card_ids=None, num_epochs=None))]
     pub fn compute_parameters(
         &self,
         train_set: Vec<FSRSItem>,
         card_ids: Option<Vec<i64>>,
+        num_epochs: Option<usize>,
     ) -> (Vec<f32>, f64) {
         let input = ComputeParametersInput {
             train_set: train_set.iter().map(|x| x.0.clone()).collect(),
@@ -35,6 +36,7 @@ impl FSRS {
             enable_sched_penalties: false,
             num_relearning_steps: None,
             card_ids,
+            num_epochs,
         };
         let start = std::time::Instant::now();
         let params = fsrs::compute_parameters(input).unwrap_or_default();
@@ -62,6 +64,7 @@ impl FSRS {
             enable_sched_penalties: false,
             num_relearning_steps: None,
             card_ids: None,
+            num_epochs: None,
         })
     }
 
@@ -78,6 +81,7 @@ impl FSRS {
             enable_sched_penalties: false,
             num_relearning_steps: None,
             card_ids: None,
+            num_epochs: None,
         };
         let start = std::time::Instant::now();
         let params = fsrs::benchmark(input);

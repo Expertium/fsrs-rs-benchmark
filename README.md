@@ -1,10 +1,10 @@
 # fsrs-rs-speed-autoresearch
 
-An **autoresearch loop** that made [FSRS-rs](https://github.com/open-spaced-repetition/fsrs-rs) parameter optimization **>100x faster** (not yet commited to FSRS-rs though) — so real Anki users spend less time staring at the optimizer's progress bar and more time doing reviews — **while only making it mildly less accurate**. An AI agent (Claude) proposes a change, measures it under a strict protocol, and keeps it only if it clears both the speed and the correctness bars. Inspired by AlphaEvolve and [Andrej Karpathy's "autoresearch" repo](https://github.com/karpathy/autoresearch). Also check out [my other autoresearch repo](https://github.com/Expertium/fsrs-autoresearch).
+An **autoresearch loop** that made [FSRS-rs](https://github.com/open-spaced-repetition/fsrs-rs) parameter optimization **~98x faster** (not yet commited to FSRS-rs though) — so real Anki users spend less time staring at the optimizer's progress bar and more time doing reviews — **while only making it mildly less accurate**. An AI agent (Claude) proposes a change, measures it under a strict protocol, and keeps it only if it clears both the speed and the correctness bars. Inspired by AlphaEvolve and [Andrej Karpathy's "autoresearch" repo](https://github.com/karpathy/autoresearch). Also check out [my other autoresearch repo](https://github.com/Expertium/fsrs-autoresearch).
 
 [![Campaign progress: cumulative median speedup (top) and median per-user optimizer time (bottom) vs iteration](result/history_plot.png)](result/history_plot.png)
 
-*Each point is an accepted change: the agent measures a candidate against the current champion and keeps it only if the typical (median) user's optimization gets faster with no loss of accuracy. The top panel is the compounding median speedup vs the original baseline; see [**Tracking progress**](#tracking-progress) for how to read it.*
+*Each point is an accepted change: the agent measures a candidate against the current champion and keeps it only if the typical (median) user's optimization gets faster with minor loss of accuracy. The top panel is the compounding median speedup vs the original baseline; see [**Tracking progress**](#tracking-progress) for how to read it.*
 
 > **🤖 Working on this repo (human or AI)? Read [`CLAUDE.md`](CLAUDE.md) first.**
 > It is the authoritative spec — the goal, the exact measurement protocol, the hard constraints and acceptance bars, an annotated map of the code, and current profiling findings. This README is just the human-facing quickstart.
@@ -113,10 +113,20 @@ The campaign tunes on 50 users, so the last step re-runs the **frozen champion a
 | build | median ms/user | median reviews/s | median speedup vs iter-0 |
 | --- | --- | --- | --- |
 | iter-0 baseline (x86) | 3659 | 7.4k | 1× |
-| **champion** (x86, default build) | **34.0** | **763k** | **×103.8** |
-| champion + AVX2 *(x86 bonus)* | 18.0 | 1.45M | ×198.3 |
+| **champion** (x86, default build) | **36.0** | **726k** | **×98.2** |
 
-The default-build champion lands at **×103.8** on 1000 users — essentially identical to the 50-user direct anchor (≈×104.5), so the speedup holds across the full review-count distribution. Throughput goes from ~7k to ~763k reviews/s. (Accuracy scales gracefully too: the champion's mean log loss is +0.0016 vs iter-0 on this set, about one band-width — the accumulated precision trades don't blow up at scale.) Per-user records: `result/{iter0-1000u-baseline,champ-1000u,avx2-1000u}.jsonl`.
+The default-build champion lands at **×98.2** on 1000 users — consistent with the 50-user measurements, so the speedup holds across the full review-count distribution. Throughput goes from ~7k to ~726k reviews/s. (Accuracy scales gracefully too: the champion's mean log loss is +0.0014 vs iter-0 on this set, about one band-width — the accumulated precision trades don't blow up at scale.) Rebuilding with AVX2 (`RUSTFLAGS="-C target-cpu=native"`) roughly doubles this again on x86 — the pre-revert AVX2 champion measured ×198.3 (18 ms/user); the reverted champion wasn't separately AVX2-measured but scales similarly (~×188). Per-user records: `result/{iter0-1000u-baseline,champ-1000u,avx2-1000u}.jsonl`.
+
+> **Note — one precision trade was reverted after the campaign.** On a closer cost/benefit review, one accepted change (a cruder polynomial approximation of `exp`/`ln` on the training path) was **undone**: it had cost ~0.0004 log loss for what re-measured as only ~5–6% speed — a bad trade once a *later* change had already removed most of the work it targeted. So the shipped champion is **×98.2** at mean log loss **0.3110** (50-user), rather than the campaign's plotted ×103.8 / 0.3112. The progress plot above is left as the **historical record of the campaign** (the revert is not plotted as a step).
+>
+> **Buying the accuracy back with more epochs.** The champion runs **8 optimizer epochs** by default (the fast setting). The speedup cost ~0.0012 log loss vs the original (0.3110 vs 0.3098). That's fully recoverable by spending more epochs — and even fully recovered, the optimizer is still ~40× faster than the original:
+>
+> | epochs | mean log loss (50u) | speedup vs iter-0 |
+> | --- | --- | --- |
+> | **8** (shipped) | 0.3110 | **~×98** |
+> | 20 | 0.3098 *(= original)* | ~×43 |
+>
+> At 20 epochs the loss returns to the original 8-epoch baseline (0.3098), at ~2.26× the 8-epoch time — so you can have the *original accuracy and* a ~43× speedup, or the shipped config for ~98× at +0.0012 log loss. (Diagnostic via `profiling/epoch_sweep.py`; the shipped default stays 8 epochs.)
 
 **Caveat — these numbers are all x86 (Ryzen 5950X), and the speedup is _not_ architecture-uniform.** Most of it is portable; a chunk is x86-specific:
 
