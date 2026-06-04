@@ -141,17 +141,6 @@ So the bulk of the speedup came from **trading a little floating-point precision
 
 Two caveats. (1) This is an exact *decomposition* of the logged product (3.25 × 34.6 = 112.7), **not** a forecast — the ratios are path-dependent (each measured against the then-current champion), so a bit-for-bit-*only* campaign would likely land somewhat **below** ×3.25, because some "free" wins were amplified by the precision wins that came before them. (2) Two of the bit-for-bit entries (SIMD/analytic *validation*) are really precision changes that came out byte-identical only because validation merely picks the best epoch and the approximation never flipped that pick; counting only *strictly* math-unchanged work drops the free factor to ~×2.25.
 
-### The reference harness (`benchmark()`) got ~32× faster too
-
-`benchmark()` (the 5-fold cross-validation reference harness, [`benchmark.py`](benchmark.py)) was never *directly* optimized during the ×104 campaign — it was the correctness anchor. But it shares the training loop with `compute_parameters()`, so it inherited the shared-kernel wins for free, and a follow-up campaign then tuned its own code path. Timing both the original iter-0 binary and the current champion the same way (50 users, min-of-3, summed over the 5 folds):
-
-| build | median ms/user | median train-rows/s | median speedup vs iter-0 |
-| --- | --- | --- | --- |
-| iter-0 baseline | 8337 | 6.1k | 1× |
-| **champion** | **239** | **216k** | **×32.5** |
-
-That **×32.5** (per-user range 27–58×) decomposes as **×26.4 inherited for free** from `compute_parameters()`'s shared kernels (analytic gradient, f32×8 SIMD, minimax transcendentals, hand-rolled Adam, build-once host batches) **× 1.23** from the dedicated `benchmark()` campaign. It's smaller than the ×104 above because `benchmark()` deliberately keeps the **O(N²) per-prefix** path as its bit-for-bit anchor — it never adopts the O(N) expanding window (compute_parameters' single biggest win, ×3.12). The arithmetic lines up: **32.5 × 3.12 ≈ 101 ≈ ×104**, i.e. `benchmark()` is exactly "compute_parameters minus the one optimization it doesn't share."
-
 ## Repo tour
 
 `compute_parameters.py` (speed harness) · `benchmark.py` (reference) · `fsrs-rs/src/{model,training,inference}.rs` (the Rust FSRS crate — the optimization target) · `fsrs_rs_python/` (PyO3 binding) · `features/` (review preprocessing) · `complexity.py` (the complexity score) · `profiling/` (profiling tools). The full annotated map is the *Code layout* section of [`CLAUDE.md`](CLAUDE.md).

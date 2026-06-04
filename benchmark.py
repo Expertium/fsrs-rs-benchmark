@@ -84,15 +84,23 @@ def build_reviews(row: pd.Series, *, include_current: bool = False) -> List[FSRS
     return [FSRSReview(delta_t=t, rating=r) for t, r in zip(t_history, r_history)]
 
 
-def convert_to_items(df: pd.DataFrame) -> List[FSRSItem]:
-    """Convert a DataFrame to FSRSItems for fsrs-rs, ordered globally by review_th."""
-    pairs = []  # (review_th, FSRSItem)
-    for _, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
+def convert_to_items(df: pd.DataFrame) -> tuple[List[FSRSItem], List[int]]:
+    """Convert a DataFrame to FSRSItems for fsrs-rs, ordered globally by review_th.
+
+    Also returns each item's originating card id (parallel list, same order) so training can group
+    a card's expanding-window prefix-items into one mini-batch — the O(N) windowed path that real
+    users run via compute_parameters(). The items list/ordering are unchanged vs. before.
+    """
+    pairs = []  # (review_th, card_id, FSRSItem)
+    for card_id, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
         for _, row in group.iterrows():
             item = FSRSItem(reviews=build_reviews(row, include_current=True))
-            pairs.append((row["review_th"], item))
+            pairs.append((row["review_th"], int(card_id), item))
+    # Sort by review_th only (the key); ties keep insertion order and never compare the items.
     pairs.sort(key=lambda pair: pair[0])
-    return [item for _, item in pairs]
+    items = [item for _, _, item in pairs]
+    card_ids = [cid for _, cid, _ in pairs]
+    return items, card_ids
 
 
 def default_parameters() -> List[float]:
@@ -100,10 +108,16 @@ def default_parameters() -> List[float]:
 
 
 def train(train_set: pd.DataFrame) -> List[float]:
-    """Train FSRS-rs on training data and return optimized weights."""
+    """Train FSRS-rs on training data and return optimized weights.
+
+    Uses compute_parameters() — the SAME O(N) windowed optimizer real Anki users run — so the
+    benchmark measures the accuracy of the algorithm that actually ships, not the (mathematically
+    equivalent but parameter-divergent) O(N^2) per-prefix path. card_ids activate the windowing.
+    """
     backend = FSRS(parameters=[])
-    items = convert_to_items(train_set)
-    return [round(w, 4) for w in backend.benchmark(items)]
+    items, card_ids = convert_to_items(train_set)
+    params, _elapsed = backend.compute_parameters(items, card_ids)
+    return [round(w, 4) for w in params]
 
 
 def predict(
