@@ -112,13 +112,18 @@ The campaign tunes on 50 users, so the last step re-runs the **frozen champion a
 
 | build | median ms/user | median reviews/s | median speedup vs iter-0 |
 | --- | --- | --- | --- |
-| iter-0 baseline | 3659 | 7.4k | 1× |
-| **champion** (portable) | **34.0** | **763k** | **×103.8** |
-| champion + AVX2 *(bonus)* | 18.0 | 1.45M | ×198.3 |
+| iter-0 baseline (x86) | 3659 | 7.4k | 1× |
+| **champion** (x86, default build) | **34.0** | **763k** | **×103.8** |
+| champion + AVX2 *(x86 bonus)* | 18.0 | 1.45M | ×198.3 |
 
-The portable champion lands at **×103.8** on 1000 users — essentially identical to the 50-user direct anchor (≈×104.5), so the speedup holds across the full review-count distribution. Throughput goes from ~7k to ~763k reviews/s. (Accuracy scales gracefully too: the champion's mean log loss is +0.0016 vs iter-0 on this set, about one band-width — the accumulated precision trades don't blow up at scale.) Per-user records: `result/{iter0-1000u-baseline,champ-1000u,avx2-1000u}.jsonl`.
+The default-build champion lands at **×103.8** on 1000 users — essentially identical to the 50-user direct anchor (≈×104.5), so the speedup holds across the full review-count distribution. Throughput goes from ~7k to ~763k reviews/s. (Accuracy scales gracefully too: the champion's mean log loss is +0.0016 vs iter-0 on this set, about one band-width — the accumulated precision trades don't blow up at scale.) Per-user records: `result/{iter0-1000u-baseline,champ-1000u,avx2-1000u}.jsonl`.
 
-The **AVX2 row is a CPU-specific bonus, not part of the official (portable) result.** Rebuilding with `RUSTFLAGS="-C target-cpu=native"` turns each 8-wide SIMD op from 2×128-bit (SSE2 baseline) into one native 256-bit (AVX2) instruction — ~1.9× more on top, so a typical x86 desktop/laptop (≈2015+) sees ~×198, while phones (ARM/NEON, 128-bit) and the portable build get the full ~×104. It can't count officially because AVX2 is x86-only (constraint 7 requires portability, incl. smartphones); shipping it to users would need runtime CPU dispatch (e.g. the [`multiversion`](https://crates.io/crates/multiversion) crate), since a `target-cpu=native` binary is built for one machine and can't be distributed.
+**Caveat — these numbers are all x86 (Ryzen 5950X), and the speedup is _not_ architecture-uniform.** Most of it is portable; a chunk is x86-specific:
+
+- **AVX2 — a further x86 bonus.** Rebuilding with `RUSTFLAGS="-C target-cpu=native"` turns each 8-wide SIMD op from 2×128-bit (SSE2 baseline) into one native 256-bit (AVX2) instruction — ~1.9× more, so a typical x86 desktop/laptop (≈2015+) sees ~×198. It can't count officially because AVX2 is x86-only (constraint 7 requires portability incl. smartphones); shipping it would need runtime CPU dispatch (e.g. the [`multiversion`](https://crates.io/crates/multiversion) crate), since a `target-cpu=native` binary is built for one machine and can't be distributed.
+- **ARM / Apple Silicon — closer to ~×30, not ×104.** The explicit SIMD *vectorization* (≈×3.3 of the ×104 — `wide::f32×8` batching 8 cards/lane) **did not replicate on an Apple M-chip** when the fsrs-rs maintainers tried it. `wide` does compile to real NEON there, but Apple Silicon's very wide out-of-order cores + auto-vectorization already extract the cross-card parallelism from *scalar* code, leaving little for explicit SIMD to add. What *does* transfer is the **algorithmic core** — the analytic gradient (replacing autodiff), the O(N) expanding window, host-side Adam, build-once batching — none of which depends on SIMD. So an ARM user realistically gets ≈ ×104 ÷ the ×3.3 SIMD multiplier ≈ **×32** (more if the SIMD partly helps on narrower ARM cores than Apple's).
+
+That architecture-independent core is exactly what got **upstreamed**: [fsrs-rs PR #411](https://github.com/open-spaced-repetition/fsrs-rs/pull/411) (merged) adopted the analytic gradient, host Adam, and `card_ids` window — crediting this repo — and left the explicit SIMD out precisely because it didn't replicate off x86.
 
 ### How much of the ×104 was "free" vs. a precision trade?
 
