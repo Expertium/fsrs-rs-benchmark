@@ -1301,6 +1301,12 @@ pub fn compute_parameters(
     if let Some(bs) = std::env::var("FSRS_BATCH_SIZE").ok().and_then(|s| s.trim().parse().ok()) {
         config.batch_size = bs;
     }
+    // FSRS_LR: the tuner's Adam sqrt LR-batch scaling (lr = committed_lr * sqrt(batch/256)) — a
+    // cheap stand-in for re-tuning LR per grid cell, so batch != 256 cells aren't handicapped by
+    // an LR tuned at batch 256. Feeds the cosine-annealing scheduler below via config.
+    if let Some(lr) = std::env::var("FSRS_LR").ok().and_then(|s| s.trim().parse().ok()) {
+        config.learning_rate = lr;
+    }
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     // Attach card ids (still aligned: recency weighting preserves order). The later max_seq_len
     // retain is order-preserving too, so card_id rides along inside each WeightedFSRSItem.

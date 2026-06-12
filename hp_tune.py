@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -58,6 +59,16 @@ GRID_PLOT = RESULT / "hp_grid_plot.png"
 GOLD_EPOCH, GOLD_BATCH = 9, 256
 GRID_EPOCHS = [6, 9, 15, 20, 30]
 GRID_BATCHES = [128, 256, 512, 1024]
+# The committed LR (training.rs default, tuned at batch 256 by the CUDA iter-194 hp_tune bundle).
+GOLD_LR = 0.0282
+
+
+def _scaled_lr(batch: int) -> float:
+    """Adam sqrt LR-batch scaling, anchored at the committed (GOLD_LR, GOLD_BATCH): gives each
+    grid cell a roughly-right LR — a cheap stand-in for re-tuning LR per cell, so batch != 256
+    cells aren't handicapped by an LR tuned at 256 (ported from the CUDA tuner; the winner's LR
+    is then fine-tuned precisely by the follow-up pass). Injected per cell via FSRS_LR."""
+    return round(GOLD_LR * math.sqrt(batch / GOLD_BATCH), 4)
 
 # LL_TOL: log-loss tie band (user 2026-06-05: raise to 5e-5 for the Rust port — the
 # training is NOT bit-exact across runs, but the cross-val by-user mean is far more
@@ -80,7 +91,8 @@ def _run_harness(script: str, n_users: int, epoch: int, batch: int, processes: i
     file would make the run a silent no-op. The operating point rides in via env."""
     if result_file.exists():
         result_file.unlink()
-    env = {**os.environ, "FSRS_N_EPOCHS": str(epoch), "FSRS_BATCH_SIZE": str(batch)}
+    env = {**os.environ, "FSRS_N_EPOCHS": str(epoch), "FSRS_BATCH_SIZE": str(batch),
+           "FSRS_LR": str(_scaled_lr(batch))}
     cmd = [sys.executable, script, *COMMON_ARGS,
            "--processes", str(processes), "--max-user-id", str(n_users)]
     proc = subprocess.run(cmd, cwd=str(REPO), env=env,
@@ -113,14 +125,14 @@ def run_cell(epoch: int, batch: int, n_users: int, processes: int) -> dict:
         items = sum(r["size"] for r in bm_rows)
     except Exception as e:  # noqa: BLE001 — record the failure, keep sweeping
         print(f"[grid] epoch {epoch:>2} batch {batch:>4}: FAILED ({e})", flush=True)
-        return {"epoch": epoch, "batch": batch, "by_user": None, "seconds": None,
-                "items": None, "throughput": None, "error": str(e)}
+        return {"epoch": epoch, "batch": batch, "lr": _scaled_lr(batch), "by_user": None,
+                "seconds": None, "items": None, "throughput": None, "error": str(e)}
     throughput = items / seconds if seconds else 0.0
-    print(f"[grid] epoch {epoch:>2} batch {batch:>4}: by_user={by_user:.6f}  "
-          f"train={seconds:.1f}s  throughput={throughput:,.0f} reviews/s  "
+    print(f"[grid] epoch {epoch:>2} batch {batch:>4} (LR {_scaled_lr(batch):g}): "
+          f"by_user={by_user:.6f}  train={seconds:.1f}s  throughput={throughput:,.0f} reviews/s  "
           f"({time.time() - t0:.0f}s wall)", flush=True)
-    return {"epoch": epoch, "batch": batch, "by_user": by_user, "seconds": seconds,
-            "items": items, "throughput": throughput}
+    return {"epoch": epoch, "batch": batch, "lr": _scaled_lr(batch), "by_user": by_user,
+            "seconds": seconds, "items": items, "throughput": throughput}
 
 
 # ── Pareto logic ─────────────────────────────────────────────────────────────
