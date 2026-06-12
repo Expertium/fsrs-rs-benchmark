@@ -1,0 +1,26 @@
+{
+  "anchor_champion_3k": 0.32097,
+  "runs": {
+    "a1_no_outlier": {
+      "mean_logloss": 0.320573,
+      "n_users": 3000,
+      "train_seconds": 618.0,
+      "wall_s": 5820,
+      "delta_vs_champion": -0.000397
+    },
+    "a2_8ep_sel": {
+      "mean_logloss": 0.321002,
+      "n_users": 3000,
+      "train_seconds": 814.5,
+      "wall_s": 5710,
+      "delta_vs_champion": 3.2e-05
+    },
+    "a3_oldhp": {
+      "mean_logloss": 0.32072,
+      "n_users": 3000,
+      "train_seconds": 610.2,
+      "wall_s": 5536,
+      "delta_vs_champion": -0.00025
+    }
+  }
+}

@@ -59,8 +59,9 @@ GRID_PLOT = RESULT / "hp_grid_plot.png"
 GOLD_EPOCH, GOLD_BATCH = 9, 256
 GRID_EPOCHS = [6, 9, 15, 20, 30]
 GRID_BATCHES = [128, 256, 512, 1024]
-# The committed LR (training.rs default, tuned at batch 256 by the CUDA iter-194 hp_tune bundle).
-GOLD_LR = 0.0282
+# The committed LR (training.rs default; the pre-194 value — the 3k ablation measured the
+# iter-194 LR/L2/B2 triple, tuned for the batch reshuffle we dropped, -0.00025 WORSE at 3k).
+GOLD_LR = 0.0188
 
 
 def _scaled_lr(batch: int) -> float:

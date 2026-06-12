@@ -1,0 +1,23 @@
+{
+  "gold": {
+    "epoch": 9,
+    "batch": 256,
+    "by_user": 0.3209782503333333,
+    "seconds": 655.0767
+  },
+  "cells": [
+    {
+      "epoch": 9,
+      "batch": 256,
+      "lr": 0.0282,
+      "by_user": 0.3209782503333333,
+      "seconds": 655.0767,
+      "items": 152354175,
+      "throughput": 232574.55958973966
+    }
+  ],
+  "partial": true,
+  "n_users": 3000,
+  "ll_tol": 5e-05,
+  "speed_tol": 0.03
+}

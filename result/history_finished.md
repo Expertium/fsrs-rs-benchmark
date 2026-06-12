@@ -6,5 +6,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 |---|---|---|---|---|---|---|---|---|---|---|
 | 0 | 218 | 218 | 1.000 | 7985 | 7985 | 1.000 | 1.000 | ✓ | accepted | Baseline: finished FSRS-7 port; 8 epochs with best-epoch selection |
 | 1 | 218 | 161 | 1.343 | 7985 | 7930 | 0.993 | 0.983 | ✓ | accepted | Drop per-epoch validation + best-epoch selection; train 9 epochs, ship last-epoch params |
+| 2 | 161 | 161 | 1.000 | 7930 | 7853 | 0.990 | 0.976 | ✓ | accepted | Drop the fsrs-rs outlier filter; train on all items (CUDA parity) |
+| 3 | 161 | 161 | 1.000 | 7853 | 7774 | 0.990 | 0.975 | ✓ | accepted | Revert LR/L2/beta2 to pre-194 values 0.0188 0.3333 0.9913 |
 
 **Cumulative speed_ratio (product of accepted): ×1.343** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.

@@ -1,0 +1,5 @@
+[grid] gold = (epoch 9, batch 256); 3000 users/cell, --processes 15.  LL_TOL=5e-05 SPEED_TOL=0.03
+[grid] measuring gold first ...
+[grid] epoch  9 batch  256 (LR 0.0282): by_user=0.321002  train=642.4s  throughput=237,162 reviews/s  (5952s wall)
+[grid] GOLD: by_user=0.321002  train=642.4s  (the 19 candidates are judged against this)
+

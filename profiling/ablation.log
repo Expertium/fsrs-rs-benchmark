@@ -1,0 +1,8 @@
+[abl] a1_no_outlier: installing champ.pyd, env={'FSRS_NO_OUTLIER': '1'}
+[abl] a1_no_outlier: mean LL=0.320573 (delta -0.000397)  [5820s]
+[abl] a2_8ep_sel: installing a2_8ep_sel.pyd, env={}
+[abl] a2_8ep_sel: mean LL=0.321002 (delta +0.000032)  [5710s]
+[abl] a3_oldhp: installing a3_oldhp.pyd, env={}
+[abl] a3_oldhp: mean LL=0.320720 (delta -0.000250)  [5536s]
+[abl] champion .pyd restored
+[abl] DONE

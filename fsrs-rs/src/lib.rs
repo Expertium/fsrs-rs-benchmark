@@ -6,7 +6,7 @@ mod inference;
 mod model;
 mod training;
 
-pub use training::{FSRSItem, FSRSReview, filter_outlier};
+pub use training::{FSRSItem, FSRSReview};
 pub use error::{FSRSError, Result};
 pub use inference::{DEFAULT_PARAMETERS, ItemProgress, MemoryState, ModelEvaluation};
 pub use model::FSRS;
