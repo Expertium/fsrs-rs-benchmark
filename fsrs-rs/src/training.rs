@@ -1568,9 +1568,14 @@ fn train<B: AutodiffBackend>(
     // best-epoch selection were REMOVED: training ships the last epoch's parameters, with the
     // 9-epoch default compensating — see the return at the bottom.)
     let total_size = train_set.len();
-    let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
     let train_host: Vec<BatchHost> = build_host_batches(train_set, config.batch_size);
     let n_train_batches = train_host.len();
+    // Cosine-annealing horizon = the TRUE step count (faithful to CUDA, which clamps progress
+    // over the exact per-user total). The old `(total/batch + 1) * epochs` estimate undercounts
+    // windowed batches (whole cards never split, so batches under-fill) — the schedule then hit
+    // zero before training ended and bounced back up (torch cosine is periodic past t_max) for
+    // the tail steps.
+    let iterations = n_train_batches * config.num_epochs;
     // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
     // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
     let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
