@@ -81,6 +81,20 @@ _MD_HEADER_BENCH = (
     " Times are machine/session-specific (informational).\n\n" + _TABLE_HEADER
 )
 
+# Finished-model era header (--finished): the FINISHED FSRS-7 model (34 params, post-port),
+# measured with benchmark() (cross-val log loss — the honest metric for training-procedure
+# changes like epoch-count/validation trades). time_before/after = the per-user MIN-of-3 Rust
+# benchmark() time summed over the 5 folds (profiling/measure_benchmark.py), median across users.
+_MD_HEADER_FINISHED = (
+    "# FSRS-rs speed autoresearch — finished-model era history\n\n"
+    "Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **speed_ratio ≥"
+    " complexity_ratio^2.5** (constraint 13), with the cross-val mean log loss (benchmark.py,"
+    " 50 users) within ±0.0015 of the era baseline. speed_ratio is the *median of per-user"
+    " ratios* of the summed-over-folds Rust benchmark() time, measured back-to-back vs the"
+    " then-current champion. Times are machine/session-specific (informational).\n\n"
+    + _TABLE_HEADER
+)
+
 # The fields a markdown row never derives — `add` requires these on stdin.
 _REQUIRED = ("iteration", "time_before", "time_after", "speed_ratio",
              "complexity_after", "checks_passed", "status", "summary")
@@ -219,16 +233,21 @@ def cmd_verify() -> int:
 
 
 def main() -> int:
-    argv = [a for a in sys.argv[1:] if a != "--benchmark"]
+    argv = [a for a in sys.argv[1:] if a not in {"--benchmark", "--finished"}]
     benchmark = "--benchmark" in sys.argv[1:]
+    finished = "--finished" in sys.argv[1:]
     if not argv or argv[0] not in {"add", "verify"}:
         print(__doc__)
         return 2
+    global _JSONL, _MD, _MD_HEADER
     if benchmark:
-        global _JSONL, _MD, _MD_HEADER
         _JSONL = _REPO / "result" / "history_benchmark.jsonl"
         _MD = _REPO / "result" / "history_benchmark.md"
         _MD_HEADER = _MD_HEADER_BENCH
+    elif finished:
+        _JSONL = _REPO / "result" / "history_finished.jsonl"
+        _MD = _REPO / "result" / "history_finished.md"
+        _MD_HEADER = _MD_HEADER_FINISHED
     return cmd_add() if argv[0] == "add" else cmd_verify()
 
 

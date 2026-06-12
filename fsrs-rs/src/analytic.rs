@@ -93,21 +93,24 @@ fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
 /// instead of once per (card × timestep). Identical ops to the old inline versions (same f32/f64),
 /// so it's BIT-FOR-BIT — it just lifts redundant transcendentals out of the hot per-timestep
 /// forward (and the one in next_d's backward). iter10.
+// Finished FSRS-7 34-param layout. NOTE: the field names ln_w27/ln_w28/aa16 are LEGACY labels
+// kept to limit churn — they now hold ln(base1=w[25]), ln(base2=w[26]), exp(short sinc_base
+// w[15]-1.5) respectively.
 struct WConsts {
-    ln_w27: f32, // ln(w27)        (curve_fwd: q1 = ln_w27/decay1)
-    ln_w28: f32, // ln(w28)        (curve_fwd: p28 = (inv2*ln_w28).exp())
-    aa7: f32,    // exp(w[7]-1.5)  (stab_fwd slow, start=7)
-    aa16: f32,   // exp(w[16]-1.5) (stab_fwd fast, start=16)
+    ln_w27: f32, // ln(w[25]) = ln(base1)   (curve_fwd: q1 = ln_base1/decay1)
+    ln_w28: f32, // ln(w[26]) = ln(base2)   (curve_fwd: p28 = (inv2*ln_base2).exp())
+    aa7: f32,    // exp(w[7]-1.5)   (long stab sinc_base, start=7)
+    aa16: f32,   // exp(w[15]-1.5)  (short stab sinc_base, start=15)
     init: f32,   // w4 - exp(3*w5) + 1   (next_d_fwd, f32)
     exp3w5: f64, // exp(3*w5) in f64      (next_d_bwd: d(init)/d(w5))
 }
 
 fn wconsts(w: &[f32]) -> WConsts {
     WConsts {
-        ln_w27: w[27].ln(),
-        ln_w28: w[28].ln(),
+        ln_w27: w[25].ln(),
+        ln_w28: w[26].ln(),
         aa7: (w[7] - 1.5).exp(),
-        aa16: (w[16] - 1.5).exp(),
+        aa16: (w[15] - 1.5).exp(),
         init: w[4] - (w[5] * 3.0).exp() + 1.0,
         exp3w5: (w[5] as f64 * 3.0).exp(),
     }
@@ -161,31 +164,40 @@ fn curve_fwd(
     let t = t.max(0.0);
     let a = t / sf;
     let bv = t / s;
-    let p35 = (w[35] * ln_sf).exp(); // sf^w35 (ln_sf shared from step_fwd; iter13)
-    let m1 = w[25] * p35;
+    // Legacy cache labels remapped to the 34-param layout (+ all-positive offsets):
+    //   p35 = s_short^(s_decay1-0.3)   [s_decay1=w33], m1 = decay1[w23]*p35
+    //   ex34 = exp((d-5)*(d_decay-0.3)) [d_decay=w32], m2 = decay2[w24]*ex34, p28 = base2[w26]^inv2
+    //   p31 = s_short^(-s_weight_power1)[w29], weight1 = base_weight1[w27]*p31
+    //   s32 = s_long^s_weight_power2 [w30], ex33 = exp((d-5)*(d_weight-0.5))[w31]
+    //   weight2 = base_weight2[w28]*s32*ex33. ln_w27=ln(base1=w25), ln_w28=ln(base2=w26).
+    let p35 = ((w[33] - 0.3) * ln_sf).exp();
+    let m1 = w[23] * p35;
     let dm1 = clamp(m1, 0.01, 0.95);
     let decay1 = -dm1;
-    let q1 = ln_w27 / decay1; // ln_w27 hoisted (loop-invariant)
+    let q1 = ln_w27 / decay1; // ln(base1) hoisted
     let e1 = q1.min(60.0).exp();
     let factor1 = e1 - 1.0;
     let b1 = a * factor1 + 1.0;
     let ln_b1 = b1.ln();
     let r1 = (decay1 * ln_b1).exp(); // b1^decay1
-    let ex34 = ((d - 5.0) * w[34]).exp();
-    let m2 = w[26] * ex34;
+    // iter-165: the D-effect moved from the decay exponent to the TIME-SCALE — decay2 is no
+    // longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3)) now scales time
+    // inside b2 instead of multiplying m2.
+    let ex34 = ((d - 5.0) * (w[32] - 0.3)).exp();
+    let m2 = w[24];
     let dm2 = clamp(m2, 0.01, 0.95);
     let decay2 = -dm2;
     let inv2 = 1.0 / decay2;
-    let p28 = (inv2 * ln_w28).exp(); // w28^inv2 ; ln_w28 hoisted (loop-invariant)
+    let p28 = (inv2 * ln_w28).exp(); // base2^inv2 ; ln(base2) hoisted
     let factor2 = p28 - 1.0;
-    let b2 = bv * factor2 + 1.0;
+    let b2 = bv * factor2 * ex34 + 1.0;
     let ln_b2 = b2.ln();
     let r2 = (decay2 * ln_b2).exp(); // b2^decay2
-    let p31 = ((-w[31]) * ln_sf).exp(); // sf^-w31 (reuse ln_sf)
-    let weight1 = w[29] * p31;
-    let s32 = (w[32] * ln_s).exp(); // s^w32 (ln_s shared from step_fwd; iter13)
-    let ex33 = ((d - 5.0) * w[33]).exp();
-    let weight2 = w[30] * s32 * ex33;
+    let p31 = ((-w[29]) * ln_sf).exp(); // s_short^-s_weight_power1
+    let weight1 = w[27] * p31;
+    let s32 = (w[30] * ln_s).exp(); // s_long^s_weight_power2
+    let ex33 = ((d - 5.0) * (w[31] - 0.5)).exp();
+    let weight2 = w[28] * s32 * ex33;
     let wsum = weight1 + weight2;
     let num = weight1 * r1 + weight2 * r2;
     let ret = num / wsum;
@@ -200,7 +212,8 @@ fn curve_fwd(
 /// VJP of the curve. `t` is data (no grad). Returns adjoints (g_s, g_sf, g_d), accumulates gw.
 #[allow(clippy::too_many_arguments)]
 fn curve_bwd(
-    w: &[f32], c: &CurveCache, t: f32, s: f32, sf: f32, d: f32, g_out: f64, gw: &mut [f64],
+    w: &[f32], c: &CurveCache, t: f32, s: f32, sf: f32, d: f32, g_out: f64, g_r1_extra: f64,
+    gw: &mut [f64],
 ) -> (f64, f64, f64) {
     let t = t.max(0.0) as f64;
     let (s, sf, d) = (s as f64, sf as f64, d as f64);
@@ -209,45 +222,48 @@ fn curve_bwd(
     let g_num = g_ret / wsum;
     let g_wsum = -g_ret * ret / wsum;
     let (r1, r2) = (c.r1 as f64, c.r2 as f64);
-    let mut g_weight1 = g_num * r1 + g_wsum;
-    let mut g_weight2 = g_num * r2 + g_wsum;
-    let mut g_r1 = g_num * c.weight1 as f64;
-    let mut g_r2 = g_num * c.weight2 as f64;
-    // weight2 = w30 * s32 * ex33
+    let g_weight1 = g_num * r1 + g_wsum;
+    let g_weight2 = g_num * r2 + g_wsum;
+    // r1 feeds BOTH the mixture (weight1*r1) AND the short-trace stability update (which reads r1
+    // instead of the mixed retention) — the latter's adjoint arrives as g_r1_extra.
+    let g_r1 = g_num * c.weight1 as f64 + g_r1_extra;
+    let g_r2 = g_num * c.weight2 as f64;
+    // weight2 = base_weight2[w28] * s32 * ex33
     let (s32, ex33) = (c.s32 as f64, c.ex33 as f64);
-    gw[30] += g_weight2 * s32 * ex33;
-    let g_s32 = g_weight2 * w[30] as f64 * ex33;
-    let g_ex33 = g_weight2 * w[30] as f64 * s32;
-    let mut g_d = g_ex33 * ex33 * w[33] as f64; // ex33 = exp((d-5)*w33)
-    gw[33] += g_ex33 * ex33 * (d - 5.0);
-    let mut g_s = g_s32 * w[32] as f64 * (s32 / s); // d(s^w32)/ds = w32*s^(w32-1) = w32*s32/s
-    gw[32] += g_s32 * s32 * c.ln_s as f64;
-    // weight1 = w29 * p31 ; p31 = sf^(-w31)
+    gw[28] += g_weight2 * s32 * ex33;
+    let g_s32 = g_weight2 * w[28] as f64 * ex33;
+    let g_ex33 = g_weight2 * w[28] as f64 * s32;
+    let mut g_d = g_ex33 * ex33 * (w[31] as f64 - 0.5); // ex33 = exp((d-5)*(d_weight-0.5))
+    gw[31] += g_ex33 * ex33 * (d - 5.0); // offset is +const => d/d(w31) deriv factor = 1
+    let mut g_s = g_s32 * w[30] as f64 * (s32 / s); // s32 = s_long^s_weight_power2[w30]
+    gw[30] += g_s32 * s32 * c.ln_s as f64;
+    // weight1 = base_weight1[w27] * p31 ; p31 = s_short^(-s_weight_power1[w29])
     let p31 = c.p31 as f64;
-    gw[29] += g_weight1 * p31;
-    let g_p31 = g_weight1 * w[29] as f64;
-    let mut g_sf = g_p31 * (-(w[31] as f64)) * (p31 / sf); // d(sf^-w31)/dsf = -w31*p31/sf
-    gw[31] += g_p31 * (-(p31 * c.ln_sf as f64));
-    // r2 = b2^decay2
+    gw[27] += g_weight1 * p31;
+    let g_p31 = g_weight1 * w[27] as f64;
+    let mut g_sf = g_p31 * (-(w[29] as f64)) * (p31 / sf); // d(sf^-w29)/dsf = -w29*p31/sf
+    gw[29] += g_p31 * (-(p31 * c.ln_sf as f64));
+    // r2 = b2^decay2 ; iter-165: b2 = bv*factor2*ex34 + 1 (ex34 is the D time-scale) and
+    // decay2 = -clamp(w24) is no longer d-modulated.
     let (b2, decay2) = (c.b2 as f64, c.decay2 as f64);
     let g_b2 = g_r2 * decay2 * (r2 / b2); // d(b2^decay2)/db2 = decay2*r2/b2
     let mut g_decay2 = g_r2 * r2 * c.ln_b2 as f64;
     let factor2 = c.factor2 as f64;
-    let g_bv = g_b2 * factor2; // b2 = bv*factor2 + 1
-    let g_factor2 = g_b2 * c.bv as f64;
+    let ex34 = c.ex34 as f64;
+    let g_bv = g_b2 * factor2 * ex34; // b2 = bv*factor2*ex34 + 1
+    let g_factor2 = g_b2 * c.bv as f64 * ex34;
+    let g_ex34 = g_b2 * c.bv as f64 * factor2;
+    g_d += g_ex34 * ex34 * (w[32] as f64 - 0.3); // ex34 = exp((d-5)*(d_decay-0.3))
+    gw[32] += g_ex34 * ex34 * (d - 5.0); // offset is +const => deriv factor = 1
     let g_p28 = g_factor2; // factor2 = p28 - 1
-    // p28 = w28^inv2
+    // p28 = base2[w26]^inv2
     let (inv2, p28) = (c.inv2 as f64, c.p28 as f64);
-    gw[28] += g_p28 * inv2 * (p28 / w[28] as f64); // d(w28^inv2)/dw28 = inv2*p28/w28
+    gw[26] += g_p28 * inv2 * (p28 / w[26] as f64); // d(base2^inv2)/d(base2) = inv2*p28/base2
     let g_inv2 = g_p28 * p28 * c.ln_w28 as f64;
     g_decay2 += g_inv2 * (-1.0 / (decay2 * decay2)); // inv2 = 1/decay2
     let g_dm2 = -g_decay2; // decay2 = -dm2
     let g_m2 = if c.m2 > 0.01 && c.m2 < 0.95 { g_dm2 } else { 0.0 };
-    let ex34 = c.ex34 as f64;
-    gw[26] += g_m2 * ex34; // m2 = w26 * ex34
-    let g_ex34 = g_m2 * w[26] as f64;
-    g_d += g_ex34 * ex34 * w[34] as f64; // ex34 = exp((d-5)*w34)
-    gw[34] += g_ex34 * ex34 * (d - 5.0);
+    gw[24] += g_m2; // m2 = w24 directly (clamp gate via c.m2)
     g_s += g_bv * (-t / (s * s)); // bv = t/s
     // r1 = b1^decay1
     let (b1, decay1) = (c.b1 as f64, c.decay1 as f64);
@@ -258,18 +274,18 @@ fn curve_bwd(
     let g_e1 = g_factor1; // factor1 = e1 - 1
     let g_q1c = g_e1 * c.e1 as f64; // e1 = exp(q1c)
     let g_q1 = if (c.q1 as f64) < 60.0 { g_q1c } else { 0.0 }; // q1c = min(q1,60)
-    // q1 = ln(w27) / decay1
+    // q1 = ln(base1) / decay1
     let lw27 = c.ln_w27 as f64;
     let g_lw27 = g_q1 / decay1;
     g_decay1 += g_q1 * (-lw27 / (decay1 * decay1));
-    gw[27] += g_lw27 / w[27] as f64; // lw27 = ln(w27)
+    gw[25] += g_lw27 / w[25] as f64; // ln_base1 = ln(w[25])
     let g_dm1 = -g_decay1; // decay1 = -dm1
     let g_m1 = if c.m1 > 0.01 && c.m1 < 0.95 { g_dm1 } else { 0.0 };
     let p35 = c.p35 as f64;
-    gw[25] += g_m1 * p35; // m1 = w25 * p35
-    let g_p35 = g_m1 * w[25] as f64;
-    g_sf += g_p35 * w[35] as f64 * (p35 / sf); // d(sf^w35)/dsf = w35*p35/sf
-    gw[35] += g_p35 * p35 * c.ln_sf as f64;
+    gw[23] += g_m1 * p35; // m1 = decay1[w23] * p35
+    let g_p35 = g_m1 * w[23] as f64;
+    g_sf += g_p35 * (w[33] as f64 - 0.3) * (p35 / sf); // p35 = s_short^(s_decay1-0.3)
+    gw[33] += g_p35 * p35 * c.ln_sf as f64;
     g_sf += g_a * (-t / (sf * sf)); // a = t/sf
     (g_s, g_sf, g_d)
 }
@@ -300,23 +316,25 @@ fn stab_fwd(
     w: &[f32], last_s: f32, last_d: f32, r: f32, rating: f32, start: usize, aa: f32,
     ln_ls: f32, ln_ld: f32,
 ) -> StabCache {
-    let hard = if rating == 2.0 { w[start + 7] } else { 1.0 };
-    let easy = if rating == 4.0 { w[start + 8] } else { 1.0 };
-    let pp = ((-w[start + 4]) * ln_ld).exp(); // last_d^-w[start+4] (ln_ld shared; iter13)
+    // Finished layout (8 params/block): start sinc_base, +1 sinc_s_exp, +2 sinc_r_mult,
+    // +3 fail_mult, +4 fail_s_exp, +5 fail_r_mult, +6 hard_penalty, +7 easy_bonus.
+    // fail_d_exp DROPPED: new_s_fail is D-independent, so ln_ld (last_d) no longer feeds it.
+    let hard = if rating == 2.0 { w[start + 6] } else { 1.0 };
+    let easy = if rating == 4.0 { w[start + 7] } else { 1.0 };
     let ln_ls1 = (last_s + 1.0).ln();
-    let qbase = (w[start + 5] * ln_ls1).exp(); // (last_s+1)^w[start+5]
-    let rexp = ((1.0 - r) * w[start + 6]).exp();
-    let nsf_fail = w[start + 3] * pp * (qbase - 1.0) * rexp;
+    let qbase = (w[start + 4] * ln_ls1).exp(); // (last_s+1)^fail_s_exp[start+4]
+    let rexp = ((1.0 - r) * w[start + 5]).exp(); // exp((1-r)*fail_r_mult[start+5])
+    let nsf_fail = w[start + 3] * (qbase - 1.0) * rexp; // fail_mult * (qbase-1) * rexp
     let pls = last_s.min(nsf_fail);
     let bb = 11.0 - last_d; // aa = exp(w[start]-1.5) hoisted (loop-invariant)
-    let cc = ((-w[start + 1]) * ln_ls).exp(); // last_s^-w[start+1] (ln_ls shared; iter13)
+    let cc = ((-w[start + 1]) * ln_ls).exp(); // last_s^-sinc_s_exp[start+1] (ln_ls shared)
     let expr = ((1.0 - r) * w[start + 2]).exp();
     let sinc = aa * bb * cc * (expr - 1.0) * hard * easy + 1.0;
     let ls_sinc = last_s * sinc;
     let nss = pls.max(ls_sinc);
     let out = if rating > 1.0 { nss } else { pls };
     StabCache {
-        out, nsf_fail, pls, sinc, ls_sinc, aa, bb, cc, expr, pp, qbase, rexp, hard, easy,
+        out, nsf_fail, pls, sinc, ls_sinc, aa, bb, cc, expr, pp: 0.0, qbase, rexp, hard, easy,
         ln_ls, ln_ld, ln_ls1,
     }
 }
@@ -326,7 +344,8 @@ fn stab_bwd(
     w: &[f32], c: &StabCache, last_s: f32, last_d: f32, r: f32, rating: f32, start: usize,
     g_out: f64, gw: &mut [f64],
 ) -> (f64, f64, f64) {
-    let (last_s, last_d, r) = (last_s as f64, last_d as f64, r as f64);
+    let (last_s, r) = (last_s as f64, r as f64);
+    let _ = last_d; // post-lapse stability is D-independent now (fail_d_exp dropped)
     let (g_nss, g_pls_direct) = if rating > 1.0 { (g_out, 0.0) } else { (0.0, g_out) };
     // nss = max(pls, ls_sinc)
     let g_pls_from_nss = if c.pls >= c.ls_sinc { g_nss } else { 0.0 };
@@ -350,59 +369,66 @@ fn stab_bwd(
     let g_cc = g_prod * (aa * bb * em1 * hard * easy);
     let g_em1 = g_prod * (aa * bb * cc * hard * easy);
     if rating == 2.0 {
-        gw[start + 7] += g_prod * (aa * bb * cc * em1 * easy);
+        gw[start + 6] += g_prod * (aa * bb * cc * em1 * easy); // hard_penalty
     }
     if rating == 4.0 {
-        gw[start + 8] += g_prod * (aa * bb * cc * em1 * hard);
+        gw[start + 7] += g_prod * (aa * bb * cc * em1 * hard); // easy_bonus
     }
-    let mut g_last_d = g_bb * (-1.0); // bb = 11 - last_d
+    let g_last_d = g_bb * (-1.0); // bb = 11 - last_d (the ONLY D-dependence of stab now)
     g_last_s += g_cc * (-(w[start + 1] as f64)) * (cc / last_s); // d(ls^-w)/dls = -w*cc/ls
     gw[start + 1] += g_cc * (-(cc * c.ln_ls as f64));
     // expr = exp((1-r)*w[start+2]) ; em1 = expr - 1
     let expr = c.expr as f64;
     let mut g_r = g_em1 * expr * (-(w[start + 2] as f64));
     gw[start + 2] += g_em1 * expr * (1.0 - r);
-    // nsf_fail = w[start+3] * pp * (qbase-1) * rexp
-    let (pp, qbase, rexp) = (c.pp as f64, c.qbase as f64, c.rexp as f64);
+    // nsf_fail = fail_mult[start+3] * (qbase-1) * rexp   (no d^-fail_d_exp factor)
+    let (qbase, rexp) = (c.qbase as f64, c.rexp as f64);
     let q = qbase - 1.0;
-    gw[start + 3] += g_nsf_fail * (pp * q * rexp);
-    let g_pp = g_nsf_fail * w[start + 3] as f64 * q * rexp;
-    let g_q = g_nsf_fail * w[start + 3] as f64 * pp * rexp;
-    let g_rexp = g_nsf_fail * w[start + 3] as f64 * pp * q;
-    // pp = last_d^(-w[start+4])
-    g_last_d += g_pp * (-(w[start + 4] as f64)) * (pp / last_d); // d(ld^-w)/dld = -w*pp/ld
-    gw[start + 4] += g_pp * (-(pp * c.ln_ld as f64));
-    // q = qbase - 1 ; qbase = (last_s+1)^w[start+5]
-    g_last_s += g_q * w[start + 5] as f64 * (qbase / (last_s + 1.0)); // d((ls+1)^w)/dls = w*qbase/(ls+1)
-    gw[start + 5] += g_q * qbase * c.ln_ls1 as f64;
-    // rexp = exp((1-r)*w[start+6])
-    g_r += g_rexp * rexp * (-(w[start + 6] as f64));
-    gw[start + 6] += g_rexp * rexp * (1.0 - r);
+    gw[start + 3] += g_nsf_fail * (q * rexp);
+    let g_q = g_nsf_fail * w[start + 3] as f64 * rexp;
+    let g_rexp = g_nsf_fail * w[start + 3] as f64 * q;
+    // q = qbase - 1 ; qbase = (last_s+1)^fail_s_exp[start+4]
+    g_last_s += g_q * w[start + 4] as f64 * (qbase / (last_s + 1.0));
+    gw[start + 4] += g_q * qbase * c.ln_ls1 as f64;
+    // rexp = exp((1-r)*fail_r_mult[start+5])
+    g_r += g_rexp * rexp * (-(w[start + 5] as f64));
+    gw[start + 5] += g_rexp * rexp * (1.0 - r);
     (g_last_s, g_last_d, g_r)
 }
 
 // ===================== next difficulty =====================
 
-fn next_d_fwd(w: &[f32], last_d: f32, rating: f32, init: f32) -> (f32, f32, f32) {
-    let delta_d = -w[6] * (rating - 3.0);
+fn next_d_fwd(w: &[f32], last_d: f32, rating: f32, r: f32, init: f32) -> (f32, f32, f32) {
+    let delta_d_base = -w[6] * (rating - 3.0);
+    // SURPRISE-WEIGHTED lapse difficulty: on a lapse scale delta_d by (r + 0.1) = 1 + (R - 0.9).
+    let delta_d = if rating == 1.0 { delta_d_base * (r + 0.1) } else { delta_d_base };
     let new_d = last_d + (10.0 - last_d) * delta_d / 9.0;
     // init = w4 - exp(3*w5) + 1 hoisted (loop-invariant)
     let out_pre = 0.01 * init + 0.99 * new_d;
-    (clamp(out_pre, D_MIN, D_MAX), out_pre, delta_d)
+    (clamp(out_pre, D_MIN, D_MAX), out_pre, delta_d) // delta_d returned = the EFFECTIVE delta_d
 }
 
-/// VJP of next_difficulty. Returns g_last_d, accumulates gw[4], gw[5], gw[6].
-fn next_d_bwd(out_pre: f32, delta_d: f32, last_d: f32, rating: f32, g_out: f64, gw: &mut [f64], exp3w5: f64) -> f64 {
+/// VJP of next_difficulty. Returns (g_last_d, g_r); accumulates gw[4], gw[5], gw[6]. `delta_d` is
+/// the EFFECTIVE delta_d from the forward; `r` is the curve retention (feeds the lapse surprise).
+#[allow(clippy::too_many_arguments)]
+fn next_d_bwd(w: &[f32], out_pre: f32, delta_d: f32, last_d: f32, rating: f32, r: f32, g_out: f64, gw: &mut [f64], exp3w5: f64) -> (f64, f64) {
     let g_out_pre = if out_pre > D_MIN && out_pre < D_MAX { g_out } else { 0.0 };
     let g_init = g_out_pre * 0.01;
     let g_new_d = g_out_pre * 0.99;
     gw[4] += g_init;
     gw[5] += g_init * (-exp3w5 * 3.0); // init = w4 - exp(3 w5) + 1 ; exp3w5 hoisted
-    let delta_d = delta_d as f64;
-    let g_last_d = g_new_d * (1.0 - delta_d / 9.0);
+    let g_last_d = g_new_d * (1.0 - delta_d as f64 / 9.0);
     let g_delta_d = g_new_d * (10.0 - last_d as f64) / 9.0;
-    gw[6] += g_delta_d * (-(rating as f64 - 3.0)); // delta_d = -w6*(rating-3)
-    g_last_d
+    let rm3 = rating as f64 - 3.0;
+    let mut g_r = 0.0;
+    if rating == 1.0 {
+        // delta_d_eff = (-w6*(rating-3)) * (r+0.1)
+        gw[6] += g_delta_d * (-rm3) * (r as f64 + 0.1);
+        g_r = g_delta_d * (-(w[6] as f64) * rm3); // d(delta_d_eff)/dr = delta_d_base
+    } else {
+        gw[6] += g_delta_d * (-rm3); // delta_d = -w6*(rating-3)
+    }
+    (g_last_d, g_r)
 }
 
 // ===================== one recurrence step =====================
@@ -442,10 +468,13 @@ fn step_fwd(w: &[f32], delta_t: f32, rating: f32, state: (f32, f32, f32), nth0: 
         w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf,
     );
     let r = curve.out;
+    let r1 = curve.r1; // short component recall — drives the short-trace update (iter-71)
     let slow = stab_fwd(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
-    let fast = stab_fwd(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
-    let (nd1, nd_out_pre, nd_delta_d) = next_d_fwd(w, last_d, rating, wc.init);
-    let (mut ns, mut nsf, mut nd) = (slow.out, fast.out, nd1);
+    let fast = stab_fwd(w, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf, ln_last_d);
+    let (nd1, nd_out_pre, nd_delta_d) = next_d_fwd(w, last_d, rating, r, wc.init);
+    // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
+    let nsf_pre = if rating == 1.0 { fast.out.min(0.8 * slow.out) } else { fast.out };
+    let (mut ns, mut nsf, mut nd) = (slow.out, nsf_pre, nd1);
     if nth0 && s0 == 0.0 {
         let rc = clamp(rating, 1.0, 4.0);
         let init_s = w[(rc as usize) - 1];
@@ -499,15 +528,29 @@ fn step_bwd(w: &[f32], c: &StepCache, g_out: (f64, f64, f64), gw: &mut [f64], wc
     } else {
         (g_ns2, g_nsf2, g_nd2)
     };
-    // ns1 = stab(slow, last_s, last_d) ; nsf1 = stab(fast, last_sf, last_d) ; nd1 = next_d(last_d)
-    let (g_ls_a, g_ld_a, g_r_a) =
-        stab_bwd(w, &c.slow, c.last_s, c.last_d, c.curve.out, c.rating, 7, g_ns1, gw);
-    let (g_lsf_b, g_ld_b, g_r_b) =
-        stab_bwd(w, &c.fast, c.last_sf, c.last_d, c.curve.out, c.rating, 16, g_nsf1, gw);
-    let g_ld_c = next_d_bwd(c.nd_out_pre, c.nd_delta_d, c.last_d, c.rating, g_nd1, gw, wc.exp3w5);
-    // r = curve(dt, last_s, last_sf, last_d)
-    let (g_ls_d, g_lsf_d, g_ld_d) =
-        curve_bwd(w, &c.curve, c.dt, c.last_s, c.last_sf, c.last_d, g_r_a + g_r_b, gw);
+    // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
+    // g_nsf1 is the adjoint on nsf_pre; route it to fast.out and/or 0.8*slow.out.
+    let (g_fast_out, g_slow_from_relearn) = if c.rating == 1.0 {
+        if c.fast.out <= 0.8 * c.slow.out {
+            (g_nsf1, 0.0)
+        } else {
+            (0.0, g_nsf1 * 0.8)
+        }
+    } else {
+        (g_nsf1, 0.0)
+    };
+    // LONG (slow) stab reads the mixed retention curve.out; SHORT (fast) stab reads r1=curve.r1.
+    let (g_ls_a, g_ld_a, g_r_long) =
+        stab_bwd(w, &c.slow, c.last_s, c.last_d, c.curve.out, c.rating, 7, g_ns1 + g_slow_from_relearn, gw);
+    let (g_lsf_b, g_ld_b, g_r1_short) =
+        stab_bwd(w, &c.fast, c.last_sf, c.last_d, c.curve.r1, c.rating, 15, g_fast_out, gw);
+    // next_d reads curve.out (and on a lapse depends on it via the surprise weighting).
+    let (g_ld_c, g_r_nextd) =
+        next_d_bwd(w, c.nd_out_pre, c.nd_delta_d, c.last_d, c.rating, c.curve.out, g_nd1, gw, wc.exp3w5);
+    // curve.out adjoint = long-stab r + next_d r; curve.r1 adjoint (g_r1_extra) = short-stab r.
+    let (g_ls_d, g_lsf_d, g_ld_d) = curve_bwd(
+        w, &c.curve, c.dt, c.last_s, c.last_sf, c.last_d, g_r_long + g_r_nextd, g_r1_short, gw,
+    );
     let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
     let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
     let g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d + g_last_d_extra;
@@ -602,8 +645,12 @@ fn curve8_fwd<const FAST: bool>(
     let t = t.fast_max(k(0.0));
     let a = t / sf;
     let bv = t / s;
-    let p35 = exp8::<FAST>(sp(35) * ln_sf);
-    let m1 = sp(25) * p35;
+    // 34-param remap + all-positive offsets: p35=s_short^(s_decay1[w33]-0.3), m1=decay1[w23]*p35,
+    // ex34=exp((d-5)*(d_decay[w32]-0.3)), m2=decay2[w24]*ex34, p28=base2[w26]^inv2,
+    // p31=s_short^-s_weight_power1[w29], weight1=base_weight1[w27]*p31. ln_w27=ln(base1=w25),
+    // ln_w28=ln(base2=w26).
+    let p35 = exp8::<FAST>((sp(33) - k(0.3)) * ln_sf);
+    let m1 = sp(23) * p35;
     let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
     let q1 = k(ln_w27) / decay1;
@@ -612,23 +659,25 @@ fn curve8_fwd<const FAST: bool>(
     let b1 = a * factor1 + k(1.0);
     let ln_b1 = ln8::<FAST>(b1);
     let r1 = exp8::<FAST>(decay1 * ln_b1);
-    let ex34 = exp8::<FAST>((d - k(5.0)) * sp(34));
-    let m2 = sp(26) * ex34;
+    // iter-165: decay2 no longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3))
+    // is now the TIME-SCALE inside b2.
+    let ex34 = exp8::<FAST>((d - k(5.0)) * (sp(32) - k(0.3)));
+    let m2 = sp(24);
     let dm2 = clamp8(m2, 0.01, 0.95);
     let decay2 = k(0.0) - dm2;
     let inv2 = k(1.0) / decay2;
     let p28 = exp8::<FAST>(inv2 * k(ln_w28));
     let factor2 = p28 - k(1.0);
-    let b2 = bv * factor2 + k(1.0);
+    let b2 = bv * factor2 * ex34 + k(1.0);
     let ln_b2 = ln8::<FAST>(b2);
     let r2 = exp8::<FAST>(decay2 * ln_b2);
-    let p31 = exp8::<FAST>(k(-w[31]) * ln_sf);
-    let weight1 = sp(29) * p31;
-    // se = s^w32 · exp(w33·(d−5)) = exp(w32·ln_s + w33·(d−5)): ONE exp instead of two. FSRS-7 defines
-    // weight2 as the product of these two powers; fusing them is a ~1-ULP FP reassociation (3b band),
-    // and curve8_bwd reads c.se directly.
-    let se = exp8::<FAST>(sp(32) * ln_s + (d - k(5.0)) * sp(33));
-    let weight2 = sp(30) * se;
+    let p31 = exp8::<FAST>(k(-w[29]) * ln_sf);
+    let weight1 = sp(27) * p31;
+    // se = s_long^s_weight_power2[w30] · exp((d_weight[w31]-0.5)·(d−5)) = exp(w30·ln_s +
+    // (w31-0.5)·(d−5)): ONE exp instead of two (iter24 fusion, ~1-ULP 3b reassociation; curve8_bwd
+    // reads c.se directly). weight2 = base_weight2[w28] * se.
+    let se = exp8::<FAST>(sp(30) * ln_s + (d - k(5.0)) * (sp(31) - k(0.5)));
+    let weight2 = sp(28) * se;
     let wsum = weight1 + weight2;
     let num = weight1 * r1 + weight2 * r2;
     let ret = num / wsum;
@@ -643,8 +692,8 @@ fn curve8_fwd<const FAST: bool>(
 /// gw[] += is an f32x8 accumulate). Returns (g_s, g_sf, g_d); accumulates into the f32x8 gw bank.
 #[allow(clippy::too_many_arguments)]
 fn curve8_bwd(
-    w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8,
-    gw: &mut [f32x8; 36], ln_w27: f32, ln_w28: f32,
+    w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
+    gw: &mut [f32x8; 34], ln_w27: f32, ln_w28: f32,
 ) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
@@ -655,35 +704,37 @@ fn curve8_bwd(
     let g_wsum = (z - g_ret) * c.ret / c.wsum;
     let g_weight1 = g_num * c.r1 + g_wsum;
     let g_weight2 = g_num * c.r2 + g_wsum;
-    let g_r1 = g_num * c.weight1;
+    // r1 also feeds the short-trace stability update (reads r1, not mixed R) -> g_r1_extra.
+    let g_r1 = g_num * c.weight1 + g_r1_extra;
     let g_r2 = g_num * c.weight2;
-    // weight2 = w30 * se ;  se = exp(w32*ln_s + w33*(d-5))  (the old s32*ex33, fused into one exp)
-    gw[30] += g_weight2 * c.se;
-    let g_se = g_weight2 * sp(30) * c.se; // adjoint-on-se times se (the shared d(se)/d(.) factor)
-    let mut g_d = g_se * sp(33); // d(se)/dd  = se*w33
-    gw[33] += g_se * (d - k(5.0)); // d(se)/dw33 = se*(d-5)
-    let mut g_s = g_se * sp(32) / s; // d(se)/ds  = se*w32/s
-    gw[32] += g_se * c.ln_s; // d(se)/dw32 = se*ln_s
-    // weight1 = w29 * p31 ; p31 = sf^(-w31)
-    gw[29] += g_weight1 * c.p31;
-    let g_p31 = g_weight1 * sp(29);
-    let mut g_sf = g_p31 * k(-w[31]) * (c.p31 / sf);
-    gw[31] += g_p31 * (z - c.p31 * c.ln_sf);
-    // r2 = b2^decay2
+    // weight2 = base_weight2[w28] * se ; se = exp(w30*ln_s + (w31-0.5)*(d-5))  (fused)
+    gw[28] += g_weight2 * c.se;
+    let g_se = g_weight2 * sp(28) * c.se; // adjoint-on-se times se (shared d(se)/d(.) factor)
+    let mut g_d = g_se * (sp(31) - k(0.5)); // d(se)/dd  = se*(d_weight-0.5)
+    gw[31] += g_se * (d - k(5.0)); // d(se)/d(d_weight) = se*(d-5) (offset deriv = 1)
+    let mut g_s = g_se * sp(30) / s; // d(se)/ds  = se*s_weight_power2/s
+    gw[30] += g_se * c.ln_s; // d(se)/d(s_weight_power2) = se*ln_s
+    // weight1 = base_weight1[w27] * p31 ; p31 = sf^(-s_weight_power1[w29])
+    gw[27] += g_weight1 * c.p31;
+    let g_p31 = g_weight1 * sp(27);
+    let mut g_sf = g_p31 * k(-w[29]) * (c.p31 / sf);
+    gw[29] += g_p31 * (z - c.p31 * c.ln_sf);
+    // r2 = b2^decay2 ; iter-165: b2 = bv*factor2*ex34 + 1 (ex34 = D time-scale) and
+    // decay2 = -clamp(w24) is no longer d-modulated.
     let g_b2 = g_r2 * c.decay2 * (c.r2 / c.b2);
     let mut g_decay2 = g_r2 * c.r2 * c.ln_b2;
-    let g_bv = g_b2 * c.factor2;
-    let g_factor2 = g_b2 * c.bv;
+    let g_bv = g_b2 * c.factor2 * c.ex34;
+    let g_factor2 = g_b2 * c.bv * c.ex34;
+    let g_ex34 = g_b2 * c.bv * c.factor2;
+    g_d += g_ex34 * c.ex34 * (sp(32) - k(0.3)); // ex34 = exp((d-5)*(d_decay-0.3))
+    gw[32] += g_ex34 * c.ex34 * (d - k(5.0));
     let g_p28 = g_factor2;
-    gw[28] += g_p28 * c.inv2 * (c.p28 / sp(28));
+    gw[26] += g_p28 * c.inv2 * (c.p28 / sp(26)); // p28 = base2[w26]^inv2
     let g_inv2 = g_p28 * c.p28 * k(ln_w28);
     g_decay2 += g_inv2 * (z - k(1.0) / (c.decay2 * c.decay2));
     let g_dm2 = z - g_decay2;
     let g_m2 = (c.m2.cmp_gt(k(0.01)) & c.m2.cmp_lt(k(0.95))).blend(g_dm2, z);
-    gw[26] += g_m2 * c.ex34;
-    let g_ex34 = g_m2 * sp(26);
-    g_d += g_ex34 * c.ex34 * sp(34);
-    gw[34] += g_ex34 * c.ex34 * (d - k(5.0));
+    gw[24] += g_m2; // m2 = w24 directly (clamp gate via c.m2)
     g_s += g_bv * (z - t / (s * s)); // bv = t/s
     // r1 = b1^decay1
     let g_b1 = g_r1 * c.decay1 * (c.r1 / c.b1);
@@ -693,16 +744,16 @@ fn curve8_bwd(
     let g_e1 = g_factor1;
     let g_q1c = g_e1 * c.e1;
     let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_q1c, z);
-    // q1 = ln_w27 / decay1
+    // q1 = ln(base1) / decay1
     let g_lw27 = g_q1 / c.decay1;
     g_decay1 += g_q1 * (z - k(ln_w27) / (c.decay1 * c.decay1));
-    gw[27] += g_lw27 / sp(27);
+    gw[25] += g_lw27 / sp(25); // ln_base1 = ln(w[25])
     let g_dm1 = z - g_decay1;
     let g_m1 = (c.m1.cmp_gt(k(0.01)) & c.m1.cmp_lt(k(0.95))).blend(g_dm1, z);
-    gw[25] += g_m1 * c.p35;
-    let g_p35 = g_m1 * sp(25);
-    g_sf += g_p35 * sp(35) * (c.p35 / sf);
-    gw[35] += g_p35 * c.p35 * c.ln_sf;
+    gw[23] += g_m1 * c.p35; // m1 = decay1[w23] * p35
+    let g_p35 = g_m1 * sp(23);
+    g_sf += g_p35 * (sp(33) - k(0.3)) * (c.p35 / sf); // p35 = s_short^(s_decay1-0.3)
+    gw[33] += g_p35 * c.p35 * c.ln_sf;
     g_sf += g_a * (z - t / (sf * sf)); // a = t/sf
     (g_s, g_sf, g_d)
 }
@@ -735,12 +786,13 @@ fn stab8_fwd<const FAST: bool>(
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let one = k(1.0);
-    let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 7), one);
-    let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 8), one);
+    let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 6), one);
+    let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 7), one);
     let ln_ls1 = ln8::<FAST>(last_s + one);
-    let qbase = exp8::<FAST>(sp(start + 5) * ln_ls1);
-    // pr = pp*rexp = exp(-w4·ln_ld) · exp((1−r)·w6) = exp(-w4·ln_ld + (1−r)·w6): ONE exp instead of two.
-    let pr = exp8::<FAST>(k(-w[start + 4]) * ln_ld + (one - r) * sp(start + 6));
+    let qbase = exp8::<FAST>(sp(start + 4) * ln_ls1); // (last_s+1)^fail_s_exp[start+4]
+    // fail_d_exp DROPPED: post-lapse stability is D-independent, so the legacy `pr` cache field now
+    // holds just rexp (no pp = last_d^-fail_d_exp factor; ln_ld unused, kept in cache for layout).
+    let pr = exp8::<FAST>((one - r) * sp(start + 5)); // rexp = exp((1-r)*fail_r_mult[start+5])
     let nsf_fail = sp(start + 3) * pr * (qbase - one);
     let pls = last_s.fast_min(nsf_fail);
     let bb = k(11.0) - last_d;
@@ -761,12 +813,13 @@ fn stab8_fwd<const FAST: bool>(
 #[allow(clippy::too_many_arguments)]
 fn stab8_bwd(
     w: &[f32], c: &Stab8, last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize,
-    g_out: f32x8, gw: &mut [f32x8; 36],
+    g_out: f32x8, gw: &mut [f32x8; 34],
 ) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let one = k(1.0);
     let z = k(0.0);
+    let _ = last_d; // post-lapse stability is D-independent now (fail_d_exp dropped)
     let gt1 = rating.cmp_gt(one);
     let g_nss = gt1.blend(g_out, z);
     let g_pls_direct = gt1.blend(z, g_out);
@@ -787,45 +840,48 @@ fn stab8_bwd(
     let g_bb = g_prod * (c.aa * c.cc * em1 * c.hard * c.easy);
     let g_cc = g_prod * (c.aa * c.bb * em1 * c.hard * c.easy);
     let g_em1 = g_prod * (c.aa * c.bb * c.cc * c.hard * c.easy);
-    gw[start + 7] += rating.cmp_eq(k(2.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.easy), z);
-    gw[start + 8] += rating.cmp_eq(k(4.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.hard), z);
-    let mut g_last_d = g_bb * (z - one); // bb = 11 - last_d
+    gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.easy), z); // hard_penalty
+    gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_prod * (c.aa * c.bb * c.cc * em1 * c.hard), z); // easy_bonus
+    let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
     g_last_s += g_cc * k(-w[start + 1]) * (c.cc / last_s);
     gw[start + 1] += g_cc * (z - c.cc * c.ln_ls);
     // expr = exp((1-r)*w[start+2])
     let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
     gw[start + 2] += g_em1 * c.expr * (one - r);
-    // nsf_fail = w[start+3] * pr * (qbase-1) ;  pr = exp(-w4*ln_ld + (1-r)*w6)  (fused pp*rexp)
+    // nsf_fail = fail_mult[start+3] * pr * (qbase-1) ; pr = rexp = exp((1-r)*fail_r_mult[start+5])
+    // (fail_d_exp DROPPED: no pp = last_d^-x factor, so nsf_fail is D-independent).
     let q = c.qbase - one;
     gw[start + 3] += g_nsf_fail * (c.pr * q);
-    let g_pr = g_nsf_fail * sp(start + 3) * q; // adjoint on pr
+    let g_pr = g_nsf_fail * sp(start + 3) * q; // adjoint on pr(=rexp)
     let g_q = g_nsf_fail * sp(start + 3) * c.pr; // adjoint on (qbase-1)
     let g_pr_pr = g_pr * c.pr; // shared  pr * d(pr)/d(.)  factor
-    // pr = exp(-w[start+4]*ln_ld + (1-r)*w[start+6])
-    g_last_d += g_pr_pr * k(-w[start + 4]) / last_d; // d(pr)/d(last_d) = pr*(-w4)/last_d
-    gw[start + 4] += g_pr_pr * (z - c.ln_ld); // d(pr)/d(w4) = pr*(-ln_ld)
-    g_r += g_pr_pr * k(-w[start + 6]); // d(pr)/d(r) = pr*(-w6)
-    gw[start + 6] += g_pr_pr * (one - r); // d(pr)/d(w6) = pr*(1-r)
-    // qbase = (last_s+1)^w[start+5]
-    g_last_s += g_q * sp(start + 5) * (c.qbase / (last_s + one));
-    gw[start + 5] += g_q * c.qbase * c.ln_ls1;
+    // pr = exp((1-r)*fail_r_mult[start+5])
+    g_r += g_pr_pr * k(-w[start + 5]); // d(pr)/d(r) = pr*(-fail_r_mult)
+    gw[start + 5] += g_pr_pr * (one - r); // d(pr)/d(fail_r_mult) = pr*(1-r)
+    // qbase = (last_s+1)^fail_s_exp[start+4]
+    g_last_s += g_q * sp(start + 4) * (c.qbase / (last_s + one));
+    gw[start + 4] += g_q * c.qbase * c.ln_ls1;
     (g_last_s, g_last_d, g_r)
 }
 
 /// f32x8 next-difficulty forward; returns (clamped out, pre-clamp out, delta_d) for the backward.
-fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, init: f32) -> (f32x8, f32x8, f32x8) {
+fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
-    let delta_d = k(-w[6]) * (rating - k(3.0));
+    let delta_d_base = k(-w[6]) * (rating - k(3.0));
+    // Surprise-weighted lapse: on a lapse scale delta_d by (r+0.1) = 1 + (R-0.9).
+    let delta_d = rating.cmp_eq(k(1.0)).blend(delta_d_base * (r + k(0.1)), delta_d_base);
     let new_d = last_d + (k(10.0) - last_d) * delta_d / k(9.0);
     let out_pre = k(0.01) * k(init) + k(0.99) * new_d;
-    (clamp8(out_pre, D_MIN, D_MAX), out_pre, delta_d)
+    (clamp8(out_pre, D_MIN, D_MAX), out_pre, delta_d) // delta_d returned = EFFECTIVE delta_d
 }
 
-/// VJP of next_d8_fwd. Returns g_last_d; accumulates gw[4], gw[5], gw[6].
+/// VJP of next_d8_fwd. Returns (g_last_d, g_r); accumulates gw[4], gw[5], gw[6]. `delta_d` is the
+/// EFFECTIVE delta_d; `r` is the curve retention (feeds the lapse surprise weighting).
+#[allow(clippy::too_many_arguments)]
 fn next_d8_bwd(
-    out_pre: f32x8, delta_d: f32x8, last_d: f32x8, rating: f32x8, g_out: f32x8,
-    gw: &mut [f32x8; 36], exp3w5: f64,
-) -> f32x8 {
+    w: &[f32], out_pre: f32x8, delta_d: f32x8, last_d: f32x8, rating: f32x8, r: f32x8, g_out: f32x8,
+    gw: &mut [f32x8; 34], exp3w5: f64,
+) -> (f32x8, f32x8) {
     let k = f32x8::splat;
     let z = k(0.0);
     let g_out_pre = (out_pre.cmp_gt(k(D_MIN)) & out_pre.cmp_lt(k(D_MAX))).blend(g_out, z);
@@ -835,8 +891,13 @@ fn next_d8_bwd(
     gw[5] += g_init * k(-(exp3w5 as f32) * 3.0); // init = w4 - exp(3 w5) + 1
     let g_last_d = g_new_d * (k(1.0) - delta_d / k(9.0));
     let g_delta_d = g_new_d * (k(10.0) - last_d) / k(9.0);
-    gw[6] += g_delta_d * (z - (rating - k(3.0))); // delta_d = -w6*(rating-3)
-    g_last_d
+    let rm3 = rating - k(3.0);
+    let is_lapse = rating.cmp_eq(k(1.0));
+    // d(delta_d_eff)/d(w6) = -(rating-3), scaled by (r+0.1) on a lapse.
+    gw[6] += g_delta_d * is_lapse.blend((z - rm3) * (r + k(0.1)), z - rm3);
+    // d(delta_d_eff)/dr = delta_d_base = -w6*(rating-3), only on a lapse.
+    let g_r = is_lapse.blend(g_delta_d * (k(-w[6]) * rm3), z);
+    (g_last_d, g_r)
 }
 
 /// Vectorized forward-only BCE loss (validation). Processes the batch 8 cards at a time; the
@@ -884,10 +945,13 @@ pub(crate) fn batch_loss_simd(
                 let ln_s = ln8::<false>(s_c);
                 let ln_sf = ln8::<false>(sf_c);
                 let ln_d = ln8::<false>(d_c);
-                let rr = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf).out;
+                let curve = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+                let rr = curve.out;
                 let ns = stab8_fwd::<false>(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d).out;
-                let nsf = stab8_fwd::<false>(w, sf_c, d_c, rr, rating, 16, wc.aa16, ln_sf, ln_d).out;
-                let nd = next_d8_fwd(w, d_c, rating, wc.init).0;
+                let nsf_raw = stab8_fwd::<false>(w, sf_c, d_c, curve.r1, rating, 15, wc.aa16, ln_sf, ln_d).out;
+                // POST-LAPSE short reset: on a lapse cap s_short at 0.8 * post-lapse s_long.
+                let nsf = rating.cmp_eq(one).blend(nsf_raw.fast_min(k(0.8) * ns), nsf_raw);
+                let nd = next_d8_fwd(w, d_c, rating, rr, wc.init).0;
                 // rating==0 (padding) passes the state through unchanged.
                 let m0 = rating.cmp_eq(k(0.0));
                 s = clamp8(m0.blend(s_c, ns), S_MIN, S_MAX);
@@ -1006,13 +1070,16 @@ fn step8_fwd<const FAST: bool>(
         let ln_last_d = ln8::<FAST>(last_d);
         let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf);
         let r = curve.out;
+        let r1 = curve.r1; // short component recall — drives the short-trace update (iter-71)
         let slow = stab8_fwd::<FAST>(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
-        let fast = stab8_fwd::<FAST>(w, last_sf, last_d, r, rating, 16, wc.aa16, ln_last_sf, ln_last_d);
-        let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, wc.init);
+        let fast = stab8_fwd::<FAST>(w, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf, ln_last_d);
+        let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, r, wc.init);
+        // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
+        let nsf_pre = rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out);
         // rating==0 (padding) passes the input state through unchanged.
         let m0 = rating.cmp_eq(k(0.0));
         let ns3 = m0.blend(last_s, slow.out);
-        let nsf3 = m0.blend(last_sf, fast.out);
+        let nsf3 = m0.blend(last_sf, nsf_pre);
         let nd3 = m0.blend(last_d, nd);
         let out = (clamp8(ns3, S_MIN, S_MAX), nd3, clamp8(nsf3, S_MIN, S_MAX));
         (
@@ -1032,7 +1099,7 @@ fn step8_fwd<const FAST: bool>(
 /// feeds the loss AND both stability traces. The O(N^2) callers pass 0 (their loss is the separate
 /// final curve). The First variant ignores it (t==0 makes no prediction).
 fn step8_bwd(
-    w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), g_r_loss: f32x8, gw: &mut [f32x8; 36], wc: &WConsts,
+    w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), g_r_loss: f32x8, gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
     let one = k(1.0);
@@ -1066,19 +1133,27 @@ fn step8_bwd(
             // rating==0 padding: output state == input state, so the adjoint flows straight through.
             let m0 = rating.cmp_eq(z);
             let g_ns2 = m0.blend(z, g_ns3);
-            let g_nsf2 = m0.blend(z, g_nsf3);
+            let g_nsf2 = m0.blend(z, g_nsf3); // adjoint on nsf_pre
             let g_nd2 = m0.blend(z, g_nd3);
             let g_last_s_extra = m0.blend(g_ns3, z);
             let g_last_sf_extra = m0.blend(g_nsf3, z);
             let g_last_d_extra = m0.blend(g_nd3, z);
-            let (g_ls_a, g_ld_a, g_r_a) =
-                stab8_bwd(w, slow, *last_s, *last_d, curve.out, *rating, 7, g_ns2, gw);
-            let (g_lsf_b, g_ld_b, g_r_b) =
-                stab8_bwd(w, fast, *last_sf, *last_d, curve.out, *rating, 16, g_nsf2, gw);
-            let g_ld_c = next_d8_bwd(*nd_out_pre, *nd_delta_d, *last_d, *rating, g_nd2, gw, wc.exp3w5);
+            // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
+            let is_lapse = rating.cmp_eq(one);
+            let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
+            let g_fast_out = is_lapse.blend(fast_wins.blend(g_nsf2, z), g_nsf2);
+            let g_slow_from_relearn = is_lapse.blend(fast_wins.blend(z, g_nsf2 * k(0.8)), z);
+            // LONG stab reads mixed retention curve.out; SHORT stab reads r1=curve.r1 (start 15).
+            let (g_ls_a, g_ld_a, g_r_long) =
+                stab8_bwd(w, slow, *last_s, *last_d, curve.out, *rating, 7, g_ns2 + g_slow_from_relearn, gw);
+            let (g_lsf_b, g_ld_b, g_r1_short) =
+                stab8_bwd(w, fast, *last_sf, *last_d, curve.r1, *rating, 15, g_fast_out, gw);
+            let (g_ld_c, g_r_nextd) =
+                next_d8_bwd(w, *nd_out_pre, *nd_delta_d, *last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5);
+            // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
             let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
-                w, curve, *dt, *last_s, *last_sf, *last_d, g_r_a + g_r_b + g_r_loss, gw, wc.ln_w27,
-                wc.ln_w28,
+                w, curve, *dt, *last_s, *last_sf, *last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
+                gw, wc.ln_w27, wc.ln_w28,
             );
             let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
             let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
@@ -1145,9 +1220,9 @@ fn loss_and_grad_range_simd(
         // d loss / d r, then the [MIN_R, MAX_R] clamp, in f32x8.
         let g_r = (k(0.0) - wt) * (lbl / r - (one - lbl) / (one - r));
         let g_rraw = (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, k(0.0));
-        let mut gw_g = [f32x8::splat(0.0); 36];
+        let mut gw_g = [f32x8::splat(0.0); 34];
         let (mut g_s, mut g_sf, mut g_d) =
-            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, &mut gw_g, wc.ln_w27, wc.ln_w28);
+            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, f32x8::splat(0.0), &mut gw_g, wc.ln_w27, wc.ln_w28);
         for t in (0..sl).rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
             let (gs0, gd0, gsf0) =
@@ -1156,7 +1231,7 @@ fn loss_and_grad_range_simd(
             g_d = gd0;
             g_sf = gsf0;
         }
-        for i in 0..36 {
+        for i in 0..34 {
             gw[i] += gw_g[i].reduce_add() as f64;
         }
     }
@@ -1256,10 +1331,10 @@ pub(crate) fn card_loss_and_grad_simd(
         // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
         // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
         // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
-        let mut gw_g = [f32x8::splat(0.0); 36];
+        let mut gw_g = [f32x8::splat(0.0); 34];
         let g_rraw_last = g_r_loss_at(fc_last.out, lbase);
         let (g_ls, g_lsf, g_ld) = curve8_bwd(
-            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, &mut gw_g, wc.ln_w27, wc.ln_w28,
+            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, f32x8::splat(0.0), &mut gw_g, wc.ln_w27, wc.ln_w28,
         );
         let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
         let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
@@ -1276,7 +1351,7 @@ pub(crate) fn card_loss_and_grad_simd(
             g_d = gd0;
             g_sf = gsf0;
         }
-        for i in 0..36 {
+        for i in 0..34 {
             gw[i] += gw_g[i].reduce_add() as f64;
         }
     }
@@ -1369,7 +1444,7 @@ fn loss_and_grad_range(
         let g_rraw = if r_raw > MIN_R && r_raw < MAX_R { g_r } else { 0.0 };
         // final curve backward -> adjoints on final (s, sf, d)
         let (mut g_s, mut g_sf, mut g_d) =
-            curve_bwd(w, &fc, delta_ts[c], s, sf, d, g_rraw, gw);
+            curve_bwd(w, &fc, delta_ts[c], s, sf, d, g_rraw, 0.0, gw);
         // recurrence backward
         for t in (0..seq_len).rev() {
             let (gs0, gd0, gsf0) = step_bwd(w, &caches[t], (g_s, g_d, g_sf), gw, &wc);
@@ -1398,18 +1473,18 @@ pub(crate) fn batch_loss_and_grad(
     let mid = batch / 2;
     std::thread::scope(|s| {
         let h = s.spawn(|| {
-            let mut g = [0.0f64; 36];
+            let mut g = [0.0f64; 34];
             let l = loss_and_grad_range(
                 w, t_hist, r_hist, seq_len, batch, delta_ts, labels, weights, &mut g, mid, batch,
             );
             (l, g)
         });
-        let mut g_a = [0.0f64; 36];
+        let mut g_a = [0.0f64; 34];
         let loss_a = loss_and_grad_range(
             w, t_hist, r_hist, seq_len, batch, delta_ts, labels, weights, &mut g_a, 0, mid,
         );
         let (loss_b, g_b) = h.join().unwrap();
-        for i in 0..36 {
+        for i in 0..34 {
             gw[i] += g_a[i] + g_b[i];
         }
         loss_a + loss_b
@@ -1463,7 +1538,7 @@ fn loss_and_grad_range_window(
                 let cc = &caches[t];
                 // curve_bwd returns (g_s, g_sf, g_d); reorder to (g_s, g_d, g_sf).
                 let (g_s, g_sf, g_d) =
-                    curve_bwd(w, cur, cc.dt, cc.last_s, cc.last_sf, cc.last_d, g_rraw, gw);
+                    curve_bwd(w, cur, cc.dt, cc.last_s, cc.last_sf, cc.last_d, g_rraw, 0.0, gw);
                 (g_s, g_d, g_sf)
             } else {
                 (0.0, 0.0, 0.0)
@@ -1551,13 +1626,13 @@ mod tests {
         let dts: Vec<f32> = (0..batch).map(|c| (1 + c % 30) as f32).collect();
         let lbl: Vec<f32> = (0..batch).map(|c| (c % 2) as f32).collect();
         let wts: Vec<f32> = (0..batch).map(|c| 0.4 + 0.13 * (c % 5) as f32).collect();
-        let mut gs = [0.0f64; 36];
+        let mut gs = [0.0f64; 34];
         batch_loss_and_grad(&w, &th, &rh, seq, batch, &dts, &lbl, &wts, &mut gs);
-        let mut gv = [0.0f64; 36];
+        let mut gv = [0.0f64; 34];
         batch_loss_and_grad_simd(&w, &th, &rh, seq, batch, &dts, &lbl, &wts, &mut gv);
         let mut num = 0.0f64;
         let mut den = 0.0f64;
-        for i in 0..36 {
+        for i in 0..34 {
             num += (gs[i] - gv[i]).powi(2);
             den += gs[i].powi(2);
         }
@@ -1590,7 +1665,7 @@ mod tests {
                 lbl_w[t] = if rat_q[t] > 1.0 { 1.0 } else { 0.0 };
             }
         }
-        let mut g_win = [0.0f64; 36];
+        let mut g_win = [0.0f64; 34];
         let loss_win =
             loss_and_grad_range_window(&w, &th_w, &rh_w, seq_w, batch_w, &lbl_w, &wts_w, &mut g_win, 0, 1);
 
@@ -1611,13 +1686,13 @@ mod tests {
             lbl_p[c] = if rat_q[l - 1] > 1.0 { 1.0 } else { 0.0 };
             wts_p[c] = weight_at(l - 1);
         }
-        let mut g_pre = [0.0f64; 36];
+        let mut g_pre = [0.0f64; 34];
         let loss_pre =
             loss_and_grad_range(&w, &th_p, &rh_p, seq_p, batch_p, &dts_p, &lbl_p, &wts_p, &mut g_pre, 0, batch_p);
 
         let mut num = 0.0f64;
         let mut den = 0.0f64;
-        for i in 0..36 {
+        for i in 0..34 {
             num += (g_win[i] - g_pre[i]).powi(2);
             den += g_pre[i].powi(2);
         }
@@ -1657,14 +1732,14 @@ mod tests {
                 lbl[t * batch + c] = if rh[t * batch + c] > 1.0 { 1.0 } else { 0.0 };
             }
         }
-        let mut gs = [0.0f64; 36];
+        let mut gs = [0.0f64; 34];
         let loss_scalar =
             loss_and_grad_range_window(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gs, 0, batch);
-        let mut gv = [0.0f64; 36];
+        let mut gv = [0.0f64; 34];
         card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gv);
         let mut num = 0.0f64;
         let mut den = 0.0f64;
-        for i in 0..36 {
+        for i in 0..34 {
             num += (gs[i] - gv[i]).powi(2);
             den += gs[i].powi(2);
         }
@@ -1679,9 +1754,9 @@ mod tests {
     fn fd_grad(
         w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
         dts: &[f32], lbl: &[f32], wts: &[f32],
-    ) -> [f64; 36] {
-        let mut g = [0.0f64; 36];
-        for i in 0..36 {
+    ) -> [f64; 34] {
+        let mut g = [0.0f64; 34];
+        for i in 0..34 {
             let eps = 1e-3f32;
             let mut wp = w.to_vec();
             wp[i] = w[i] + eps;
@@ -1702,7 +1777,7 @@ mod tests {
         let dts = [5.0f32, 5.0, 5.0, 5.0];
         let lbl = [1.0f32, 1.0, 0.0, 1.0];
         let wts = [1.0f32, 1.0, 1.0, 1.0];
-        let mut mg = [0.0f64; 36];
+        let mut mg = [0.0f64; 34];
         batch_loss_and_grad(&w, &t_hist, &r_hist, 2, 4, &dts, &lbl, &wts, &mut mg);
         let fd = fd_grad(&w, &t_hist, &r_hist, 2, 4, &dts, &lbl, &wts);
         // NOTE: finite differences cross clamp/min/max kinks where the analytic subgradient
@@ -1711,7 +1786,7 @@ mod tests {
         // correctness gate is the average log loss on the full run (±0.0010). This test only
         // guards against GROSS errors (sign flips / missing terms => rel >~ 1).
         let mut bad = false;
-        for i in 0..36 {
+        for i in 0..34 {
             let d = (mg[i] - fd[i]).abs();
             let rel = d / fd[i].abs().max(1e-3);
             if rel > 0.6 && d > 1e-3 {

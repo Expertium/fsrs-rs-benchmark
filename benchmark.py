@@ -33,18 +33,18 @@ MIN_STABILITY = 0.0001
 MIN_RETRIEVABILITY = 0.0001
 MAX_RETRIEVABILITY = 0.9999
 
-# Dual-trace FSRS-7 (iter-66) 36-param layout.
-FSRS7_DECAY1_INDEX = 25
-FSRS7_DECAY2_INDEX = 26
-FSRS7_BASE1_INDEX = 27
-FSRS7_BASE2_INDEX = 28
-FSRS7_WEIGHT1_INDEX = 29
-FSRS7_WEIGHT2_INDEX = 30
-FSRS7_S_WEIGHT_POWER1_INDEX = 31
-FSRS7_S_WEIGHT_POWER2_INDEX = 32
-FSRS7_D_WEIGHT_INDEX = 33
-FSRS7_D_DECAY_INDEX = 34
-FSRS7_S_DECAY1_INDEX = 35
+# Finished FSRS-7 34-param layout (curve params shifted -2 vs the 36-param draft).
+FSRS7_DECAY1_INDEX = 23
+FSRS7_DECAY2_INDEX = 24
+FSRS7_BASE1_INDEX = 25
+FSRS7_BASE2_INDEX = 26
+FSRS7_WEIGHT1_INDEX = 27
+FSRS7_WEIGHT2_INDEX = 28
+FSRS7_S_WEIGHT_POWER1_INDEX = 29
+FSRS7_S_WEIGHT_POWER2_INDEX = 30
+FSRS7_D_WEIGHT_INDEX = 31
+FSRS7_D_DECAY_INDEX = 32
+FSRS7_S_DECAY1_INDEX = 33
 
 
 def _parse_scalar(value: object, type_name: str) -> str:
@@ -107,17 +107,19 @@ def default_parameters() -> List[float]:
     return list(DEFAULT_PARAMETERS)
 
 
-def train(train_set: pd.DataFrame) -> List[float]:
-    """Train FSRS-rs on training data and return optimized weights.
+def train(train_set: pd.DataFrame) -> tuple[List[float], float]:
+    """Train FSRS-rs on training data; return (optimized weights, Rust train seconds).
 
     Uses compute_parameters() — the SAME O(N) windowed optimizer real Anki users run — so the
     benchmark measures the accuracy of the algorithm that actually ships, not the (mathematically
     equivalent but parameter-divergent) O(N^2) per-prefix path. card_ids activate the windowing.
+    The elapsed seconds are the binding's monotonic-clock Rust-region time (Python excluded);
+    summed over the folds they give the per-user benchmark() training cost (hp_tune's speed axis).
     """
     backend = FSRS(parameters=[])
     items, card_ids = convert_to_items(train_set)
-    params, _elapsed = backend.compute_parameters(items, card_ids)
-    return [round(w, 4) for w in params]
+    params, elapsed = backend.compute_parameters(items, card_ids)
+    return [round(w, 4) for w in params], elapsed
 
 
 def predict(
@@ -145,9 +147,11 @@ def predict(
         decay2_param = weights[FSRS7_DECAY2_INDEX]
         base1 = weights[FSRS7_BASE1_INDEX]
         base2 = weights[FSRS7_BASE2_INDEX]
-        d_weight = weights[FSRS7_D_WEIGHT_INDEX]
-        d_decay = weights[FSRS7_D_DECAY_INDEX]
-        s_decay1 = weights[FSRS7_S_DECAY1_INDEX]
+        # All-positive convention: these three are stored shifted; offset back here so the curve
+        # uses the effective values (matches the Rust model + the CUDA .cu).
+        d_weight = weights[FSRS7_D_WEIGHT_INDEX] - 0.5
+        d_decay = weights[FSRS7_D_DECAY_INDEX] - 0.3
+        s_decay1 = weights[FSRS7_S_DECAY1_INDEX] - 0.3
 
         # FAST component: decay S-modulated; factor1 in log-space, exponent clamped at 60.
         decay1_mag = np.clip(decay1_param * s_fast**s_decay1, 0.01, 0.95)
@@ -155,11 +159,14 @@ def predict(
         factor1 = np.exp(np.minimum((1.0 / decay1) * np.log(base1), 60.0)) - 1.0
         r1 = (1.0 + factor1 * t_over_s_fast) ** decay1
 
-        # SLOW component: decay D-modulated.
-        decay2_mag = np.clip(decay2_param * np.exp(d_decay * (d - 5.0)), 0.01, 0.95)
+        # SLOW component. iter-165: the D-effect moved from the decay exponent to the
+        # TIME-SCALE — decay2 is no longer d-modulated; r2 sees time scaled by
+        # exp(d_decay*(d-5)) (d_decay already offset by -0.3 above).
+        decay2_mag = np.clip(decay2_param, 0.01, 0.95)
         decay2 = -decay2_mag
         factor2 = base2 ** (1.0 / decay2) - 1.0
-        r2 = (1.0 + factor2 * t_over_s_slow) ** decay2
+        d_timescale = np.exp(d_decay * (d - 5.0))
+        r2 = (1.0 + factor2 * t_over_s_slow * d_timescale) ** decay2
 
         weight1 = weights[FSRS7_WEIGHT1_INDEX] * s_fast ** (
             -weights[FSRS7_S_WEIGHT_POWER1_INDEX]
@@ -213,12 +220,18 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
     del device_id
 
     dataset = UserDataLoader(config).load_user_data(user_id)
+    # Per-user Rust training cost: the binding-timed compute_parameters() seconds summed over
+    # the folds (1 rep — hp_tune's benchmark speed axis; folds that fall back to defaults add 0).
+    train_secs = 0.0
 
     def get_weights(train_set: pd.DataFrame) -> List[float]:
+        nonlocal train_secs
         if config.default_params:
             return default_parameters()
         try:
-            return train(train_set)
+            params, secs = train(train_set)
+            train_secs += secs
+            return params
         except Exception as exc:
             if str(exc).endswith("inadequate."):
                 if config.verbose_inadequate_data:
@@ -273,6 +286,7 @@ def process(user_id: int, device_id: Optional[int] = None) -> tuple[dict, Option
         y, p, save_tmp_df, config.get_evaluation_file_name(), user_id, config, w_list
     )
     stats["metrics"] = {"LogLoss": stats["metrics"]["LogLoss"]}
+    stats["time_ms"] = round(train_secs * 1000.0, 1)
     return stats, raw
 
 

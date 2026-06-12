@@ -20,12 +20,22 @@ use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
 /// Layout: 0..24 s0/difficulty/long+short stability (unchanged), 25..32 forgetting
 /// curve (decay1, decay2, base1, base2, base_weight1, base_weight2, s_weight_power1,
 /// s_weight_power2), 33 d_weight, 34 d_decay, 35 s_decay1.
-pub static DEFAULT_PARAMETERS: [f32; 36] = [
-    0.041, 2.4175, 4.1283, 11.9709, 5.6385, 0.4468, 3.262, 2.3054, 0.1688, 1.3325, 0.3524, 0.0049,
-    0.7503, 0.0896, 0.6625, 1.3, 0.882, 0.3072, 3.5875, 0.303, 0.0107, 0.2279, 2.6413, 0.5594, 1.3,
-    0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862, 0.0, 0.0, 0.0,
+// Finished FSRS-7 (34 params). Layout: 0-3 s0(again,hard,good,easy); 4 init_d0, 5 init_d1,
+// 6 next_d_mult; 7-14 long stability (sinc_base, sinc_s_exp, sinc_r_mult, fail_mult, fail_s_exp,
+// fail_r_mult, hard_penalty, easy_bonus); 15-22 short stability (same 8); 23 decay1, 24 decay2,
+// 25 base1, 26 base2, 27 base_weight1, 28 base_weight2, 29 s_weight_power1, 30 s_weight_power2;
+// 31 d_weight, 32 d_decay, 33 s_decay1. (fail_d_exp dropped from both stability blocks vs the
+// 36-param draft; values = fsrs-autoresearch FSRS7_DEFAULT_35_VALUES, rounded to <=4 dp.)
+// ALL-POSITIVE CONVENTION (also applied in the CUDA constants): the three signed modulation
+// params are stored SHIFTED so their clip ranges start at 0, and offset back in the formulas —
+// d_weight effective = w-0.5 (range [0,1.0]); d_decay & s_decay1 effective = w-0.3 (range
+// [0,0.6]). The stored defaults for 31/32/33 below are already the shifted (all-positive) values.
+pub static DEFAULT_PARAMETERS: [f32; 34] = [
+    0.1104, 2.2395, 3.9221, 11.7841, 6.1686, 0.6457, 3.6807, 1.9795, 0.0, 1.3826, 0.7024, 0.5999,
+    0.8146, 0.6398, 1.0, 1.3207, 0.6707, 3.8668, 0.4416, 0.0934, 1.8631, 0.6162, 1.0869, 0.1567,
+    0.0801, 0.2421, 0.9464, 0.1433, 0.7145, 0.0, 0.5667, 0.3734, 0.5333, 0.3048,
 ];
-/// This is a slice for efficiency, and should be 36 in length.
+/// This is a slice for efficiency, and should be 34 in length.
 pub type Parameters = [f32];
 
 fn infer<B: Backend>(

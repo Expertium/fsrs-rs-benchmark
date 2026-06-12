@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 mod training_v7 {
 use crate::model::{S_MAX, S_MIN};
 
-pub(crate) const PARAM_LEN: usize = 36;
+pub(crate) const PARAM_LEN: usize = 34;
 pub(crate) const PENALTY_W_1: f64 = 0.5;
 pub(crate) const PENALTY_W_2: f64 = 0.0015;
 pub(crate) const PENALTY_W_L2: f64 = 0.5;
@@ -41,14 +41,14 @@ pub(crate) const MAX_T: f32 = 36500.0;
 pub(crate) const ONE_DAY: f32 = 1.0;
 pub(crate) const SHORT_C: f32 = 600.0 / 86400.0;
 pub(crate) const INV_C: f32 = 1.0 / SHORT_C;
-pub(crate) const GRAD_LEN: usize = 36;
-// L2 prior sigmas for the iter-66 dual-trace layout (FSRS7_L2_SIGMA_35_VALUES).
-// 0..3 free (9999), 4..24 difficulty/long+short stability, 25..32 forgetting curve,
-// 33 d_weight, 34 d_decay, 35 s_decay1.
-pub(crate) const PARAMS_STDDEV: [f32; 36] = [
-    9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.0829,
-    0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
-    0.864, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489, 0.2, 0.15, 0.15,
+pub(crate) const GRAD_LEN: usize = 34;
+// L2 prior sigmas for the finished 34-param layout (FSRS7_L2_SIGMA_35_VALUES, fail_d_exp dropped).
+// 0..3 free (9999), 4..22 difficulty/long+short stability, 23..30 forgetting curve,
+// 31 d_weight, 32 d_decay, 33 s_decay1.
+pub(crate) const PARAMS_STDDEV: [f32; 34] = [
+    9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.175,
+    0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1735, 0.4608, 0.311, 0.864, 0.0418,
+    0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489, 0.2, 0.15, 0.15,
 ];
 
 pub(crate) fn l2_penalty_value_and_grad(
@@ -305,7 +305,7 @@ fn fsrs7_fc_r_and_drdt_scalar(t: f64, s: f64, w: &[f32]) -> (f64, f64) {
     (r, dr_dt)
 }
 
-fn fsrs7_fc_r_dual(t: Dual35, s: Dual35, w: &[Dual35; GRAD_LEN]) -> Dual35 {
+fn fsrs7_fc_r_dual(t: Dual35, s: Dual35, w: &[Dual35]) -> Dual35 {
     let decay1 = w[27].neg();
     let decay2 = w[28].neg();
     let base1 = w[29].clamp_min(1e-4);
@@ -330,7 +330,7 @@ fn fsrs7_fc_r_dual(t: Dual35, s: Dual35, w: &[Dual35; GRAD_LEN]) -> Dual35 {
     wt1.mul(r1).add(wt2.mul(r2)).div(wt_sum).clamp(0.0, 1.0)
 }
 
-fn fsrs7_init_d_dual(rating: f64, w: &[Dual35; GRAD_LEN]) -> Dual35 {
+fn fsrs7_init_d_dual(rating: f64, w: &[Dual35]) -> Dual35 {
     w[4].sub(w[5].mul_const(rating - 1.0).exp())
         .add_const(1.0)
         .clamp(1.0, 10.0)
@@ -343,7 +343,7 @@ fn fsrs7_next_d_good_dual(d: Dual35, init_d4: Dual35) -> Dual35 {
         .clamp(1.0, 10.0)
 }
 
-fn fsrs7_s_fail_long_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35; GRAD_LEN]) -> Dual35 {
+fn fsrs7_s_fail_long_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35]) -> Dual35 {
     let raw = w[10]
         .mul(d.pow(w[11].neg()))
         .mul(s.add_const(1.0).pow(w[12]).sub_const(1.0))
@@ -351,7 +351,7 @@ fn fsrs7_s_fail_long_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35; GRAD_LEN
     s.min(raw)
 }
 
-fn fsrs7_s_fail_short_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35; GRAD_LEN]) -> Dual35 {
+fn fsrs7_s_fail_short_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35]) -> Dual35 {
     let raw = w[19]
         .mul(d.pow(w[20].neg()))
         .mul(s.add_const(1.0).pow(w[21]).sub_const(1.0))
@@ -359,7 +359,7 @@ fn fsrs7_s_fail_short_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35; GRAD_LE
     s.min(raw)
 }
 
-fn fsrs7_next_s_good_dual(s: Dual35, d: Dual35, delta_t: Dual35, w: &[Dual35; GRAD_LEN]) -> Dual35 {
+fn fsrs7_next_s_good_dual(s: Dual35, d: Dual35, delta_t: Dual35, w: &[Dual35]) -> Dual35 {
     let r = fsrs7_fc_r_dual(delta_t, s, w).clamp(0.0001, 0.9999);
 
     let sf_l = fsrs7_s_fail_long_dual(s, d, r, w);
@@ -407,7 +407,7 @@ fn fsrs7_interval_differentiable_dual(
     target: f64,
     n_newton: usize,
     w: &[f32],
-    w_dual: &[Dual35; GRAD_LEN],
+    w_dual: &[Dual35],
 ) -> Dual35 {
     let s_f = s.value.max(1e-10);
     let d1 = -(w[27] as f64);
@@ -452,7 +452,7 @@ fn fsrs7_interval_differentiable_dual(
 
 fn fsrs7_interval_growth_penalty_dual(
     w: &[f32],
-    w_dual: &[Dual35; GRAD_LEN],
+    w_dual: &[Dual35],
     n_reviews: usize,
     target_dr: f64,
     n_newton: usize,
@@ -487,7 +487,7 @@ fn fsrs7_interval_growth_penalty_dual(
 
 fn fsrs7_short_interval_penalty_dual(
     w: &[f32],
-    w_dual: &[Dual35; GRAD_LEN],
+    w_dual: &[Dual35],
     n_reviews: usize,
     n_newton: usize,
     target_drs: &[f32],
@@ -595,7 +595,7 @@ const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 // hand-rolled host Adam in train(), which replaced burn's tensor optimizer (and its per-step
 // host round-trips) with an element-wise replica of burn 0.17's AdaptiveMomentum.
 const ADAM_BETA1: f32 = 0.55;
-const ADAM_BETA2: f32 = 0.955555;
+const ADAM_BETA2: f32 = 0.9942;
 const ADAM_EPS: f32 = 1e-8;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
@@ -975,9 +975,9 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
         .into_iter()
         .enumerate()
         .map(|(idx, item)| WeightedFSRSItem {
-            // iter-66 champion recency weighting: C0 + (1 - C0) * (idx/n)^EXP,
-            // C0 = 0.0666667, EXP = 11.25.
-            weight: 0.0666667 + 0.9333333 * (idx as f32 / length).powf(11.25),
+            // Finished FSRS-7 recency weighting: C0 + (1 - C0) * (idx/n)^EXP,
+            // C0 = 0.0667 (<=4dp), EXP = 11.25 (fsrs_v7_constants RECENCY_C0 / RECENCY_EXP).
+            weight: 0.0667 + 0.9333 * (idx as f32 / length).powf(11.25),
             item,
             // -1 = "no card grouping" (the evaluate()/benchmark() paths). compute_parameters()
             // overwrites this with the real card id after weighting (order is preserved).
@@ -1156,13 +1156,13 @@ pub(crate) struct TrainingConfig {
     pub optimizer: AdamConfig,
     #[config(default = false)]
     pub enable_sched_penalties: bool,
-    #[config(default = 8)]
+    #[config(default = 9)]
     pub num_epochs: usize,
-    #[config(default = 512)]
+    #[config(default = 256)]
     pub batch_size: usize,
     #[config(default = 2023)]
     pub seed: u64,
-    #[config(default = 0.045)]
+    #[config(default = 0.0282)]
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
@@ -1280,7 +1280,7 @@ pub fn compute_parameters(
         },
         AdamConfig::new()
             .with_beta_1(0.55)
-            .with_beta_2(0.955555)
+            .with_beta_2(0.9942)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
@@ -1288,6 +1288,18 @@ pub fn compute_parameters(
     // Bumping it also extends the cosine-annealing schedule over the larger iteration count below.
     if let Some(ne) = num_epochs {
         config.num_epochs = ne;
+    }
+    // TUNER operating-point overrides (hp_tune.py epoch x batch grid). These let the tuner sweep
+    // (n_epoch, batch_size) per cell via env vars with NO rebuild — the shipped Python path sets
+    // neither var, so production training keeps the defaults (8 epochs / batch 256). The explicit
+    // num_epochs arg above still wins when set; FSRS_N_EPOCHS is only a fallback for it.
+    if num_epochs.is_none() {
+        if let Some(ne) = std::env::var("FSRS_N_EPOCHS").ok().and_then(|s| s.trim().parse().ok()) {
+            config.num_epochs = ne;
+        }
+    }
+    if let Some(bs) = std::env::var("FSRS_BATCH_SIZE").ok().and_then(|s| s.trim().parse().ok()) {
+        config.batch_size = bs;
     }
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     // Attach card ids (still aligned: recency weighting preserves order). The later max_seq_len
@@ -1360,7 +1372,7 @@ pub fn benchmark(
         },
         AdamConfig::new()
             .with_beta_1(0.55)
-            .with_beta_2(0.955555)
+            .with_beta_2(0.9942)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
@@ -1462,7 +1474,7 @@ fn build_batch_host_windowed(cards: &[Vec<WeightedFSRSItem>]) -> BatchHost {
             rh[t * bsz + c] = r.rating as f32;
         }
         // Each surviving prefix of length L scores review L-1 at timestep t = L-1 (L >= 2 => t >= 1).
-        for wi in prefixes {
+        for wi in prefixes.iter() {
             let t = wi.item.reviews.len() - 1;
             let current = wi.item.reviews.last().unwrap();
             wts[t * bsz + c] = wi.weight;
@@ -1545,26 +1557,17 @@ fn train<B: AutodiffBackend>(
 ) -> Result<Model<B>> {
     B::seed(config.seed);
 
-    // Training data. In this codebase the train set == the test set (both compute_parameters() and
-    // benchmark() train and validate on the same weighted items), so the host batches are built ONCE
-    // and reused for BOTH the gradient pass and the per-epoch validation. This drops a redundant O(N)
-    // clone of the dataset plus a second full build_host_batches() — a sizeable share of the per-user
-    // setup floor, which grew to ~a third of the largest users' time after the O(N) window. Bit-for-
-    // bit: the gradient and validation only ever READ these immutable batches; only their index
-    // orders differ (per-epoch reshuffle vs. the fixed valid_order below).
+    // Training data: the host batches are built ONCE (before the epoch loop) and reused every
+    // epoch — only the batch ORDER reshuffles per epoch. (The per-epoch validation pass + its
+    // best-epoch selection were REMOVED: training ships the last epoch's parameters, with the
+    // 9-epoch default compensating — see the return at the bottom.)
     let total_size = train_set.len();
-    let test_size = total_size;
     let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
     let train_host: Vec<BatchHost> = build_host_batches(train_set, config.batch_size);
     let n_train_batches = train_host.len();
     // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
     // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
     let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
-
-    // Validation scores the SAME batches; the old ShuffleDataLoader shuffled their order ONCE
-    // (StdRng::seed_from_u64(seed)), replicated with `valid_order` for byte-identical summation.
-    let mut valid_order: Vec<usize> = (0..n_train_batches).collect();
-    valid_order.shuffle(&mut StdRng::seed_from_u64(config.seed));
 
     let mut lr_scheduler = CosineAnnealingLR::init(iterations as f64, config.learning_rate);
     let interrupter = TrainingInterrupter::new();
@@ -1582,23 +1585,18 @@ fn train<B: AutodiffBackend>(
     // was the LAST burn-tensor code in the per-step loop — each step round-tripped w through
     // model.w.val().to_data().to_vec() (and again inside the clipper) plus a fresh GradientsParams.
     // We keep w in a plain Vec<f32> and hand-roll Adam element-wise (see the loop below), so a step
-    // is now pure host arithmetic on 36 floats. parameters_to_model clips, so this start == the old
-    // model.w.val(); the returned Model is rebuilt once from best_w at the very end.
+    // is now pure host arithmetic on 34 floats. parameters_to_model clips, so this start == the old
+    // model.w.val(); the returned Model is rebuilt once from the final w_host at the very end.
     let mut w_host: Vec<f32> = clip_parameters(initial_parameters);
     let init_w_vec = w_host.clone();
-    let mut adam_m = [0.0f32; 36]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1)
-    let mut adam_v = [0.0f32; 36]; // Adam 2nd moment (moment_2)
+    let mut adam_m = [0.0f32; 34]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1)
+    let mut adam_v = [0.0f32; 34]; // Adam 2nd moment (moment_2)
     let mut adam_t = 0i32; // step count (AdaptiveMomentumState.time; becomes 1 on the first step)
 
-    let mut best_loss = f64::INFINITY;
-    let mut best_w = w_host.clone();
-    // (Validation batches were pre-built above into valid_host + valid_order; each epoch scores
-    // them with the analytic forward crate::analytic::batch_loss — same BCE math + [1e-5,1-1e-5]
-    // clamp as burn's tensor forward, only the FP summation order differs, judged by the 3b band.)
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
     // train batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
-    let (mut t_pen, mut t_bwd, mut t_opt, mut t_valid) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut t_pen, mut t_bwd, mut t_opt) = (0.0f64, 0.0f64, 0.0f64);
     for epoch in 1..=config.num_epochs {
         // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
         let mut order: Vec<usize> = (0..n_train_batches).collect();
@@ -1632,7 +1630,7 @@ fn train<B: AutodiffBackend>(
             // Hand-written analytic BCE gradient (replaces the autodiff forward+backward),
             // plus the manual L2/schedule penalty gradient.
             let _tb = std::time::Instant::now();
-            let mut total_grad = [0.0f64; 36];
+            let mut total_grad = [0.0f64; 34];
             if hb.windowed {
                 // O(N) expanding-window grad: one pass per card, a loss at every timestep.
                 crate::analytic::card_loss_and_grad_simd(
@@ -1643,8 +1641,8 @@ fn train<B: AutodiffBackend>(
                     &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
                 );
             }
-            let mut total_grad_f32 = [0.0f32; 36];
-            for i in 0..36 {
+            let mut total_grad_f32 = [0.0f32; 34];
+            for i in 0..34 {
                 total_grad_f32[i] = total_grad[i] as f32 + manual_grad.get(i).copied().unwrap_or(0.0);
             }
             if config.model.freeze_initial_stability {
@@ -1653,7 +1651,8 @@ fn train<B: AutodiffBackend>(
                 }
             }
             if config.model.freeze_short_term_stability {
-                for v in total_grad_f32.iter_mut().take(25).skip(16) {
+                // short stability block is 15..23 in the 34-param layout.
+                for v in total_grad_f32.iter_mut().take(23).skip(15) {
                     *v = 0.0;
                 }
             }
@@ -1672,7 +1671,7 @@ fn train<B: AutodiffBackend>(
             let f1 = 1.0f32 - ADAM_BETA1;
             let f2 = 1.0f32 - ADAM_BETA2;
             let lr_f32 = lr as f32;
-            for i in 0..36 {
+            for i in 0..34 {
                 let g = total_grad_f32[i];
                 adam_m[i] = adam_m[i] * ADAM_BETA1 + g * f1;
                 adam_v[i] = adam_v[i] * ADAM_BETA2 + g.powf(2.0) * f2;
@@ -1699,58 +1698,28 @@ fn train<B: AutodiffBackend>(
             break;
         }
 
-        let _tv = std::time::Instant::now();
-        // w is fixed during validation, so extract it once per epoch (not per batch).
-        let w_vec_valid = w_host.clone();
-        let mut loss_valid = 0.0;
-        for &vi in &valid_order {
-            let vb = &train_host[vi];
-            let (l2_penalty_value, _) = l2_penalty(
-                &w_vec_valid,
-                &init_w_vec,
-                vb.real_batch_size,
-                total_size,
-                L2_PENALTY_WEIGHT,
-                &training_v7::PARAMS_STDDEV,
-            );
-            let (schedule_value, _) =
-                schedule_penalty(&w_vec_valid, vb.real_batch_size, config.enable_sched_penalties);
-            let schedule_penalty = schedule_value / total_size as f64;
-            let bce = if vb.windowed {
-                crate::analytic::card_loss_simd(
-                    &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.lbl, &vb.wts,
-                )
-            } else {
-                crate::analytic::batch_loss_simd(
-                    &w_vec_valid, &vb.th, &vb.rh, vb.seq, vb.bsz, &vb.dts, &vb.lbl, &vb.wts,
-                )
-            };
-            loss_valid += bce + l2_penalty_value + schedule_penalty;
-
-            if interrupter.should_stop() {
-                break;
-            }
-        }
-        loss_valid /= test_size as f64;
-        t_valid += _tv.elapsed().as_secs_f64();
-        info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
-        if loss_valid < best_loss {
-            best_loss = loss_valid;
-            best_w = w_host.clone();
-        }
+        info!("epoch: {:?} done", epoch);
     }
-    eprintln!(
-        "PROFILE total_train_region: pen={:.3} grad={:.3} opt={:.3} valid={:.3}",
-        t_pen, t_bwd, t_opt, t_valid
-    );
-
-    info!("best_loss: {:?}", best_loss);
+    // Per-region training timing, silent unless FSRS_PROFILE is set (it printed on
+    // every train() call before — clutter + stderr I/O in the timed path). The env
+    // gate keeps the t_* accumulators live (no dead-code warnings) and lets profiling
+    // re-enable the dump on demand.
+    if std::env::var_os("FSRS_PROFILE").is_some() {
+        eprintln!(
+            "PROFILE total_train_region: pen={:.3} grad={:.3} opt={:.3}",
+            t_pen, t_bwd, t_opt
+        );
+    }
 
     if interrupter.should_stop() {
         return Err(FSRSError::Interrupted);
     }
 
-    Ok(parameters_to_model::<B>(&best_w, &B::Device::default()))
+    // No per-epoch validation / best-epoch selection: the shipped parameters are the LAST
+    // epoch's (the 9th-epoch default below compensates — dropping the selection can only
+    // raise the loss by construction, the extra epoch buys it back at a fraction of the
+    // validation pass's cost).
+    Ok(parameters_to_model::<B>(&w_host, &B::Device::default()))
 }
 
 struct NoProgress {}
