@@ -890,6 +890,38 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
         .collect()
 }
 
+/// TUNER recency override (hp_tune per-cell fine tune). Same formula as
+/// `recency_weighted_fsrs_items` but reads the floor weight C0 and ramp exponent EXP from
+/// FSRS_RECENCY_C0 / FSRS_RECENCY_EXP, defaulting to the shipped constants (0.0667 / 11.25) so
+/// production (neither var set) is bit-for-bit identical. Used ONLY by the windowed
+/// compute_parameters training path — the frozen evaluate() keeps calling the plain version, so
+/// the scorer is untouched (constraint 11).
+pub(crate) fn recency_weighted_fsrs_items_tuned(items: Vec<FSRSItem>) -> Vec<WeightedFSRSItem> {
+    let c0_env = std::env::var("FSRS_RECENCY_C0")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok());
+    let exp_env = std::env::var("FSRS_RECENCY_EXP")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok());
+    // No override set -> delegate to the exact (literal-constant) production path so the shipped
+    // no-env training is byte-identical to the champion (no (1.0 - c0)-vs-0.9333 ULP drift).
+    if c0_env.is_none() && exp_env.is_none() {
+        return recency_weighted_fsrs_items(items);
+    }
+    let c0 = c0_env.unwrap_or(0.0667);
+    let exp = exp_env.unwrap_or(11.25);
+    let length = (items.len() as f32).max(1.0);
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| WeightedFSRSItem {
+            weight: c0 + (1.0 - c0) * (idx as f32 / length).powf(exp),
+            item,
+            card_id: -1,
+        })
+        .collect()
+}
+
 pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
     // The (rating, delta_t)-bucket outlier filter was REMOVED (Andrew, 2026-06-13): the CUDA
     // research pipeline never filtered, and the 3k ablation measured the filter costing
@@ -1179,7 +1211,7 @@ pub fn compute_parameters(
     if let Some(lr) = std::env::var("FSRS_LR").ok().and_then(|s| s.trim().parse().ok()) {
         config.learning_rate = lr;
     }
-    let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
+    let mut weighted_train_set = recency_weighted_fsrs_items_tuned(train_set);
     // Attach card ids (still aligned: recency weighting preserves order). The later max_seq_len
     // retain is order-preserving too, so card_id rides along inside each WeightedFSRSItem.
     if let Some(train_card_ids) = &train_card_ids {
@@ -1475,6 +1507,16 @@ fn train<B: AutodiffBackend>(
     let mut adam_m = [0.0f32; 34]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1)
     let mut adam_v = [0.0f32; 34]; // Adam 2nd moment (moment_2)
     let mut adam_t = 0i32; // step count (AdaptiveMomentumState.time; becomes 1 on the first step)
+    // TUNER Adam-beta overrides (hp_tune per-cell fine tune). Default to the shipped consts so
+    // production (neither var set) is bit-for-bit; read once here, used in the per-step loop below.
+    let beta1 = std::env::var("FSRS_BETA1")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(ADAM_BETA1);
+    let beta2 = std::env::var("FSRS_BETA2")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(ADAM_BETA2);
 
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
@@ -1549,15 +1591,15 @@ fn train<B: AutodiffBackend>(
             // unified loop reproduces it. Same hyperparameters (ADAM_*) as the AdamConfig → the Adam
             // math is identical; only the FP op order vs burn's ndarray kernels can differ (3b band).
             adam_t += 1;
-            let bc1 = 1.0f32 - ADAM_BETA1.powi(adam_t);
-            let bc2 = 1.0f32 - ADAM_BETA2.powi(adam_t);
-            let f1 = 1.0f32 - ADAM_BETA1;
-            let f2 = 1.0f32 - ADAM_BETA2;
+            let bc1 = 1.0f32 - beta1.powi(adam_t);
+            let bc2 = 1.0f32 - beta2.powi(adam_t);
+            let f1 = 1.0f32 - beta1;
+            let f2 = 1.0f32 - beta2;
             let lr_f32 = lr as f32;
             for i in 0..34 {
                 let g = total_grad_f32[i];
-                adam_m[i] = adam_m[i] * ADAM_BETA1 + g * f1;
-                adam_v[i] = adam_v[i] * ADAM_BETA2 + g.powf(2.0) * f2;
+                adam_m[i] = adam_m[i] * beta1 + g * f1;
+                adam_v[i] = adam_v[i] * beta2 + g.powf(2.0) * f2;
                 let m_hat = adam_m[i] / bc1;
                 let v_hat = adam_v[i] / bc2;
                 w_host[i] -= lr_f32 * (m_hat / (v_hat.sqrt() + ADAM_EPS));

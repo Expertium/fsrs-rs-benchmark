@@ -123,9 +123,14 @@ def train(train_set: pd.DataFrame) -> tuple[List[float], float]:
 
 
 def predict(
-    testset: pd.DataFrame, weights: List[float]
+    testset: pd.DataFrame, weights: List[float], history_items: Optional[List[FSRSItem]] = None
 ) -> tuple[List[float], List[float], pd.DataFrame]:
-    """Return (predictions, labels, testset_with_predictions)."""
+    """Return (predictions, labels, testset_with_predictions).
+
+    ``history_items`` (the per-test-row FSRSItem histories, weight-independent) may be passed
+    precomputed so a caller scoring the SAME testset under many weight sets (the HP tuner) builds
+    them once instead of re-marshaling per call. None (default) rebuilds them here -> bit-for-bit
+    identical to the original behaviour."""
 
     def fsrs7_forgetting_curve(
         delta_t: pd.Series,
@@ -183,7 +188,8 @@ def predict(
 
     predictor = FSRS(parameters=weights)
     testset_copy = testset.copy()
-    history_items = [FSRSItem(reviews=build_reviews(row)) for _, row in testset_copy.iterrows()]
+    if history_items is None:
+        history_items = [FSRSItem(reviews=build_reviews(row)) for _, row in testset_copy.iterrows()]
     memory_states = predictor.memory_state_batch(history_items)
     testset_copy["stability"] = [s.stability for s in memory_states]
     testset_copy["difficulty"] = [s.difficulty for s in memory_states]

@@ -331,12 +331,12 @@ def plot_grid() -> None:
     if g is not None:
         ax.scatter(g["by_user"], g["throughput"], facecolors="none",
                    edgecolors="black", s=160, lw=1.8, zorder=5,
-                   label=f"gold ({gold['epoch']}, {gold['batch']})")
+                   label=f"previous gold ({gold['epoch']}, {gold['batch']})")
         ax.legend(loc="upper left", fontsize=9)
 
-    ax.set_xlabel("Log loss  (cross-val by-user; lower = better)", fontsize=12)
-    ax.set_ylabel("Speed  (items / s; higher = faster)", fontsize=12)
-    ax.set_title("n_epoch x batch_size Pareto grid", fontsize=13)
+    ax.set_xlabel("Log loss (benchmark; lower = better)", fontsize=12)
+    ax.set_ylabel("Speed (items/s; higher = faster)", fontsize=12)
+    ax.set_title("n_epoch x batch_size Pareto frontier", fontsize=13)
     ax.grid(True, alpha=0.25)
     ax.margins(0.10)  # data headroom so inward-pointing labels stay clear of the spines
     fig.tight_layout()
