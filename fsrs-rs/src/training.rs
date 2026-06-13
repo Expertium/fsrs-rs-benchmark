@@ -1518,6 +1518,12 @@ fn train<B: AutodiffBackend>(
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .unwrap_or(ADAM_BETA2);
+    // TUNER L2-strength override (hp_tune per-cell fine tune). Default to the shipped const so
+    // production (no env) is bit-for-bit; read once here, used as the L2 penalty weight below.
+    let l2_weight = std::env::var("FSRS_L2")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(L2_PENALTY_WEIGHT);
 
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
@@ -1535,7 +1541,6 @@ fn train<B: AutodiffBackend>(
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = Progress::new(iteration, n_train_batches);
             let _tp = std::time::Instant::now();
-            let l2_weight = L2_PENALTY_WEIGHT;
             let w_vec = w_host.clone();
             let (_l2_penalty_value, mut manual_grad) = l2_penalty(
                 &w_vec,

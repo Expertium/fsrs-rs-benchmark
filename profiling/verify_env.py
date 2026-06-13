@@ -25,7 +25,7 @@ USERS = [42, 26, 36]
 backend = FSRS(parameters=[])  # mirror compute_parameters.process()'s backend
 
 def _set(env: dict):
-    for k in ("FSRS_BETA1", "FSRS_BETA2", "FSRS_RECENCY_C0", "FSRS_RECENCY_EXP"):
+    for k in ("FSRS_BETA1", "FSRS_BETA2", "FSRS_RECENCY_C0", "FSRS_RECENCY_EXP", "FSRS_L2"):
         os.environ.pop(k, None)
     for k, v in env.items():
         os.environ[k] = str(v)
@@ -42,17 +42,20 @@ for u in USERS:
 def diff(a, b):
     return sum(1 for x, y in zip(a, b) if x != y)
 
-print("user | noenv-vs-defaultenv (expect 0) | noenv-vs-beta1=0.70 (expect >0) | noenv-vs-C0=0.20 (expect >0)")
+print("user | noenv-vs-defaultenv (0) | beta1=0.70 (>0) | C0=0.20 (>0) | L2=1.0 (>0)")
 for u in USERS:
     items, cids = data[u]
     _set({})
     base = train(items, cids)
-    _set({"FSRS_BETA1": 0.55, "FSRS_BETA2": 0.9913, "FSRS_RECENCY_C0": 0.0667, "FSRS_RECENCY_EXP": 11.25})
+    _set({"FSRS_BETA1": 0.55, "FSRS_BETA2": 0.9913, "FSRS_RECENCY_C0": 0.0667,
+          "FSRS_RECENCY_EXP": 11.25, "FSRS_L2": 0.3333})
     deflt = train(items, cids)
     _set({"FSRS_BETA1": 0.70})
     b70 = train(items, cids)
     _set({"FSRS_RECENCY_C0": 0.20})
     c20 = train(items, cids)
+    _set({"FSRS_L2": 1.0})
+    l2 = train(items, cids)
     _set({})
-    print(f"{u:>4} | {diff(base, deflt):>30} | {diff(base, b70):>31} | {diff(base, c20):>28}")
+    print(f"{u:>4} | {diff(base, deflt):>22} | {diff(base, b70):>15} | {diff(base, c20):>12} | {diff(base, l2):>10}")
 print("\nbase params[:6] :", [round(x, 5) for x in base[:6]])

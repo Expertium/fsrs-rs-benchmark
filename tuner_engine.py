@@ -42,7 +42,7 @@ from data_loader import UserDataLoader  # noqa: E402
 
 config = bm.config
 HP_ENV_KEYS = ("FSRS_N_EPOCHS", "FSRS_BATCH_SIZE", "FSRS_LR",
-               "FSRS_BETA1", "FSRS_BETA2", "FSRS_RECENCY_C0", "FSRS_RECENCY_EXP")
+               "FSRS_BETA1", "FSRS_BETA2", "FSRS_RECENCY_C0", "FSRS_RECENCY_EXP", "FSRS_L2")
 
 
 def build_user_folds(user_id: int, loader: UserDataLoader):
@@ -82,7 +82,11 @@ def build_user_folds(user_id: int, loader: UserDataLoader):
         # scoring skips the per-row marshaling and only reruns memory_state_batch + the curve.
         from fsrs_rs_python import FSRSItem
         test_hist = [FSRSItem(reviews=bm.build_reviews(row)) for _, row in test_set.iterrows()]
-        folds.append((items, card_ids, test_set, test_hist))
+        # Cache ONLY the columns predict() reads when history_items is precomputed: delta_t (curve
+        # input) + y (label). Dropping the other ~13 feature columns x5 folds is a large RAM cut
+        # (the full test_set DataFrames dominated the per-user cache). Same row order as test_hist.
+        test_slim = test_set[["delta_t", "y"]].copy()
+        folds.append((items, card_ids, test_slim, test_hist))
         if config.train_equals_test:
             break
     if not folds:
@@ -101,6 +105,7 @@ def set_hp_env(op: dict, hps: dict) -> None:
     os.environ["FSRS_BETA2"] = repr(float(hps["beta2"]))
     os.environ["FSRS_RECENCY_C0"] = repr(float(hps["c0"]))
     os.environ["FSRS_RECENCY_EXP"] = repr(float(hps["exp"]))
+    os.environ["FSRS_L2"] = repr(float(hps["l2"]))
 
 
 def eval_user(cache: dict, backend: FSRS) -> tuple[float, float]:
@@ -152,7 +157,7 @@ def probe(n_users: int) -> None:
     n_items = sum(c["n_items"] for c in cache.values())
 
     gold_op = {"epoch": 9, "batch": 256}
-    gold_hps = {"lr": 0.0188, "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25}
+    gold_hps = {"lr": 0.0188, "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25, "l2": 0.3333}
     set_hp_env(gold_op, gold_hps)
     t0 = time.perf_counter()
     lls, total_secs = [], 0.0
@@ -203,7 +208,12 @@ def _pool_worker(slice_ids, in_q, out_q):
         c = build_user_folds(u, loader)
         if c is not None:
             cache[u] = c
-    out_q.put(("ready", len(cache), sum(c["n_items"] for c in cache.values())))
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss
+    except Exception:  # noqa: BLE001
+        rss = 0
+    out_q.put(("ready", len(cache), sum(c["n_items"] for c in cache.values()), rss))
     while True:
         msg = in_q.get()
         if msg is None:
@@ -234,10 +244,12 @@ class WorkerPool:
             p.start()
             self.procs.append(p)
         self.n_users = self.n_items = 0
+        self.total_rss = 0
         for q in self.out_qs:
-            _, nu, ni = q.get()
+            _, nu, ni, rss = q.get()
             self.n_users += nu
             self.n_items += ni
+            self.total_rss += rss
 
     def evaluate(self, op: dict, hps: dict):
         for q in self.in_qs:
@@ -268,6 +280,7 @@ HP_SPECS = [
     ("beta2", "beta", 1.5, 0.4,  0.9995),
     ("c0",    "mul",  1.5, 0.005, 0.5),
     ("exp",   "mul",  1.5, 1.0,  20.0),
+    ("l2",    "mul",  1.5, 0.02, 8.0),
 ]
 
 
@@ -294,7 +307,7 @@ def coordinate_descent(pool: WorkerPool, op: dict, start_hps: dict, improve_eps:
     trials = [{"hps": dict(best), "loss": bl, "secs": bs}]
     active = {n: True for n, *_ in HP_SPECS}
     print(f"      baseline by_user={bl:.6f}  (lr={best['lr']:g} b1={best['beta1']:g} "
-          f"b2={best['beta2']:g} c0={best['c0']:g} exp={best['exp']:g})", flush=True)
+          f"b2={best['beta2']:g} c0={best['c0']:g} exp={best['exp']:g} l2={best['l2']:g})", flush=True)
     for r in range(rounds):
         improved = False
         for name, kind, step, lo, hi in HP_SPECS:
@@ -335,7 +348,7 @@ def validate(n_users: int) -> None:
     import subprocess
     import pyarrow.parquet as pq
     gold_op = {"epoch": 9, "batch": 256}
-    gold_hps = {"lr": 0.0188, "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25}
+    gold_hps = {"lr": 0.0188, "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25, "l2": 0.3333}
     all_ids = sorted(u.as_py() for u in pq.ParquetDataset(config.data_path / "revlogs").partitioning.dictionaries[0])
     ids = all_ids[:n_users]
 
@@ -356,7 +369,7 @@ def validate(n_users: int) -> None:
         bm_result.unlink()
     env = {**os.environ, "FSRS_N_EPOCHS": "9", "FSRS_BATCH_SIZE": "256",
            "FSRS_LR": repr(0.0188), "FSRS_BETA1": repr(0.55), "FSRS_BETA2": repr(0.9913),
-           "FSRS_RECENCY_C0": repr(0.0667), "FSRS_RECENCY_EXP": repr(11.25)}
+           "FSRS_RECENCY_C0": repr(0.0667), "FSRS_RECENCY_EXP": repr(11.25), "FSRS_L2": repr(0.3333)}
     cmd = [sys.executable, "benchmark.py", "--algo", "FSRS-rs", "--short", "--secs", "--recency",
            "--processes", "10", "--max-user-id", str(n_users)]
     print(f"[validate] running benchmark.py on {n_users} users at gold env ...", flush=True)
@@ -453,17 +466,18 @@ def run_two_stage_grid(tune_users: int, confirm_users: int, P: int, max_cells: i
     stage1_path = RESULT / "hp_grid_stage1.json"
 
     print(f"[grid] STAGE 1: per-cell coordinate descent on {tune_users} users, {P} workers. "
-          f"5 HPs: lr/beta1/beta2/c0/exp.", flush=True)
+          f"6 HPs: lr/beta1/beta2/c0/exp/l2.", flush=True)
     t0 = time.time()
     pool = WorkerPool(tune_ids, P)
     print(f"[grid] pool ready: {pool.n_users} users cached ({pool.n_items:,} items) "
-          f"in {time.time()-t0:.0f}s", flush=True)
+          f"in {time.time()-t0:.0f}s | total worker RSS {pool.total_rss/2**30:.1f} GB "
+          f"({pool.total_rss/max(1,pool.n_users)/2**20:.1f} MB/user)", flush=True)
 
     # Measure the by_user run-to-run noise (Rust training isn't bit-exact): eval gold 3x, take the
     # spread, and set the coordinate-descent improvement threshold to a safe multiple of it so the
     # search keeps only moves that clearly beat noise. Floor 2e-6 (the 6dp record granularity).
     gold_op = {"epoch": ht.GOLD_EPOCH, "batch": ht.GOLD_BATCH}
-    gold_hps = {"lr": ht._scaled_lr(ht.GOLD_BATCH), "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25}
+    gold_hps = {"lr": ht._scaled_lr(ht.GOLD_BATCH), "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25, "l2": 0.3333}
     noise_lls = [pool.evaluate(gold_op, gold_hps)[0] for _ in range(3)]
     noise = max(noise_lls) - min(noise_lls)
     improve_eps = max(2e-6, 3.0 * noise)
@@ -473,11 +487,11 @@ def run_two_stage_grid(tune_users: int, confirm_users: int, P: int, max_cells: i
     cells = []
     for epoch, batch in grid:
         op = {"epoch": epoch, "batch": batch}
-        start = {"lr": ht._scaled_lr(batch), "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25}
+        start = {"lr": ht._scaled_lr(batch), "beta1": 0.55, "beta2": 0.9913, "c0": 0.0667, "exp": 11.25, "l2": 0.3333}
         print(f"\n[grid] cell (epoch {epoch}, batch {batch}) — start lr={start['lr']:g}", flush=True)
         best, bl, bs, nev, trials = coordinate_descent(pool, op, start, improve_eps)
         print(f"      BEST by_user={bl:.6f} after {nev} evals: lr={best['lr']:g} b1={best['beta1']:g} "
-              f"b2={best['beta2']:g} c0={best['c0']:g} exp={best['exp']:g}", flush=True)
+              f"b2={best['beta2']:g} c0={best['c0']:g} exp={best['exp']:g} l2={best['l2']:g}", flush=True)
         cells.append({"epoch": epoch, "batch": batch, **best,
                       "subset_by_user": bl, "subset_secs": bs, "n_tune_evals": nev, "trials": trials})
         stage1_path.write_text(json.dumps(
@@ -490,7 +504,7 @@ def run_two_stage_grid(tune_users: int, confirm_users: int, P: int, max_cells: i
           f"(loop-inversion) ...", flush=True)
     t1 = time.time()
     configs = [({"epoch": c["epoch"], "batch": c["batch"]},
-                {k: c[k] for k in ("lr", "beta1", "beta2", "c0", "exp")}) for c in cells]
+                {k: c[k] for k in ("lr", "beta1", "beta2", "c0", "exp", "l2")}) for c in cells]
     results, total_items = confirm_on_full(configs, confirm_ids, P)
     for c, r in zip(cells, results):
         c["by_user"] = r["by_user"]
@@ -519,7 +533,7 @@ def run_two_stage_grid(tune_users: int, confirm_users: int, P: int, max_cells: i
         tag = " DOMINATES" if ht.dominates(c, g_ll, g_s) else ""
         print(f"      ({c['epoch']:>2},{c['batch']:>4}) by_user={c['by_user']:.6f} "
               f"train={c['seconds']:.1f}s lr={c['lr']:g} b1={c['beta1']:g} b2={c['beta2']:g} "
-              f"c0={c['c0']:g} exp={c['exp']:g}{tag}", flush=True)
+              f"c0={c['c0']:g} exp={c['exp']:g} l2={c['l2']:g}{tag}", flush=True)
     print(f"\n[grid] WINNER: epoch={winner['epoch']} batch={winner['batch']} "
           f"{'[Pareto win]' if improved else '[= gold]'}", flush=True)
     try:
