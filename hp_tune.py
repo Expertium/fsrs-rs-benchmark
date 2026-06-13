@@ -340,7 +340,10 @@ def plot_grid() -> None:
     ax.grid(True, alpha=0.25)
     ax.margins(0.10)  # data headroom so inward-pointing labels stay clear of the spines
     fig.tight_layout()
-    fig.savefig(GRID_PLOT, dpi=130)
+    # dpi 200 (was 130): at 130 the gold ring + its green point are different-sized scatter
+    # markers whose centers round to slightly different sub-pixels, so the ring looked ~0.5px
+    # off-center; 200 dpi makes that sub-pixel shift invisible (and sharpens text/lines).
+    fig.savefig(GRID_PLOT, dpi=200)
     print(f"[plot] wrote {GRID_PLOT.relative_to(REPO)}", flush=True)
 
 
