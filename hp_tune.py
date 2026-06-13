@@ -325,7 +325,7 @@ def plot_grid() -> None:
         ax.annotate(f"({c['epoch']}, {c['batch']})",
                     (c["by_user"], c["throughput"]),
                     textcoords="offset points", xytext=(dx, dy), ha=ha, va=va,
-                    color="#2ca02c", fontsize=9, fontweight="bold")
+                    color="#15691b", fontsize=9, fontweight="bold", zorder=6)
     # ring the gold standard
     g = next((c for c in cells if c["epoch"] == gold["epoch"] and c["batch"] == gold["batch"]), None)
     if g is not None:
