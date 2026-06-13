@@ -314,10 +314,17 @@ def plot_grid() -> None:
     fy = [c["throughput"] for c in front]
     ax.plot(fx, fy, "-", color="#2ca02c", lw=2.5, zorder=3)
     ax.scatter(fx, fy, c="#2ca02c", s=55, zorder=4)
+    # Labels: point inward near the right/top edges so they never clip the border.
+    xr = (max(fx) - min(fx)) or 1.0
+    yr = (max(fy) - min(fy)) or 1.0
     for c in front:
+        right = (c["by_user"] - min(fx)) / xr > 0.62
+        top = (c["throughput"] - min(fy)) / yr > 0.88
+        dx, ha = (-7, "right") if right else (7, "left")
+        dy, va = (-9, "top") if top else (7, "bottom")
         ax.annotate(f"({c['epoch']}, {c['batch']})",
                     (c["by_user"], c["throughput"]),
-                    textcoords="offset points", xytext=(6, 6),
+                    textcoords="offset points", xytext=(dx, dy), ha=ha, va=va,
                     color="#2ca02c", fontsize=9, fontweight="bold")
     # ring the gold standard
     g = next((c for c in cells if c["epoch"] == gold["epoch"] and c["batch"] == gold["batch"]), None)
@@ -331,6 +338,7 @@ def plot_grid() -> None:
     ax.set_ylabel("Speed  (items / s; higher = faster)", fontsize=12)
     ax.set_title("n_epoch x batch_size Pareto grid", fontsize=13)
     ax.grid(True, alpha=0.25)
+    ax.margins(0.10)  # data headroom so inward-pointing labels stay clear of the spines
     fig.tight_layout()
     fig.savefig(GRID_PLOT, dpi=130)
     print(f"[plot] wrote {GRID_PLOT.relative_to(REPO)}", flush=True)
