@@ -186,13 +186,19 @@ def epoch_batch_grid(n_users: int, processes: int) -> None:
           f"(the 19 candidates are judged against this)\n", flush=True)
 
     # Persist after EVERY cell (the 3k sweep runs for days — a crash must not lose
-    # finished cells; --plot and a restart can read the partial file).
+    # finished cells; --plot and a restart can read the partial file) AND refresh the
+    # Speed-vs-LogLoss plot so the frontier fills in live as cells land. The plot is
+    # best-effort: a render failure must never kill a multi-day sweep.
     def checkpoint(cells: list[dict]) -> None:
         GRID_JSON.write_text(json.dumps({
             "gold": {"epoch": GOLD_EPOCH, "batch": GOLD_BATCH, "by_user": g_ll, "seconds": g_s},
             "cells": cells, "partial": True,
             "n_users": n_users, "ll_tol": LL_TOL, "speed_tol": SPEED_TOL,
         }, indent=2), encoding="utf-8")
+        try:
+            plot_grid()
+        except Exception as e:  # noqa: BLE001
+            print(f"[grid] plot refresh skipped: {e}", flush=True)
 
     cells = [gold]
     checkpoint(cells)
@@ -319,7 +325,7 @@ def plot_grid() -> None:
         ax.scatter(g["by_user"], g["throughput"], facecolors="none",
                    edgecolors="black", s=160, lw=1.8, zorder=5,
                    label=f"gold ({gold['epoch']}, {gold['batch']})")
-        ax.legend(loc="lower left", fontsize=9)
+        ax.legend(loc="upper left", fontsize=9)
 
     ax.set_xlabel("Log loss  (cross-val by-user; lower = better)", fontsize=12)
     ax.set_ylabel("Speed  (items / s; higher = faster)", fontsize=12)
