@@ -43,8 +43,9 @@ pub(crate) const SHORT_C: f32 = 600.0 / 86400.0;
 pub(crate) const INV_C: f32 = 1.0 / SHORT_C;
 pub(crate) const GRAD_LEN: usize = 34;
 // L2 prior sigmas for the finished 34-param layout (FSRS7_L2_SIGMA_35_VALUES, fail_d_exp dropped).
-// 0..3 free (9999), 4..22 difficulty/long+short stability, 23..30 forgetting curve,
-// 31 d_weight, 32 d_decay, 33 s_decay1.
+// 0..3 free (9999), 4..22 difficulty/long+short stability, 23..33 forgetting curve (31 d_weight,
+// 32 d_decay, 33 s_decay1 = the D-modulation / shared fast-decay curve params, stored shifted per
+// the all-positive convention; 33 s_decay1 also feeds the fast-trace stability update).
 pub(crate) const PARAMS_STDDEV: [f32; 34] = [
     9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.175,
     0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1735, 0.4608, 0.311, 0.864, 0.0418,
@@ -90,7 +91,7 @@ pub(crate) fn l2_penalty_value_and_grad(
 //
 // NOTE (iter-66 dual-trace port): the schedule penalty below is DISABLED by default
 // (enable_sched_penalties = false in every timed path) and was NOT migrated to the
-// new 36-param dual-trace layout — its w-indices (e.g. the curve at 27..34, the
+// new dual-trace layout (now 34 params) — its w-indices (e.g. the curve at 27..34, the
 // transition blend at 25/26) still refer to the pre-port single-trace layout. Do
 // not enable it without first reworking these indices and the stability recurrence.
 #[derive(Clone, Copy, Debug)]

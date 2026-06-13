@@ -23,10 +23,10 @@ pub(super) const PARAM_LEN: usize = 34;
 
 impl<B: Backend> VersionOps<B> for Fsrs7Ops {
     fn apply_freeze_short_term(_initial_params: &mut [f32]) {
-        // Dual-trace FSRS-7 (iter-66 port): the old w[26] transition weight is gone
-        // (w[26] is now decay2), and the fast trace is intrinsic to the model, so
-        // "freeze short term" has nothing to zero — it is a no-op. Unused in the
-        // timed paths anyway (enable_short_term is always true there).
+        // Dual-trace FSRS-7: the single-trace "transition weight" param that freeze-short-term
+        // used to zero is gone (its old slot was repurposed in the dual-trace layout), and the
+        // fast trace is intrinsic to the model, so "freeze short term" has nothing to zero — it
+        // is a no-op. Unused in the timed paths anyway (enable_short_term is always true there).
     }
 
     fn power_forgetting_curve(

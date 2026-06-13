@@ -16,16 +16,20 @@ use burn::tensor::cast::ToElement;
 use burn::tensor::{Shape, Tensor, TensorData};
 use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
 
-/// FSRS-7 default parameters (36 values, iter-66 dual-trace champion init_w).
-/// Layout: 0..24 s0/difficulty/long+short stability (unchanged), 25..32 forgetting
-/// curve (decay1, decay2, base1, base2, base_weight1, base_weight2, s_weight_power1,
-/// s_weight_power2), 33 d_weight, 34 d_decay, 35 s_decay1.
-// Finished FSRS-7 (34 params). Layout: 0-3 s0(again,hard,good,easy); 4 init_d0, 5 init_d1,
-// 6 next_d_mult; 7-14 long stability (sinc_base, sinc_s_exp, sinc_r_mult, fail_mult, fail_s_exp,
-// fail_r_mult, hard_penalty, easy_bonus); 15-22 short stability (same 8); 23 decay1, 24 decay2,
-// 25 base1, 26 base2, 27 base_weight1, 28 base_weight2, 29 s_weight_power1, 30 s_weight_power2;
-// 31 d_weight, 32 d_decay, 33 s_decay1. (fail_d_exp dropped from both stability blocks vs the
-// 36-param draft; values = fsrs-autoresearch FSRS7_DEFAULT_35_VALUES, rounded to <=4 dp.)
+/// FSRS-7 finished-model default parameters (34 values; fsrs-autoresearch champion init_w).
+/// Full index -> role layout in the comment below.
+// Finished FSRS-7 (34 params). Layout by where each param is USED:
+//  - 0-3   initial stability s0 (again, hard, good, easy)        [initial state]
+//  - 4-5   init_d0, init_d1; 6 next_d_mult                        [difficulty update]
+//  - 7-14  long-trace stability (sinc_base, sinc_s_exp, sinc_r_mult, fail_mult, fail_s_exp,
+//          fail_r_mult, hard_penalty, easy_bonus)                 [slow stability update]
+//  - 15-22 short-trace stability (same 8 roles)                   [fast stability update]
+//  - 24 decay2, 26 base2, 27 base_weight1, 28 base_weight2, 29 s_weight_power1,
+//    30 s_weight_power2, 31 d_weight, 32 d_decay                  [forgetting curve ONLY]
+//  - 23 decay1, 25 base1, 33 s_decay1                             [forgetting curve AND the
+//    fast-trace stability update — they build r1 (fast_component_recall), shared by both]
+// (fail_d_exp dropped from both stability blocks vs the 36-param draft; values =
+// fsrs-autoresearch FSRS7_DEFAULT_35_VALUES, rounded to <=4 dp.)
 // ALL-POSITIVE CONVENTION (also applied in the CUDA constants): the three signed modulation
 // params are stored SHIFTED so their clip ranges start at 0, and offset back in the formulas —
 // d_weight effective = w-0.5 (range [0,1.0]); d_decay & s_decay1 effective = w-0.3 (range
