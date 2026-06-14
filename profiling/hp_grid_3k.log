@@ -1,5 +1,19 @@
 [grid] gold = (epoch 9, batch 256); 3000 users/cell, --processes 15.  LL_TOL=5e-05 SPEED_TOL=0.03
 [grid] measuring gold first ...
-[grid] epoch  9 batch  256 (LR 0.0282): by_user=0.320978  train=655.1s  throughput=232,575 reviews/s  (5936s wall)
-[grid] GOLD: by_user=0.320978  train=655.1s  (the 19 candidates are judged against this)
+[grid] epoch  9 batch  256 (LR 0.0188): by_user=0.320318  train=588.2s  throughput=259,027 reviews/s  (5560s wall)
+[grid] GOLD: by_user=0.320318  train=588.2s  (the 19 candidates are judged against this)
 
+[grid] epoch  6 batch  128 (LR 0.0133): by_user=0.320306  train=585.6s  throughput=260,171 reviews/s  (5531s wall)
+        vs gold: d_loss=-0.000012  d_time=-0.4%  -> mixed (trade-off)
+[grid] epoch  6 batch  256 (LR 0.0188): by_user=0.320451  train=427.7s  throughput=356,233 reviews/s  (5525s wall)
+        vs gold: d_loss=+0.000133  d_time=-27.3%  -> mixed (trade-off)
+[grid] epoch  6 batch  512 (LR 0.0266): by_user=0.320621  train=372.5s  throughput=408,951 reviews/s  (5530s wall)
+        vs gold: d_loss=+0.000303  d_time=-36.7%  -> mixed (trade-off)
+[grid] epoch  6 batch 1024 (LR 0.0376): by_user=0.321074  train=355.3s  throughput=428,852 reviews/s  (5513s wall)
+        vs gold: d_loss=+0.000755  d_time=-39.6%  -> mixed (trade-off)
+[grid] epoch  9 batch  128 (LR 0.0133): by_user=0.320218  train=848.4s  throughput=179,580 reviews/s  (5755s wall)
+        vs gold: d_loss=-0.000100  d_time=+44.2%  -> mixed (trade-off)
+[grid] epoch  9 batch  512 (LR 0.0266): by_user=0.320467  train=517.6s  throughput=294,375 reviews/s  (5742s wall)
+        vs gold: d_loss=+0.000149  d_time=-12.0%  -> mixed (trade-off)
+[grid] epoch  9 batch 1024 (LR 0.0376): by_user=0.320768  train=496.7s  throughput=306,715 reviews/s  (5785s wall)
+        vs gold: d_loss=+0.000450  d_time=-15.5%  -> mixed (trade-off)

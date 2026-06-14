@@ -1,0 +1,24 @@
+[stage3] refining cell (epoch 9, batch 512) on 3000 users, 15 workers.
+[stage3] start HPs: lr=0.0177 beta1=0.55 beta2=0.9804 c0=0.0667 exp=11.25 l2=0.3333
+[stage3] baseline 3k by_user=0.320315  train=520.0s
+      r0 lr: 0.0177->0.0266  by_user=0.320454 (d=+0.000138)
+      r0 lr: 0.0177->0.0118  by_user=0.320301 (d=-0.000014)
+      r0 beta1: 0.55->0.7  by_user=0.320282 (d=-0.000033)
+      r0 beta2: 0.9804->0.9706  by_user=0.320344 (d=+0.000029)
+      r0 beta2: 0.9804->0.9869  by_user=0.320323 (d=+0.000008)
+      r0 c0: 0.0667->0.1001  by_user=0.320365 (d=+0.000050)
+      r0 c0: 0.0667->0.0445  by_user=0.320499 (d=+0.000184)
+      r0 exp: 11.25->16.875  by_user=0.320347 (d=+0.000032)
+      r0 exp: 11.25->7.5  by_user=0.320385 (d=+0.000069)
+      r0 l2: 0.3333->0.5  by_user=0.320340 (d=+0.000024)
+      r0 l2: 0.3333->0.2222  by_user=0.320342 (d=+0.000026)
+      round 0: center by_user=0.320315; moved
+      r1 lr: 0.0118->0.0177  by_user=0.320282 (d=+0.000003)
+      r1 lr: 0.0118->0.0079  by_user=0.320514 (d=+0.000235)
+      r1 beta1: 0.7->0.55  by_user=0.320301 (d=+0.000022)
+      r1 beta1: 0.7->0.8  by_user=0.320282 (d=+0.000003)
+      round 1: center by_user=0.320279; no improving move — stop
+
+[stage3] DONE in 408 min. baseline 0.320315 -> best 0.320279 (-0.000036)
+[stage3] refined HPs: lr=0.0118 beta1=0.7 beta2=0.9804 c0=0.0667 exp=11.25 l2=0.3333
+[stage3] wrote result\hp_grid_stage3.json

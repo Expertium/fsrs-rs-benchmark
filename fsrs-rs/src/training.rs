@@ -592,11 +592,12 @@ const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 
 // Adam hyperparameters — MUST equal the AdamConfig built in compute_parameters()/benchmark().
-// Constraint 4 freezes these, so this single copy can't drift from the config. Used by the
-// hand-rolled host Adam in train(), which replaced burn's tensor optimizer (and its per-step
-// host round-trips) with an element-wise replica of burn 0.17's AdaptiveMomentum.
-const ADAM_BETA1: f32 = 0.55;
-const ADAM_BETA2: f32 = 0.9913;
+// These are the per-cell HP tune's (9,512)-gold betas (2026-06-14, hp_grid_stage3.json); keep
+// this single copy in sync with both AdamConfig sites. Used by the hand-rolled host Adam in
+// train(), which replaced burn's tensor optimizer with an element-wise replica of burn 0.17's
+// AdaptiveMomentum.
+const ADAM_BETA1: f32 = 0.70;
+const ADAM_BETA2: f32 = 0.9804;
 const ADAM_EPS: f32 = 1e-8;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
@@ -1063,11 +1064,11 @@ pub(crate) struct TrainingConfig {
     pub enable_sched_penalties: bool,
     #[config(default = 9)]
     pub num_epochs: usize,
-    #[config(default = 256)]
+    #[config(default = 512)]
     pub batch_size: usize,
     #[config(default = 2023)]
     pub seed: u64,
-    #[config(default = 0.0188)]
+    #[config(default = 0.0118)]
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
@@ -1184,8 +1185,8 @@ pub fn compute_parameters(
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
         AdamConfig::new()
-            .with_beta_1(0.55)
-            .with_beta_2(0.9913)
+            .with_beta_1(0.70)
+            .with_beta_2(0.9804)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
@@ -1282,8 +1283,8 @@ pub fn benchmark(
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
         AdamConfig::new()
-            .with_beta_1(0.55)
-            .with_beta_2(0.9913)
+            .with_beta_1(0.70)
+            .with_beta_2(0.9804)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
