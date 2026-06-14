@@ -103,6 +103,65 @@ def convert_to_items(df: pd.DataFrame) -> tuple[List[FSRSItem], List[int]]:
     return items, card_ids
 
 
+def convert_to_raw(df: pd.DataFrame):
+    """COMPACT-RAW twin of `convert_to_items`: emit each card's FULL review sequence as flat O(N)
+    arrays instead of materializing its O(N^2) expanding-window prefix FSRSItems. Fed to the Rust
+    `compute_parameters_raw`, which rebuilds the identical (train_set, card_ids) internally — so the
+    two paths are bit-for-bit, but the cache/marshaling is O(total reviews) instead of O(N^2).
+
+    Returns (deltas, ratings, review_ths, card_offsets) as numpy arrays, CSR across cards:
+      * cards are in ascending card_id order (matching convert_to_items' groupby), so the Rust side's
+        synthetic card id = card index reproduces every ordering tie-break;
+      * card c's full sequence is the slice [card_offsets[c] : card_offsets[c+1]] of deltas/ratings;
+      * review_ths is aligned to reviews: a review index j that has a SURVIVING prefix-item carries
+        that prefix's review_th (the global recency key); reviews kept only as HISTORY — the initial
+        review (j=0) and base.py's dropped `delta_t==0` middle reviews — carry the sentinel 0.
+
+    Scored reviews are NOT always the contiguous lengths 2..K: base.py drops same-timestamp reviews
+    from scoring while keeping them in later prefixes' history. We therefore read each surviving
+    row's history length (= its review's full-sequence position j) directly, rather than assuming
+    contiguity. The full sequence is the LONGEST surviving row's reviews (every shorter row is a head
+    of it, including the history-only middle reviews); parsed once per card.
+    """
+    deltas: List[float] = []
+    ratings: List[int] = []
+    review_ths: List[int] = []  # aligned to reviews; sentinel 0 = history-only (unscored) review
+    card_offsets: List[int] = [0]
+    for card_id, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
+        th_strs = group["t_history"].tolist()
+        rths = group["review_th"].tolist()
+        # j = this row's review position in the card's full sequence = #history entries =
+        # (#comma-separated t_history fields). _fmt_history never emits trailing commas, so
+        # commas+1 == field count for a non-empty string (empty == the never-present j=0 row).
+        js = [(s.count(",") + 1) if isinstance(s, str) and s != "" else 0 for s in th_strs]
+        imax = max(range(len(js)), key=js.__getitem__)  # longest surviving prefix == full sequence
+        long_row = group.iloc[imax]
+        t_full = parse_history(long_row["t_history"], parse_interval)
+        r_full = parse_history(long_row["r_history"], parse_rating)
+        t_full.append(parse_interval(long_row["delta_t"]))
+        r_full.append(parse_rating(long_row["rating"]))
+        k = len(t_full)  # full sequence length (reviews 0..k-1)
+        if k != len(r_full) or k != js[imax] + 1:
+            raise ValueError(f"card {card_id}: full-seq len {k} (r {len(r_full)}) vs jmax+1 {js[imax] + 1}")
+        card_th = [0] * k  # 0 = unscored; fill each surviving row's scored position
+        for j, rth in zip(js, rths):
+            if not 1 <= j <= k - 1:
+                raise ValueError(f"card {card_id}: out-of-range scored position j={j} (K={k})")
+            if card_th[j] != 0:
+                raise ValueError(f"card {card_id}: two rows score review {j}")
+            card_th[j] = int(rth)
+        deltas.extend(t_full)
+        ratings.extend(r_full)
+        review_ths.extend(card_th)
+        card_offsets.append(card_offsets[-1] + k)
+    return (
+        np.asarray(deltas, dtype=np.float32),
+        np.asarray(ratings, dtype=np.uint32),
+        np.asarray(review_ths, dtype=np.int64),
+        np.asarray(card_offsets, dtype=np.uint64),
+    )
+
+
 def default_parameters() -> List[float]:
     return list(DEFAULT_PARAMETERS)
 

@@ -22,7 +22,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 mod training_v7 {
@@ -592,12 +592,13 @@ const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 
 // Adam hyperparameters — MUST equal the AdamConfig built in compute_parameters()/benchmark().
-// These are the per-cell HP tune's (9,512)-gold betas (2026-06-14, hp_grid_stage3.json); keep
+// These are the per-cell HP tune's (9,512)-gold betas (2026-06-14, hp_grid_stage3.json; beta2
+// rounded 0.9804->0.98, the 4e-4 is within noise — Andrew); keep
 // this single copy in sync with both AdamConfig sites. Used by the hand-rolled host Adam in
 // train(), which replaced burn's tensor optimizer with an element-wise replica of burn 0.17's
 // AdaptiveMomentum.
 const ADAM_BETA1: f32 = 0.70;
-const ADAM_BETA2: f32 = 0.9804;
+const ADAM_BETA2: f32 = 0.98;
 const ADAM_EPS: f32 = 1e-8;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
@@ -715,6 +716,16 @@ pub struct FSRSReview {
     pub delta_t: f32,
 }
 
+const LONG_TERM_DELTA_T_BUCKET_DAYS: f32 = 1.0;
+
+pub(crate) fn bucket_long_term_delta_t(delta_t: f32) -> f32 {
+    if !delta_t.is_finite() {
+        return 1.0;
+    }
+    let clamped = delta_t.max(1.0);
+    (clamped / LONG_TERM_DELTA_T_BUCKET_DAYS).floor() * LONG_TERM_DELTA_T_BUCKET_DAYS
+}
+
 impl FSRSItem {
     // The previous reviews done before the current one.
     pub(crate) fn history(&self) -> impl Iterator<Item = &FSRSReview> {
@@ -732,6 +743,14 @@ impl FSRSItem {
             .count()
     }
 
+    pub(crate) fn first_long_term_review(&self) -> FSRSReview {
+        *self
+            .reviews
+            .iter()
+            .find(|review| review.delta_t >= 1.0)
+            .expect("Invalid FSRS item: at least one review with delta_t >= 1.0 is required")
+    }
+
     pub(crate) fn r_matrix_index(&self) -> (u32, u32, u32) {
         let delta_t = self.current().delta_t as f64;
         let delta_t_bin = (2.48 * 3.62f64.powf(delta_t.log(3.62).floor()) * 100.0).round() as u32;
@@ -746,6 +765,84 @@ impl FSRSItem {
         }
         let lapse_bin = (1.65 * 1.73f64.powf((lapse as f64).log(1.73).floor())).round() as u32;
         (delta_t_bin, length_bin, lapse_bin)
+    }
+}
+
+/// OUTLIER FILTER — DEPLOYMENT vs BENCHMARK (Andrew, 2026-06-14).
+/// The (rating, delta_t)-bucket outlier filter drops reviews from rare/sparse first-interval buckets.
+/// It is needed ONLY for parity with the `srs-benchmark` repo (where every algorithm filters the
+/// same outliers so the comparison is fair). In DEPLOYMENT — i.e. real Anki — the optimizer is NOT
+/// filtered (Anki trains on every review), and a 3k ablation measured the filter COSTING +0.000397
+/// cross-val log loss. So this fork (which optimizes for the Anki user) keeps the filter OFF by
+/// DEFAULT; the timed/shipped path is bit-for-bit with the filter-removed state. Set the env var
+/// `FSRS_OUTLIER_FILTER` (any value) to ENABLE it when running this crate under srs-benchmark.
+fn outlier_filter_enabled() -> bool {
+    std::env::var_os("FSRS_OUTLIER_FILTER").is_some()
+}
+
+/// Compute the outlier-removed (rating, delta_t) buckets from the initialization subset. The old
+/// `filtered_items` init set is DEAD (every caller of prepare_training_data{,_carded} discards it),
+/// and the threshold logic only ever reads each bucket's SIZE — so we take the init candidates by
+/// REFERENCE and tally per-(rating, delta_t-bucket) COUNTS, cloning nothing and storing no items.
+/// Split out so the card-aware path reuses the exact same `removed_pairs`.
+fn compute_outlier_removed_pairs<'a>(
+    dataset_for_initialization: impl Iterator<Item = &'a FSRSItem>,
+) -> [HashSet<u32>; 5] {
+    let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
+    let mut groups = HashMap::<u32, HashMap<u32, usize>>::new();
+
+    for item in dataset_for_initialization {
+        let first_review = item.reviews.first().unwrap();
+        let first_long_term_review = item.first_long_term_review();
+        *groups
+            .entry(first_review.rating)
+            .or_default()
+            .entry(to_key(first_long_term_review.delta_t))
+            .or_default() += 1;
+    }
+
+    let mut removed_pairs: [HashSet<u32>; 5] = Default::default();
+
+    for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
+        let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
+
+        // sort by bucket COUNT desc, then delta_t desc (count == the old sub_group.len()).
+        sub_groups.sort_by(|(delta_t_a, cnt_a), (delta_t_b, cnt_b)| {
+            cnt_b
+                .cmp(cnt_a)
+                .then(from_key(*delta_t_b).total_cmp(&from_key(*delta_t_a)))
+        });
+
+        let total = sub_groups.iter().map(|(_, cnt)| *cnt).sum::<usize>();
+        let mut has_been_removed = 0;
+
+        // Each bucket is either KEPT in the (vestigial) init set or its (rating, delta_t) pair is
+        // flagged as an outlier in `removed_pairs`. Identical control flow to the original, on counts.
+        for (delta_t, cnt) in sub_groups.iter().rev() {
+            let over_threshold = has_been_removed + *cnt >= 20.max(total / 20);
+            let kept_in_init_set = over_threshold
+                && *cnt >= 6
+                && from_key(*delta_t) <= if rating != 4 { 100.0 } else { 365.0 };
+            if !kept_in_init_set {
+                removed_pairs[rating as usize].insert(*delta_t);
+            }
+            if !over_threshold {
+                has_been_removed += *cnt;
+            }
+        }
+    }
+    removed_pairs
+}
+
+/// The retain predicate: keep an item unless its (rating, first-long-term-delta_t) bucket was
+/// flagged as an outlier.
+fn item_survives_outlier(item: &FSRSItem, removed_pairs: &[HashSet<u32>; 5]) -> bool {
+    if item.long_term_review_cnt() == 0 {
+        true
+    } else {
+        let key = bucket_long_term_delta_t(item.first_long_term_review().delta_t).to_bits();
+        !removed_pairs[item.reviews[0].rating as usize].contains(&key)
     }
 }
 
@@ -925,20 +1022,42 @@ pub(crate) fn recency_weighted_fsrs_items_tuned(items: Vec<FSRSItem>) -> Vec<Wei
 }
 
 pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    // The (rating, delta_t)-bucket outlier filter was REMOVED (Andrew, 2026-06-13): the CUDA
-    // research pipeline never filtered, and the 3k ablation measured the filter costing
-    // +0.000397 cross-val log loss (0.320573 without vs 0.320970 with). Training now sees
-    // every item; the vestigial init-set slot stays for signature compatibility.
-    (Vec::new(), items)
+    // Outlier filter OFF by default (Anki deployment / this fork) -> train on every item, bit-for-bit
+    // with the filter-removed state. ON only under FSRS_OUTLIER_FILTER (srs-benchmark parity); see
+    // the note above `outlier_filter_enabled`. The vestigial init-set slot stays for signature compat.
+    if !outlier_filter_enabled() {
+        return (Vec::new(), items);
+    }
+    let removed_pairs =
+        compute_outlier_removed_pairs(items.iter().filter(|item| item.long_term_review_cnt() == 1));
+    let trainset = items
+        .into_iter()
+        .filter(|item| item_survives_outlier(item, &removed_pairs))
+        .collect();
+    (Vec::new(), trainset)
 }
 
-/// Card-aware twin of `prepare_training_data` (windowed path): like it, no filtering — all
-/// items and their parallel card ids pass through unchanged.
+/// Card-aware twin of `prepare_training_data` (windowed path): same outlier toggle, applied to the
+/// `items` AND their parallel `card_ids` together (order-preserving) so each kept prefix keeps its
+/// card id. Default (filter OFF) passes everything through unchanged (bit-for-bit).
 pub(crate) fn prepare_training_data_carded(
     items: Vec<FSRSItem>,
     card_ids: Vec<i64>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>, Vec<i64>) {
-    (Vec::new(), items, card_ids)
+    if !outlier_filter_enabled() {
+        return (Vec::new(), items, card_ids);
+    }
+    let removed_pairs =
+        compute_outlier_removed_pairs(items.iter().filter(|item| item.long_term_review_cnt() == 1));
+    let mut trainset = Vec::with_capacity(items.len());
+    let mut trainset_card_ids = Vec::with_capacity(items.len());
+    for (item, cid) in items.into_iter().zip(card_ids) {
+        if item_survives_outlier(&item, &removed_pairs) {
+            trainset.push(item);
+            trainset_card_ids.push(cid);
+        }
+    }
+    (Vec::new(), trainset, trainset_card_ids)
 }
 
 // ========== BCE Loss ==========
@@ -1097,6 +1216,10 @@ pub struct ComputeParametersInput {
     /// by the profiling epoch-buyback sweep (`profiling/epoch_sweep.py`) to measure accuracy-vs-epochs;
     /// the shipped Python path never sets it, so production training stays at 8 epochs.
     pub num_epochs: Option<usize>,
+    /// Optional custom initial parameters = SGD start AND L2 anchor (default `None` = the compiled
+    /// `DEFAULT_PARAMETERS`, BIT-FOR-BIT). Used by the gated default-param meta-optimizer (the gate
+    /// trains each user with the candidate-default as both init and anchor — see fsrs-default-param-tuner).
+    pub init_w: Option<Vec<f32>>,
 }
 
 impl Default for ComputeParametersInput {
@@ -1109,6 +1232,7 @@ impl Default for ComputeParametersInput {
             num_relearning_steps: None,
             card_ids: None,
             num_epochs: None,
+            init_w: None,
         }
     }
 }
@@ -1143,6 +1267,7 @@ pub fn compute_parameters(
         num_relearning_steps,
         card_ids,
         num_epochs,
+        init_w,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -1166,12 +1291,17 @@ pub fn compute_parameters(
             (train_set, None)
         }
     };
+    // SGD start + L2 anchor: a non-empty custom init_w (gated default-param tuner) overrides the
+    // compiled DEFAULT_PARAMETERS; None/empty keeps DEFAULT_PARAMETERS, so the shipped path stays
+    // BIT-FOR-BIT (the two early-return tiny-user cases also returned DEFAULT_PARAMETERS before).
+    let initialized_parameters = match &init_w {
+        Some(w) if !w.is_empty() => w.clone(),
+        _ => DEFAULT_PARAMETERS.to_vec(),
+    };
     if train_set.len() < 8 {
         finish_progress();
-        return Ok(DEFAULT_PARAMETERS.to_vec());
+        return Ok(initialized_parameters);
     }
-
-    let initialized_parameters = DEFAULT_PARAMETERS.to_vec();
     if train_set.len() < 64 {
         finish_progress();
         return Ok(initialized_parameters);
@@ -1186,7 +1316,7 @@ pub fn compute_parameters(
         },
         AdamConfig::new()
             .with_beta_1(0.70)
-            .with_beta_2(0.9804)
+            .with_beta_2(0.98)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
@@ -1284,7 +1414,7 @@ pub fn benchmark(
         },
         AdamConfig::new()
             .with_beta_1(0.70)
-            .with_beta_2(0.9804)
+            .with_beta_2(0.98)
             .with_epsilon(1e-8),
     )
     .with_enable_sched_penalties(enable_sched_penalties);

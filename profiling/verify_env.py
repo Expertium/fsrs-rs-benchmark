@@ -2,7 +2,7 @@
 
 Two things at once, in ONE process:
   (1) DEFAULT CORRECTNESS: training with no env, and with the env set to the shipped defaults
-      (0.70 / 0.9804 / 0.0667 / 11.25 — the (9,512)-gold betas, 2026-06-14), must produce
+      (0.70 / 0.98 / 0.0667 / 11.25 — the (9,512)-gold betas, beta2 rounded 2026-06-14), must produce
       BYTE-IDENTICAL params -> the override code defaults exactly to the consts (production stays
       bit-for-bit).
   (2) LIVE-ENV MECHANISM: changing os.environ BETWEEN compute_parameters() calls in the SAME
@@ -48,7 +48,7 @@ for u in USERS:
     items, cids = data[u]
     _set({})
     base = train(items, cids)
-    _set({"FSRS_BETA1": 0.70, "FSRS_BETA2": 0.9804, "FSRS_RECENCY_C0": 0.0667,
+    _set({"FSRS_BETA1": 0.70, "FSRS_BETA2": 0.98, "FSRS_RECENCY_C0": 0.0667,
           "FSRS_RECENCY_EXP": 11.25, "FSRS_L2": 0.3333})
     deflt = train(items, cids)
     _set({"FSRS_BETA1": 0.60})
