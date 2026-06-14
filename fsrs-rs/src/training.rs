@@ -1526,6 +1526,11 @@ fn train<B: AutodiffBackend>(
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(L2_PENALTY_WEIGHT);
 
+    // PROFILING-ONLY (default off => shipped path bit-for-bit): when FSRS_VALIDATE is set, re-run
+    // the per-epoch validation forward that the finished-model port removed (training.rs end note),
+    // so the no-per-epoch-validation speedup can be measured on the IDENTICAL model. Read once.
+    let validate = std::env::var_os("FSRS_VALIDATE").is_some();
+
     // PROFILING-ONLY (not committed): per-phase wall time decomposition.
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
     // train batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
@@ -1628,6 +1633,23 @@ fn train<B: AutodiffBackend>(
 
         if interrupter.should_stop() {
             break;
+        }
+
+        if validate {
+            // Per-epoch validation forward (gated by FSRS_VALIDATE; default off). Scores
+            // card_loss_simd over the train batches (train==test in compute_parameters), exactly
+            // as the removed best-epoch-selection pass did. Result discarded — black_box keeps it
+            // live so the timing reflects the real validation cost; w_host is NOT touched, so the
+            // trained parameters are identical whether or not validation runs.
+            let mut vloss = 0.0f64;
+            for hb in &train_host {
+                if hb.windowed {
+                    vloss += crate::analytic::card_loss_simd(
+                        &w_host, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts,
+                    );
+                }
+            }
+            std::hint::black_box(vloss);
         }
 
         info!("epoch: {:?} done", epoch);

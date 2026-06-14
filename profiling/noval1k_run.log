@@ -1,0 +1,20 @@
+[Sun Jun 14 19:56:07 RTZST 2026] START old config: 8 epochs + validation, 1000 users
+users=1000 total_items=60360449 LogLoss(mean)=0.3177 time(median)=34.0ms
+[run] snapshot -> C:\Users\Andrew\fsrs-rs-speed-autoresearch\profiling\measure\noval1k_8val.jsonl  users=1000 median_time=34.0ms
+[Sun Jun 14 20:16:20 RTZST 2026] START new shipped: 9 epochs, no validation, 1000 users
+users=1000 total_items=60360449 LogLoss(mean)=0.3174 time(median)=24.0ms
+[run] snapshot -> C:\Users\Andrew\fsrs-rs-speed-autoresearch\profiling\measure\noval1k_noval.jsonl  users=1000 median_time=24.0ms
+[Sun Jun 14 20:36:11 RTZST 2026] COMPARE (net: 8ep+val / 9ep+noval) ===
+  users compared      : 1000
+  median time champ   : 34.0 ms
+  median time cand    : 24.0 ms
+  SPEED_RATIO (median): 1.3712   <- accept if >= 1.05   [OK]
+  mean speedup        : 1.3811   (informational)
+  mean LogLoss champ  : 0.317662
+  mean LogLoss cand   : 0.317445
+  d_AVG LogLoss       : -0.000216  (vs champ; informational now that the gate is absolute)
+  abs mean LogLoss    : 0.317445  <- CORRECTNESS BAR: in [0.3083, 0.3113] (orig 0.3098 +-0.0015)  [FAIL]
+  max |per-user dLL|  : 0.010564   (diagnostic only: gross-bug tell, NOT the bar)
+  users w/ param diff : 1000/1000   (reordered (expected for graph changes))
+  max |param diff|    : 3.057   (diagnostic only)
+[Sun Jun 14 20:36:12 RTZST 2026] DONE
