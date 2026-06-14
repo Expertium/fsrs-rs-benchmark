@@ -103,6 +103,13 @@ def convert_to_items(df: pd.DataFrame) -> tuple[List[FSRSItem], List[int]]:
     return items, card_ids
 
 
+def hist_len_of(t_history: object) -> int:
+    """Number of history entries in a row's t_history = the row's review position j in its card's
+    full sequence (its history = reviews[0..j-1]). _fmt_history never emits trailing commas, so
+    commas+1 == field count for a non-empty string; empty == the never-present initial-review row."""
+    return (t_history.count(",") + 1) if isinstance(t_history, str) and t_history != "" else 0
+
+
 def convert_to_raw(df: pd.DataFrame):
     """COMPACT-RAW twin of `convert_to_items`: emit each card's FULL review sequence as flat O(N)
     arrays instead of materializing its O(N^2) expanding-window prefix FSRSItems. Fed to the Rust
@@ -130,10 +137,8 @@ def convert_to_raw(df: pd.DataFrame):
     for card_id, group in df.sort_values(by=["card_id", "review_th"]).groupby("card_id"):
         th_strs = group["t_history"].tolist()
         rths = group["review_th"].tolist()
-        # j = this row's review position in the card's full sequence = #history entries =
-        # (#comma-separated t_history fields). _fmt_history never emits trailing commas, so
-        # commas+1 == field count for a non-empty string (empty == the never-present j=0 row).
-        js = [(s.count(",") + 1) if isinstance(s, str) and s != "" else 0 for s in th_strs]
+        # j = this row's review position in the card's full sequence = #history entries.
+        js = [hist_len_of(s) for s in th_strs]
         imax = max(range(len(js)), key=js.__getitem__)  # longest surviving prefix == full sequence
         long_row = group.iloc[imax]
         t_full = parse_history(long_row["t_history"], parse_interval)
@@ -162,6 +167,57 @@ def convert_to_raw(df: pd.DataFrame):
     )
 
 
+def build_user_raw_folds(dataset: pd.DataFrame, config):
+    """COMPACT-RAW twin of the per-fold construction that measured the (9,512) gold
+    (tuner_engine.build_user_folds): same 5-fold TimeSeriesSplit + filters, but flat O(N) arrays.
+    Returns None if no usable fold. The dict holds:
+      * full        = convert_to_raw(dataset): whole-collection card sequences, used to reconstruct
+                      each TEST row's history (a head of its card's full sequence) via memory_states_raw.
+      * card_to_idx = {card_id: index in `full`} (ascending card_id, matching convert_to_raw).
+      * folds[k]    = train_raw (convert_to_raw(train_set), for compute_parameters_raw(init_w=...)),
+                      test_card_idx/test_hist_len (-> memory_states_raw), test_dt/test_y (curve+labels).
+    The proxy scores the test folds with the candidate params directly (0-epoch); the gate trains each
+    fold from the candidate first — both reuse this structure, so they stay aligned (the gated design)."""
+    full = convert_to_raw(dataset)
+    card_to_idx = {int(c): i for i, c in enumerate(sorted(dataset["card_id"].unique()))}
+    folds = []
+    for split_i, (tr_idx, te_idx) in enumerate(
+        TimeSeriesSplit(n_splits=config.n_splits).split(dataset)
+    ):
+        if config.train_equals_test:
+            train_set = dataset.copy()
+            test_set = dataset[
+                dataset["review_th"] >= dataset.iloc[te_idx]["review_th"].min()
+            ].copy()
+        else:
+            train_set = dataset.iloc[tr_idx]
+            test_set = dataset.iloc[te_idx]
+            if config.equalize_test_with_non_secs:
+                train_set = dataset[dataset[f"{split_i}_train"]]
+                test_set = dataset[dataset[f"{split_i}_test"]]
+        if config.no_test_same_day:
+            test_set = test_set[test_set["elapsed_days"] > 0].copy()
+        if config.no_train_same_day:
+            train_set = train_set[train_set["elapsed_days"] > 0].copy()
+        if train_set.empty or test_set.empty:
+            continue
+        n_test = len(test_set)
+        folds.append({
+            "train_raw": convert_to_raw(train_set),
+            "test_card_idx": np.fromiter(
+                (card_to_idx[int(c)] for c in test_set["card_id"]), dtype=np.uint64, count=n_test),
+            "test_hist_len": np.fromiter(
+                (hist_len_of(s) for s in test_set["t_history"]), dtype=np.uint64, count=n_test),
+            "test_dt": test_set["delta_t"].to_numpy(dtype=float),
+            "test_y": test_set["y"].to_numpy(dtype=float),
+        })
+        if config.train_equals_test:
+            break
+    if not folds:
+        return None
+    return {"full": full, "card_to_idx": card_to_idx, "folds": folds}
+
+
 def default_parameters() -> List[float]:
     return list(DEFAULT_PARAMETERS)
 
@@ -182,14 +238,20 @@ def train(train_set: pd.DataFrame) -> tuple[List[float], float]:
 
 
 def predict(
-    testset: pd.DataFrame, weights: List[float], history_items: Optional[List[FSRSItem]] = None
+    testset: pd.DataFrame, weights: List[float], history_items: Optional[List[FSRSItem]] = None,
+    precomputed_states: Optional[tuple] = None,
 ) -> tuple[List[float], List[float], pd.DataFrame]:
     """Return (predictions, labels, testset_with_predictions).
 
     ``history_items`` (the per-test-row FSRSItem histories, weight-independent) may be passed
     precomputed so a caller scoring the SAME testset under many weight sets (the HP tuner) builds
     them once instead of re-marshaling per call. None (default) rebuilds them here -> bit-for-bit
-    identical to the original behaviour."""
+    identical to the original behaviour.
+
+    ``precomputed_states`` = (stability, difficulty, stability_fast) per-test-row arrays from
+    ``FSRS.memory_states_raw`` (the COMPACT-RAW test path) — when given, the burn memory-state pass
+    is skipped entirely (the states already encode it) and only the Python forgetting curve runs, so
+    the result is bit-for-bit with the history_items path while avoiding the O(N^2) test_hist."""
 
     def fsrs7_forgetting_curve(
         delta_t: pd.Series,
@@ -247,12 +309,19 @@ def predict(
 
     predictor = FSRS(parameters=weights)
     testset_copy = testset.copy()
-    if history_items is None:
-        history_items = [FSRSItem(reviews=build_reviews(row)) for _, row in testset_copy.iterrows()]
-    memory_states = predictor.memory_state_batch(history_items)
-    testset_copy["stability"] = [s.stability for s in memory_states]
-    testset_copy["difficulty"] = [s.difficulty for s in memory_states]
-    testset_copy["stability_fast"] = [s.stability_fast for s in memory_states]
+    if precomputed_states is not None:
+        # COMPACT-RAW path: states already computed by memory_states_raw; skip memory_state_batch.
+        stab, diff, sfast = precomputed_states
+        testset_copy["stability"] = stab
+        testset_copy["difficulty"] = diff
+        testset_copy["stability_fast"] = sfast
+    else:
+        if history_items is None:
+            history_items = [FSRSItem(reviews=build_reviews(row)) for _, row in testset_copy.iterrows()]
+        memory_states = predictor.memory_state_batch(history_items)
+        testset_copy["stability"] = [s.stability for s in memory_states]
+        testset_copy["difficulty"] = [s.difficulty for s in memory_states]
+        testset_copy["stability_fast"] = [s.stability_fast for s in memory_states]
     testset_copy["p"] = fsrs7_forgetting_curve(
         testset_copy["delta_t"],
         testset_copy["stability"],

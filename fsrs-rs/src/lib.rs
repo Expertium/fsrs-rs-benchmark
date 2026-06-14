@@ -12,4 +12,5 @@ pub use inference::{DEFAULT_PARAMETERS, ItemProgress, MemoryState, ModelEvaluati
 pub use model::FSRS;
 pub use training::{
     CombinedProgressState, ComputeParametersInput, benchmark, compute_parameters,
+    windowed_loss_with_params,
 };

@@ -160,6 +160,70 @@ impl FSRS {
             .log_loss
     }
 
+    /// FAST PROXY for the gated default-param tuner: the windowed 0-epoch loss of `params` over a
+    /// user's cards (no training), via the SIMD analytic forward — ~50x cheaper than evaluate_raw's
+    /// burn path. Reconstructs the same (train_set, card_ids) as compute_parameters_raw, then sums
+    /// card_loss_simd. Descent DRIVER only (approximate); the 5-fold gate is the real selector.
+    pub fn windowed_loss_raw(
+        &self,
+        deltas: Vec<f32>,
+        ratings: Vec<u32>,
+        review_ths: Vec<i64>,
+        card_offsets: Vec<usize>,
+        params: Vec<f32>,
+    ) -> f64 {
+        let (train_set, card_ids) =
+            reconstruct_raw_items(&deltas, &ratings, &review_ths, &card_offsets);
+        fsrs::windowed_loss_with_params(train_set, card_ids, &params)
+    }
+
+    /// COMPACT-RAW test-side path for the cross-val gate: reconstruct each test row's HISTORY item
+    /// (a head of its card's full sequence) from flat arrays, then run the SAME `memory_state_batch`
+    /// the prediction path uses, returning per-row `(stability, difficulty, stability_fast)` flat
+    /// arrays. Avoids materializing the O(N^2) per-test-row history FSRSItems. The forgetting curve
+    /// stays in Python (`predict(..., precomputed_states=...)`) so the metric is bit-for-bit with the
+    /// items path. `hist_card_idx[i]`/`hist_len[i]` select test row i's card and history length j (its
+    /// history = reviews[0..j-1] of that card; j >= 1 since the initial review is never a test row).
+    pub fn memory_states_raw(
+        &self,
+        deltas: Vec<f32>,
+        ratings: Vec<u32>,
+        card_offsets: Vec<usize>,
+        hist_card_idx: Vec<usize>,
+        hist_len: Vec<usize>,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let items: Vec<fsrs::FSRSItem> = hist_card_idx
+            .iter()
+            .zip(hist_len.iter())
+            .map(|(&c, &len)| {
+                let s = card_offsets[c];
+                let reviews = (0..len)
+                    .map(|k| fsrs::FSRSReview {
+                        rating: ratings[s + k],
+                        delta_t: deltas[s + k],
+                    })
+                    .collect();
+                fsrs::FSRSItem { reviews }
+            })
+            .collect();
+        let starting = (0..items.len()).map(|_| None).collect();
+        let states = self
+            .0
+            .lock()
+            .unwrap()
+            .memory_state_batch(items, starting)
+            .unwrap();
+        let mut stab = Vec::with_capacity(states.len());
+        let mut diff = Vec::with_capacity(states.len());
+        let mut sfast = Vec::with_capacity(states.len());
+        for s in states {
+            stab.push(s.stability);
+            diff.push(s.difficulty);
+            sfast.push(s.stability_fast);
+        }
+        (stab, diff, sfast)
+    }
+
     /// Log loss of `items` under the current parameters, computed by Rust
     /// `evaluate()` (the same metric the optimizer uses; not timed).
     pub fn evaluate(&self, items: Vec<FSRSItem>) -> f32 {

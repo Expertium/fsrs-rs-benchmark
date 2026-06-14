@@ -1392,6 +1392,59 @@ pub fn compute_parameters(
     Ok(optimized_parameters)
 }
 
+/// PROXY for the gated default-param tuner: the windowed 0-epoch loss of `params` over a user's
+/// cards (NO training), via the fast SIMD analytic forward `card_loss_simd` — the same kernel the
+/// FSRS_VALIDATE diagnostic uses, ~50x cheaper than the burn predict path. Returns the
+/// recency-weighted mean BCE (total weighted loss / total weight); NaN if too few items. This is a
+/// descent DRIVER only (minimax-approximate, train==test, recency-weighted) — the real selection
+/// metric is the faithful 5-fold gate (which uses the frozen evaluate()/burn predict). The same
+/// setup as `compute_parameters` (normalize, carded prep, recency weighting, max_seq_len retain,
+/// windowed batching) so the proxy tracks what training would see, just without the SGD.
+pub fn windowed_loss_with_params(
+    train_set: Vec<FSRSItem>,
+    card_ids: Vec<i64>,
+    params: &[f32],
+) -> f64 {
+    let train_set = normalize_training_set(train_set);
+    let (_, train_set, train_card_ids) = prepare_training_data_carded(train_set, card_ids);
+    if train_set.len() < 64 {
+        return f64::NAN;
+    }
+    let config = TrainingConfig::new(
+        ModelConfig {
+            freeze_initial_stability: false,
+            initial_stability: None,
+            initial_forgetting_curve: None,
+            freeze_short_term_stability: false,
+            num_relearning_steps: 1,
+        },
+        AdamConfig::new(),
+    );
+    let mut weighted = recency_weighted_fsrs_items_tuned(train_set);
+    debug_assert_eq!(train_card_ids.len(), weighted.len());
+    for (wi, &cid) in weighted.iter_mut().zip(train_card_ids.iter()) {
+        wi.card_id = cid;
+    }
+    weighted.retain(|item| item.item.reviews.len() <= config.max_seq_len);
+    // batch_size only affects card grouping, not the summed loss; the default is fine.
+    let host = build_host_batches(weighted, config.batch_size);
+    let w = clip_parameters(params);
+    let mut total_loss = 0.0f64;
+    let mut total_w = 0.0f64;
+    for hb in &host {
+        if hb.windowed {
+            total_loss +=
+                crate::analytic::card_loss_simd(&w, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts);
+            total_w += hb.wts.iter().map(|&x| x as f64).sum::<f64>();
+        }
+    }
+    if total_w > 0.0 {
+        total_loss / total_w
+    } else {
+        f64::NAN
+    }
+}
+
 pub fn benchmark(
     ComputeParametersInput {
         train_set,
