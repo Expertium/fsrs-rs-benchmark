@@ -1,0 +1,38 @@
+Gated default-param meta-opt: 3000 users, 14 workers, 30 steps, gate every 5.
+Adam lr=0.005 b1=0.9 b2=0.999 h=0.005; 69 evals/step.
+Pool ready: 3000 users cached, ~32.4 GB total RAM.
+  step-0 baseline (shipped DEFAULT_PARAMETERS): proxy 0.343774  gate 0.32029006
+[gated] step 1/30: proxy=0.343681  |grad|=0.0162  (1084s)
+[gated] step 2/30: proxy=0.343633  |grad|=0.0135  (1031s)
+[gated] step 3/30: proxy=0.343543  |grad|=0.0169  (1025s)
+[gated] step 4/30: proxy=0.343495  |grad|=0.0094  (1038s)
+[gated] step 5/30: proxy=0.343485  |grad|=0.0063  (1026s)  GATE=0.32023154 (best 0.32023154 @ step 5)
+[gated] step 6/30: proxy=0.343464  |grad|=0.0113  (1088s)
+[gated] step 7/30: proxy=0.343436  |grad|=0.0112  (1056s)
+[gated] step 8/30: proxy=0.343421  |grad|=0.0072  (1055s)
+[gated] step 9/30: proxy=0.343420  |grad|=0.0051  (1060s)
+[gated] step 10/30: proxy=0.343418  |grad|=0.0075  (1048s)  GATE=0.32022607 (best 0.32022607 @ step 10)
+[gated] step 11/30: proxy=0.343411  |grad|=0.0081  (1088s)
+[gated] step 12/30: proxy=0.343402  |grad|=0.0060  (1083s)
+[gated] step 13/30: proxy=0.343396  |grad|=0.0042  (1076s)
+[gated] step 14/30: proxy=0.343390  |grad|=0.0053  (1059s)
+[gated] step 15/30: proxy=0.343380  |grad|=0.0067  (1041s)  GATE=0.32026314 (best 0.32022607 @ step 10)
+[gated] step 16/30: proxy=0.343367  |grad|=0.0062  (1070s)
+[gated] step 17/30: proxy=0.343358  |grad|=0.0041  (1057s)
+[gated] step 18/30: proxy=0.343354  |grad|=0.0035  (1040s)
+[gated] step 19/30: proxy=0.343349  |grad|=0.0054  (1035s)
+[gated] step 20/30: proxy=0.343340  |grad|=0.0059  (1040s)  GATE=0.32032970 (best 0.32022607 @ step 10)
+[gated] step 21/30: proxy=0.343332  |grad|=0.0041  (1094s)
+[gated] step 22/30: proxy=0.343328  |grad|=0.0023  (1095s)
+[gated] step 23/30: proxy=0.343325  |grad|=0.0037  (1090s)
+[gated] step 24/30: proxy=0.343319  |grad|=0.0048  (1085s)
+[gated] step 25/30: proxy=0.343313  |grad|=0.0044  (1081s)  GATE=0.32029540 (best 0.32022607 @ step 10)
+[gated] step 26/30: proxy=0.343308  |grad|=0.0030  (1051s)
+[gated] step 27/30: proxy=0.343303  |grad|=0.0024  (1046s)
+[gated] step 28/30: proxy=0.343298  |grad|=0.0034  (1042s)
+[gated] step 29/30: proxy=0.343293  |grad|=0.0038  (1045s)
+[gated] step 30/30: proxy=0.343287  |grad|=0.0030  (1047s)  GATE=0.32025268 (best 0.32022607 @ step 10)
+
+[gated] done. best GATE 0.32022607 @ step 10 (step 0 = shipped default = 0.32029006)
+[gated] IMPROVED
+[gated] best_params = [0.11354, 2.28831, 3.95764, 11.73624, 6.14268, 0.65401, 3.64328, 1.99899, 0.0, 1.40007, 0.68894, 0.60835, 0.78783, 0.68513, 1.0, 1.28365, 0.69496, 3.83478, 0.41175, 0.05657, 1.82234, 0.57445, 1.03845, 0.15793, 0.11286, 0.24632, 0.95854, 0.15459, 0.70442, 0.0, 0.52448, 0.40981, 0.49115, 0.30336]
