@@ -43,6 +43,12 @@ up-to-4× longer sequences), so A→B *understates* the algorithmic gain.
 So the *library* delivered the expected speedup. Epoch-compensation checks: 5ep+valid → 6ep noval
 = ×1.068 faster AND −0.00028 log loss; 8ep+valid → 9ep noval = ×1.222, +0.00016.
 
+**Reconciliation with upstream's own bench numbers** (their Criterion bench, one smallish
+collection, with `card_ids`): #411 ×9.3 → #419 ×1.62 (27.756→17.103 ms) → #424 ×1.43
+(15.374→10.738 ms) = **≈ ×21.5 at the 5-epoch default**, ≈ ×13–14 at Anki's 8 epochs. Our 50-user
+measurement of the same config is ×29 median because the multiplier grows with collection size
+(per-user ×5.3–×58); both scales tell the same story.
+
 ## Why users still see ~10×
 
 1. **End-to-end dilution (now the whole story for large collections).** Anki's optimize also
